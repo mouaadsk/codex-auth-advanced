@@ -1,0 +1,8 @@
+node_modules/
+.local-codex/
+.local-codex-group-test/
+.local-home/
+.omx/
+.zig-global-cache/
+.zig-local-cache/
+npm-debug.log*

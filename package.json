@@ -1,0 +1,41 @@
+{
+  "name": "@loongphy/codex-auth-advanced",
+  "version": "0.3.0-alpha.2",
+  "type": "module",
+  "description": "CLI for switching Codex accounts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Loongphy/codex-auth"
+  },
+  "homepage": "https://github.com/Loongphy/codex-auth",
+  "bugs": {
+    "url": "https://github.com/Loongphy/codex-auth/issues"
+  },
+  "bin": {
+    "codex-auth-advanced": "bin/codex-auth-advanced.js"
+  },
+  "files": [
+    "bin/",
+    "LICENSE",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@loongphy/codex-auth-advanced-linux-x64": "0.3.0-alpha.2",
+    "@loongphy/codex-auth-advanced-linux-arm64": "0.3.0-alpha.2",
+    "@loongphy/codex-auth-advanced-darwin-x64": "0.3.0-alpha.2",
+    "@loongphy/codex-auth-advanced-darwin-arm64": "0.3.0-alpha.2",
+    "@loongphy/codex-auth-advanced-win32-x64": "0.3.0-alpha.2",
+    "@loongphy/codex-auth-advanced-win32-arm64": "0.3.0-alpha.2"
+  },
+  "scripts": {
+    "check:versions": "node scripts/npm/check-versions.mjs",
+    "stage:npm": "node scripts/npm/stage-packages.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
