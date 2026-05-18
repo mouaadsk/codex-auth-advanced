@@ -619,6 +619,37 @@ function accountIsExhausted(account) {
   return Number.isFinite(primary) && primary >= 100 || Number.isFinite(secondary) && secondary >= 100;
 }
 
+function accountRemainingPercent(account, which) {
+  const usage = which === "primary" ? account.last_usage?.primary : account.last_usage?.secondary;
+  const used = Number(usage?.used_percent);
+  if (!Number.isFinite(used)) return null;
+  return Math.max(0, 100 - used);
+}
+
+function registryAutoThresholds(registry) {
+  const auto = registry?.auto_switch ?? {};
+  const primary = Number(auto.threshold_5h_percent ?? auto.primary_threshold_percent ?? 0);
+  const secondary = Number(auto.threshold_weekly_percent ?? auto.secondary_threshold_percent ?? 0);
+  return {
+    primary: Number.isFinite(primary) ? primary : 0,
+    secondary: Number.isFinite(secondary) ? secondary : 0
+  };
+}
+
+function accountShouldAutoSwitch(account, registry) {
+  if (!account) return false;
+  if (account.auth_mode === "apikey") return accountIsExhausted(account);
+  if (accountIsExhausted(account)) return true;
+  const thresholds = registryAutoThresholds(registry);
+  const primary = accountRemainingPercent(account, "primary");
+  const secondary = accountRemainingPercent(account, "secondary");
+  return primary != null && primary <= thresholds.primary || secondary != null && secondary <= thresholds.secondary;
+}
+
+function accountIsSwitchCandidate(account) {
+  return !accountIsExhausted(account);
+}
+
 function accountSortTime(account) {
   return Number(account.last_used_at || account.created_at || 0);
 }
@@ -650,7 +681,21 @@ function parseSwitchCommand(argv) {
 }
 
 function hasUnsupportedSwitchFlags(args) {
-  return args.some((arg) => arg === "--live" || arg === "--auto" || arg === "--api" || arg === "--skip-api");
+  return args.some((arg) => arg === "--api" || arg === "--skip-api");
+}
+
+function switchFlags(args) {
+  const flags = {
+    live: false,
+    auto: false,
+    selectors: []
+  };
+  for (const arg of args) {
+    if (arg === "--live") flags.live = true;
+    else if (arg === "--auto") flags.auto = true;
+    else flags.selectors.push(arg);
+  }
+  return flags;
 }
 
 function switchToStoredAccount(codexHome, account) {
@@ -691,7 +736,7 @@ function switchToStoredAccount(codexHome, account) {
   process.stdout.write(`Switched to ${accountLabel(account)}.\n`);
 }
 
-function renderSwitchRows(accounts, activeAccountKey) {
+function renderSwitchRows(accounts, activeAccountKey, { includeExhausted = true } = {}) {
   const rows = accounts.map((account, index) => ({
     index: String(index + 1).padStart(2, "0"),
     marker: account.account_key === activeAccountKey ? "*" : " ",
@@ -700,7 +745,11 @@ function renderSwitchRows(accounts, activeAccountKey) {
     fiveHour: accountUsageLabel(account, "primary"),
     weekly: accountUsageLabel(account, "secondary"),
     exhausted: accountIsExhausted(account) ? "yes" : "no"
-  }));
+  })).filter((row) => includeExhausted || row.exhausted !== "yes");
+  if (!rows.length) {
+    process.stdout.write("No usable accounts found.\n");
+    return;
+  }
   const widths = {
     account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
     plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
@@ -715,6 +764,110 @@ function renderSwitchRows(accounts, activeAccountKey) {
   }
 }
 
+function apiAccountDailyLabel(account) {
+  const value = Number(account.api_spend?.spend_usd);
+  return Number.isFinite(value) ? moneyUsed(value) : "-";
+}
+
+function apiAccountWeeklyLabel(account) {
+  if (account.auth_mode !== "apikey") return accountUsageLabel(account, "secondary");
+  const spend = Number(account.api_spend?.spend_usd);
+  const trackedLimit = Number(account.api_spend?.limit_usd);
+  const limit = apiSpendLimitUsd(account) ?? (Number.isFinite(trackedLimit) && trackedLimit > 0 ? trackedLimit : null);
+  return moneyLimitStatus(spend, limit);
+}
+
+function accountLastLabel(account) {
+  if (account.auth_mode === "apikey" && account.api_spend?.checked_at) return "Now";
+  const last = Number(account.last_used_at || account.created_at);
+  if (!Number.isFinite(last) || last <= 0) return "-";
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - last);
+  if (seconds < 60) return "Now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+function renderLocalList(groups) {
+  const rows = [];
+  const grouped = groups.length > 1;
+  for (const group of groups) {
+    const registry = readJsonFile(registryPath(group.codexHome));
+    if (!registry || !Array.isArray(registry.accounts)) continue;
+    for (const [index, account] of sortedRegistryAccounts(registry).entries()) {
+      rows.push({
+        marker: account.account_key === registry.active_account_key ? "*" : " ",
+        index: String(index + 1).padStart(2, "0"),
+        group: group.name,
+        account: accountLabel(account),
+        plan: accountPlanLabel(account),
+        fiveHour: accountUsageLabel(account, "primary"),
+        daily: account.auth_mode === "apikey" ? apiAccountDailyLabel(account) : "-",
+        weekly: apiAccountWeeklyLabel(account),
+        last: accountLastLabel(account)
+      });
+    }
+  }
+  if (!rows.length) {
+    process.stdout.write("No accounts found.\n");
+    return;
+  }
+
+  const widths = {
+    group: grouped ? Math.max("GROUP".length, ...rows.map((row) => row.group.length)) : 0,
+    account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
+    plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
+    fiveHour: Math.max("5H LEFT".length, ...rows.map((row) => row.fiveHour.length)),
+    daily: Math.max("DAILY".length, ...rows.map((row) => row.daily.length)),
+    weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
+    last: Math.max("LAST ACTIVITY".length, ...rows.map((row) => row.last.length))
+  };
+  const prefixWidth = 5;
+  const header = grouped
+    ? `${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`
+    : `${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`;
+  process.stdout.write(`${header}\n${"-".repeat(header.length)}\n`);
+  for (const row of rows) {
+    const prefix = `${row.marker} ${row.index} `;
+    if (grouped) {
+      process.stdout.write(`${prefix}${pad(row.group, widths.group)}  ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.daily, widths.daily)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.last, widths.last)}\n`);
+    } else {
+      process.stdout.write(`${prefix}${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.daily, widths.daily)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.last, widths.last)}\n`);
+    }
+  }
+}
+
+function parseListLiveCommand(argv) {
+  if (argv[0] === "list" && argv.includes("--live")) {
+    return { groups: loadManagedGroups() };
+  }
+  if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "list" && argv.includes("--live")) {
+    return { groups: [{ name: argv[1], codexHome: managedGroupCodexHome(argv[1]) }] };
+  }
+  if (argv[0] === "group" && argv[1] === "list" && typeof argv[2] === "string" && argv.includes("--live")) {
+    return { groups: [{ name: argv[2], codexHome: managedGroupCodexHome(argv[2]) }] };
+  }
+  return null;
+}
+
+async function maybeHandleStoredListLive(argv) {
+  const command = parseListLiveCommand(argv);
+  if (!command) return false;
+  const hasApiKeyAccounts = command.groups.some((group) => {
+    const registry = readJsonFile(registryPath(group.codexHome));
+    return registry?.accounts?.some((account) => account?.auth_mode === "apikey");
+  });
+  if (!hasApiKeyAccounts) return false;
+
+  while (true) {
+    await syncApiKeySpendLimits();
+    clearScreen();
+    renderLocalList(command.groups);
+    process.stdout.write("\nRefreshing every 5s. Press Ctrl-C to stop.\n");
+    sleep(5000);
+  }
+}
+
 function maybeHandleStoredSwitch(argv) {
   const command = parseSwitchCommand(argv);
   if (!command || hasUnsupportedSwitchFlags(command.args)) return false;
@@ -723,7 +876,18 @@ function maybeHandleStoredSwitch(argv) {
   if (!registry || !Array.isArray(registry.accounts)) return false;
   if (!registry.accounts.some((account) => account?.auth_mode === "apikey")) return false;
 
-  const query = command.args.join(" ").trim();
+  const flags = switchFlags(command.args);
+  if (flags.auto && !flags.live) {
+    console.error("--auto requires --live.");
+    process.exit(1);
+  }
+
+  if (flags.live) {
+    handleLiveStoredSwitch(command.codexHome, flags.auto);
+    return true;
+  }
+
+  const query = flags.selectors.join(" ").trim();
   if (query) {
     const result = findAccountForSwitch(registry, query);
     if (result.ambiguous) {
@@ -757,6 +921,110 @@ function maybeHandleStoredSwitch(argv) {
   }
   switchToStoredAccount(command.codexHome, result.account);
   return true;
+}
+
+function clearScreen() {
+  if (process.stdout.isTTY) {
+    process.stdout.write("\x1b[2J\x1b[H");
+  }
+}
+
+function activeRegistryAccountFromRegistry(registry) {
+  if (!registry || typeof registry.active_account_key !== "string") return null;
+  return registry.accounts.find((account) => account?.account_key === registry.active_account_key) ?? null;
+}
+
+function firstUsableSwitchCandidate(registry) {
+  const active = registry.active_account_key;
+  return sortedRegistryAccounts(registry).find((account) => account.account_key !== active && accountIsSwitchCandidate(account)) ?? null;
+}
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function handleLiveStoredSwitch(codexHome, auto) {
+  while (true) {
+    const registry = readJsonFile(registryPath(codexHome));
+    if (!registry || !Array.isArray(registry.accounts)) {
+      console.error(`No registry found at ${registryPath(codexHome)}.`);
+      process.exit(1);
+    }
+    clearScreen();
+    renderSwitchRows(sortedRegistryAccounts(registry), registry.active_account_key);
+    process.stdout.write(`\n${auto ? "Auto-switch is watching usable accounts. Press Ctrl-C to stop." : "Enter a selector to switch, or q to quit."}\n`);
+
+    if (auto) {
+      const active = activeRegistryAccountFromRegistry(registry);
+      if (accountShouldAutoSwitch(active, registry)) {
+        const candidate = firstUsableSwitchCandidate(registry);
+        if (candidate) {
+          switchToStoredAccount(codexHome, candidate);
+        } else {
+          process.stdout.write("No usable switch candidate found.\n");
+        }
+      }
+      sleep(5000);
+      continue;
+    }
+
+    const selected = readLineFromTty("Switch to account number, alias, or email [q to quit]: ");
+    if (!selected || selected.toLowerCase() === "q") {
+      process.stdout.write("No account switched.\n");
+      return;
+    }
+    const result = findAccountForSwitch(registry, selected);
+    if (result.ambiguous) {
+      process.stderr.write(`Multiple accounts matched "${selected}". Use a more specific selector.\n`);
+      sleep(1200);
+      continue;
+    }
+    if (!result.account) {
+      process.stderr.write(`No account matched "${selected}".\n`);
+      sleep(1200);
+      continue;
+    }
+    switchToStoredAccount(codexHome, result.account);
+    sleep(1200);
+  }
+}
+
+function autoSwitchEnabled(registry) {
+  const auto = registry?.auto_switch;
+  return auto?.enabled === true;
+}
+
+function autoSwitchCycleForGroup(group) {
+  const registry = readJsonFile(registryPath(group.codexHome));
+  if (!registry || !Array.isArray(registry.accounts) || !autoSwitchEnabled(registry)) return;
+  const active = activeRegistryAccountFromRegistry(registry);
+  if (!accountShouldAutoSwitch(active, registry)) return;
+  const candidate = firstUsableSwitchCandidate(registry);
+  if (!candidate) return;
+  switchToStoredAccount(group.codexHome, candidate);
+}
+
+async function runAutoSwitchCycle() {
+  syncMissingApiKeyConfigsAllGroups();
+  await syncApiKeySpendLimits();
+  for (const group of loadManagedGroups()) {
+    autoSwitchCycleForGroup(group);
+  }
+}
+
+async function maybeHandleDaemon(argv) {
+  if (argv[0] !== "daemon") return false;
+  const once = argv.includes("--once") || argv.includes("--manager-once");
+  const supported = argv.some((arg) => arg === "--watch" || arg === "--manager" || arg === "--once" || arg === "--manager-once");
+  if (!supported) return false;
+  if (once) {
+    await runAutoSwitchCycle();
+    return true;
+  }
+  while (true) {
+    await runAutoSwitchCycle();
+    sleep(30000);
+  }
 }
 
 function setApiSpendLimit(codexHome, query, limitUsd) {
@@ -1232,6 +1500,36 @@ async function syncApiKeySpendLimits() {
   }
 }
 
+function syncMissingApiKeyConfigsAllGroups() {
+  const groups = loadManagedGroups();
+  const configByAccountKey = new Map();
+  for (const group of groups) {
+    const registry = readJsonFile(registryPath(group.codexHome));
+    if (!registry || !Array.isArray(registry.accounts)) continue;
+    for (const account of registry.accounts) {
+      if (account?.auth_mode !== "apikey") continue;
+      const configPath = accountConfigPath(group.codexHome, account.account_key);
+      if (fs.existsSync(configPath) && !configByAccountKey.has(account.account_key)) {
+        configByAccountKey.set(account.account_key, configPath);
+      }
+    }
+  }
+
+  for (const group of groups) {
+    const registry = readJsonFile(registryPath(group.codexHome));
+    if (!registry || !Array.isArray(registry.accounts)) continue;
+    for (const account of registry.accounts) {
+      if (account?.auth_mode !== "apikey") continue;
+      const targetPath = accountConfigPath(group.codexHome, account.account_key);
+      if (fs.existsSync(targetPath)) continue;
+      const sourcePath = configByAccountKey.get(account.account_key);
+      if (!sourcePath || !fs.existsSync(sourcePath)) continue;
+      ensureDir(path.dirname(targetPath));
+      copyFilePrivate(sourcePath, targetPath);
+    }
+  }
+}
+
 function accountDisplayNeedles(account) {
   return [account.alias, account.account_name, account.email].filter(
     (value) => typeof value === "string" && value.length > 0
@@ -1454,6 +1752,56 @@ function childEnvForArgv(argv) {
   return env;
 }
 
+function isAutoConfigCommand(argv) {
+  if (argv[0] === "config" && argv[1] === "auto") return true;
+  return argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "auto";
+}
+
+function xmlEscape(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function repairMacLaunchAgentPath() {
+  if (process.platform !== "darwin") return;
+  const plistPath = path.join(userHome(), "Library", "LaunchAgents", "com.loongphy.codex-auth-advanced.manager.plist");
+  if (!fs.existsSync(plistPath)) return;
+  const scriptPath = path.join(__dirname, "codex-auth-advanced.js");
+  const plist = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '  <key>Label</key>',
+    '  <string>com.loongphy.codex-auth-advanced.manager</string>',
+    '  <key>ProgramArguments</key>',
+    '  <array>',
+    `    <string>${xmlEscape(process.execPath)}</string>`,
+    `    <string>${xmlEscape(scriptPath)}</string>`,
+    '    <string>daemon</string>',
+    '    <string>--manager</string>',
+    '  </array>',
+    '  <key>EnvironmentVariables</key>',
+    '  <dict>',
+    '    <key>CODEX_AUTH_VERSION</key>',
+    '    <string>0.3.0-alpha.2</string>',
+    '    <key>CODEX_AUTH_NODE_EXECUTABLE</key>',
+    `    <string>${xmlEscape(process.execPath)}</string>`,
+    '  </dict>',
+    '  <key>RunAtLoad</key>',
+    '  <true/>',
+    '  <key>KeepAlive</key>',
+    '  <true/>',
+    '</dict>',
+    '</plist>',
+    ''
+  ].join("\n");
+  fs.writeFileSync(plistPath, plist, "utf8");
+}
+
 function resolveBinary() {
   const platformDir = `${process.platform}-${process.arch}`;
   const vendorBinDir = path.join(__dirname, "..", "vendor", platformDir, "bin");
@@ -1497,15 +1845,25 @@ if (await maybeHandleAddApiKey(argv)) {
   process.exit(0);
 }
 
+syncMissingApiKeyConfigsAllGroups();
+
+if (!apiSpendLimitImportInfo) {
+  await syncApiKeySpendLimits();
+}
+
+if (await maybeHandleDaemon(argv)) {
+  process.exit(0);
+}
+
+if (await maybeHandleStoredListLive(argv)) {
+  process.exit(0);
+}
+
 if (maybeHandleStoredSwitch(argv)) {
   process.exit(0);
 }
 
 ensureAllActiveAccountConfigs();
-
-if (!apiSpendLimitImportInfo) {
-  await syncApiKeySpendLimits();
-}
 
 function exitFromChild(child) {
   if (child.error) {
@@ -1531,6 +1889,10 @@ if (!(await maybeRunApiKeyAwareGroupList(binaryPath, argv))) {
       applyApiSpendLimitToImportedAccounts(apiSpendLimitImportInfo.codexHome, apiSpendLimitImportInfo.args, parsedApiSpendLimitArgs.limitUsd);
     }
     await syncApiKeySpendLimits();
+    syncMissingApiKeyConfigsAllGroups();
+    if (isAutoConfigCommand(argv)) {
+      repairMacLaunchAgentPath();
+    }
     ensureAllActiveAccountConfigs();
   }
 
