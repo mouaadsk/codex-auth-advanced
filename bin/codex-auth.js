@@ -3,13 +3,11 @@
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const require = createRequire(import.meta.url);
 const rootPackageJsonPath = path.join(__dirname, "..", "package.json");
 const requiredNodeMajor = 22;
 const invokedCommandName = path.basename(process.argv[1] ?? "codex-auth", path.extname(process.argv[1] ?? ""));
@@ -22,21 +20,12 @@ function ensureSupportedNodeVersion() {
   }
 
   console.error(
-    `Node.js ${requiredNodeMajor}+ is required to run @loongphy/codex-auth-advanced. Current version: ${process.version}.`
+    `Node.js ${requiredNodeMajor}+ is required to run codex-auth-advanced. Current version: ${process.version}.`
   );
   process.exit(1);
 }
 
 ensureSupportedNodeVersion();
-
-const packageMap = {
-  "linux:x64": "@loongphy/codex-auth-advanced-linux-x64",
-  "linux:arm64": "@loongphy/codex-auth-advanced-linux-arm64",
-  "darwin:x64": "@loongphy/codex-auth-advanced-darwin-x64",
-  "darwin:arm64": "@loongphy/codex-auth-advanced-darwin-arm64",
-  "win32:x64": "@loongphy/codex-auth-advanced-win32-x64",
-  "win32:arm64": "@loongphy/codex-auth-advanced-win32-arm64"
-};
 
 function userHome() {
   return process.env.HOME || process.env.USERPROFILE || "";
@@ -1255,38 +1244,28 @@ function childEnvForArgv(argv) {
 }
 
 function resolveBinary() {
-  const key = `${process.platform}:${process.arch}`;
-  const packageName = packageMap[key];
-  if (!packageName) {
+  const platformDir = `${process.platform}-${process.arch}`;
+  const vendorBinDir = path.join(__dirname, "..", "vendor", platformDir, "bin");
+  if (!fs.existsSync(vendorBinDir)) {
     console.error(`Unsupported platform: ${process.platform}/${process.arch}`);
+    console.error(`Missing local binary directory: ${vendorBinDir}`);
     process.exit(1);
   }
 
-  try {
-    const packageRoot = path.dirname(require.resolve(`${packageName}/package.json`));
-    const wantsAdvancedBinary = invokedCommandName === "codex-auth-advanced";
-    const advancedBinaryName = process.platform === "win32" ? "codex-auth-advanced.exe" : "codex-auth-advanced";
-    const defaultBinaryName = process.platform === "win32" ? "codex-auth.exe" : "codex-auth";
-    const binaryName = wantsAdvancedBinary ? advancedBinaryName : defaultBinaryName;
-    const binaryPath = path.join(packageRoot, "bin", binaryName);
-    if (!fs.existsSync(binaryPath)) {
-      const fallbackPath = path.join(packageRoot, "bin", defaultBinaryName);
-      if (!wantsAdvancedBinary || !fs.existsSync(fallbackPath)) {
-        console.error(`Missing binary inside ${packageName}: ${binaryPath}`);
-        process.exit(1);
-      }
-      return fallbackPath;
+  const wantsAdvancedBinary = invokedCommandName === "codex-auth-advanced";
+  const advancedBinaryName = process.platform === "win32" ? "codex-auth-advanced.exe" : "codex-auth-advanced";
+  const defaultBinaryName = process.platform === "win32" ? "codex-auth.exe" : "codex-auth";
+  const binaryName = wantsAdvancedBinary ? advancedBinaryName : defaultBinaryName;
+  const binaryPath = path.join(vendorBinDir, binaryName);
+  if (!fs.existsSync(binaryPath)) {
+    const fallbackPath = path.join(vendorBinDir, defaultBinaryName);
+    if (!wantsAdvancedBinary || !fs.existsSync(fallbackPath)) {
+      console.error(`Missing local binary: ${binaryPath}`);
+      process.exit(1);
     }
-    return binaryPath;
-  } catch (error) {
-    console.error(
-      `Missing platform package ${packageName}. Reinstall @loongphy/codex-auth-advanced on ${process.platform}/${process.arch}.`
-    );
-    if (error && error.message) {
-      console.error(error.message);
-    }
-    process.exit(1);
+    return fallbackPath;
   }
+  return binaryPath;
 }
 
 const binaryPath = resolveBinary();
