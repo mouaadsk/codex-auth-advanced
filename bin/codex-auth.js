@@ -66,6 +66,32 @@ function writeJsonFile(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function copyFilePrivate(sourcePath, targetPath) {
+  fs.copyFileSync(sourcePath, targetPath);
+  fs.chmodSync(targetPath, 0o600);
+}
+
+function timestampForBackup() {
+  const now = new Date();
+  const pad2 = (value) => String(value).padStart(2, "0");
+  return [
+    now.getFullYear(),
+    pad2(now.getMonth() + 1),
+    pad2(now.getDate()),
+    "-",
+    pad2(now.getHours()),
+    pad2(now.getMinutes()),
+    pad2(now.getSeconds())
+  ].join("");
+}
+
+function backupIfExists(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const backupPath = `${filePath}.bak.${timestampForBackup()}`;
+  fs.copyFileSync(filePath, backupPath);
+  fs.chmodSync(backupPath, 0o600);
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
 }
@@ -561,9 +587,176 @@ function applyApiSpendLimitToImportedAccounts(codexHome, args, limitUsd) {
 
 function accountMatchesQuery(account, query) {
   const normalized = String(query || "").toLowerCase();
+  if (/^\d+$/.test(normalized)) return false;
   return [account.account_key, account.alias, account.email, account.account_name, account.chatgpt_account_id]
     .filter((value) => typeof value === "string" && value.length > 0)
     .some((value) => value.toLowerCase().includes(normalized));
+}
+
+function accountLabel(account) {
+  return account.alias || account.email || account.account_name || account.account_key;
+}
+
+function accountPlanLabel(account) {
+  if (account.auth_mode === "apikey") return "API";
+  if (account.plan === "team") return "Business";
+  if (typeof account.plan === "string" && account.plan.length > 0) {
+    return `${account.plan[0].toUpperCase()}${account.plan.slice(1)}`;
+  }
+  return "-";
+}
+
+function accountUsageLabel(account, which) {
+  const usage = which === "primary" ? account.last_usage?.primary : account.last_usage?.secondary;
+  if (!usage || !Number.isFinite(Number(usage.used_percent))) return "-";
+  return `${Math.max(0, 100 - Number(usage.used_percent))}%`;
+}
+
+function accountIsExhausted(account) {
+  if (account.auth_mode === "apikey" && account.api_spend?.exhausted === true) return true;
+  const primary = Number(account.last_usage?.primary?.used_percent);
+  const secondary = Number(account.last_usage?.secondary?.used_percent);
+  return Number.isFinite(primary) && primary >= 100 || Number.isFinite(secondary) && secondary >= 100;
+}
+
+function accountSortTime(account) {
+  return Number(account.last_used_at || account.created_at || 0);
+}
+
+function sortedRegistryAccounts(registry) {
+  return [...registry.accounts].sort((a, b) => accountSortTime(b) - accountSortTime(a));
+}
+
+function findAccountForSwitch(registry, query) {
+  const accounts = sortedRegistryAccounts(registry);
+  if (/^\d+$/.test(String(query || ""))) {
+    const index = Number(query) - 1;
+    return accounts[index] ? { account: accounts[index], ambiguous: false } : { account: null, ambiguous: false };
+  }
+  const matches = accounts.filter((account) => accountMatchesQuery(account, query));
+  if (matches.length === 1) return { account: matches[0], ambiguous: false };
+  if (matches.length > 1) return { account: null, ambiguous: true, matches };
+  return { account: null, ambiguous: false };
+}
+
+function parseSwitchCommand(argv) {
+  if (argv[0] === "switch") {
+    return { codexHome: defaultCodexHome(), args: argv.slice(1) };
+  }
+  if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "switch") {
+    return { codexHome: managedGroupCodexHome(argv[1]), args: argv.slice(3) };
+  }
+  return null;
+}
+
+function hasUnsupportedSwitchFlags(args) {
+  return args.some((arg) => arg === "--live" || arg === "--auto" || arg === "--api" || arg === "--skip-api");
+}
+
+function switchToStoredAccount(codexHome, account) {
+  const authPath = accountAuthPath(codexHome, account.account_key);
+  if (!fs.existsSync(authPath)) {
+    console.error(`Missing auth file for ${accountLabel(account)}: ${authPath}`);
+    process.exit(1);
+  }
+
+  const rootAuthPath = path.join(codexHome, "auth.json");
+  const rootConfig = rootConfigPath(codexHome);
+  ensureDir(codexHome);
+  backupIfExists(rootAuthPath);
+  copyFilePrivate(authPath, rootAuthPath);
+
+  if (account.auth_mode === "apikey") {
+    const configPath = accountConfigPath(codexHome, account.account_key);
+    if (fs.existsSync(configPath)) {
+      backupIfExists(rootConfig);
+      copyFilePrivate(configPath, rootConfig);
+    }
+  }
+
+  const registryFile = registryPath(codexHome);
+  const registry = readJsonFile(registryFile);
+  if (registry && Array.isArray(registry.accounts)) {
+    registry.active_account_key = account.account_key;
+    registry.active_account_activated_at_ms = Date.now();
+    const existing = registry.accounts.find((item) => item?.account_key === account.account_key);
+    if (existing) existing.last_used_at = Math.floor(Date.now() / 1000);
+    writeJsonFile(registryFile, registry);
+    fs.chmodSync(registryFile, 0o600);
+  }
+  if (account.auth_mode !== "apikey") {
+    ensureActiveAccountConfig(codexHome);
+  }
+
+  process.stdout.write(`Switched to ${accountLabel(account)}.\n`);
+}
+
+function renderSwitchRows(accounts, activeAccountKey) {
+  const rows = accounts.map((account, index) => ({
+    index: String(index + 1).padStart(2, "0"),
+    marker: account.account_key === activeAccountKey ? "*" : " ",
+    account: accountLabel(account),
+    plan: accountPlanLabel(account),
+    fiveHour: accountUsageLabel(account, "primary"),
+    weekly: accountUsageLabel(account, "secondary"),
+    exhausted: accountIsExhausted(account) ? "yes" : "no"
+  }));
+  const widths = {
+    account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
+    plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
+    fiveHour: Math.max("5H LEFT".length, ...rows.map((row) => row.fiveHour.length)),
+    weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
+    exhausted: Math.max("EXHAUSTED".length, ...rows.map((row) => row.exhausted.length))
+  };
+  const header = `     ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("EXHAUSTED", widths.exhausted)}`;
+  process.stdout.write(`${header}\n${"-".repeat(header.length)}\n`);
+  for (const row of rows) {
+    process.stdout.write(`${row.marker} ${row.index} ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.exhausted, widths.exhausted)}\n`);
+  }
+}
+
+function maybeHandleStoredSwitch(argv) {
+  const command = parseSwitchCommand(argv);
+  if (!command || hasUnsupportedSwitchFlags(command.args)) return false;
+
+  const registry = readJsonFile(registryPath(command.codexHome));
+  if (!registry || !Array.isArray(registry.accounts)) return false;
+  if (!registry.accounts.some((account) => account?.auth_mode === "apikey")) return false;
+
+  const query = command.args.join(" ").trim();
+  if (query) {
+    const result = findAccountForSwitch(registry, query);
+    if (result.ambiguous) {
+      console.error(`Multiple accounts matched "${query}". Use a more specific alias, email, account_key, or row number.`);
+      process.exit(1);
+    }
+    if (!result.account) {
+      console.error(`No account matched "${query}".`);
+      process.exit(1);
+    }
+    switchToStoredAccount(command.codexHome, result.account);
+    return true;
+  }
+
+  if (!process.stdin.isTTY) return false;
+  const accounts = sortedRegistryAccounts(registry);
+  renderSwitchRows(accounts, registry.active_account_key);
+  const selected = readLineFromTty("Switch to account number, alias, or email [q to quit]: ");
+  if (!selected || selected.toLowerCase() === "q") {
+    process.stdout.write("No account switched.\n");
+    return true;
+  }
+  const result = findAccountForSwitch(registry, selected);
+  if (result.ambiguous) {
+    console.error(`Multiple accounts matched "${selected}". Use a more specific selector.`);
+    process.exit(1);
+  }
+  if (!result.account) {
+    console.error(`No account matched "${selected}".`);
+    process.exit(1);
+  }
+  switchToStoredAccount(command.codexHome, result.account);
+  return true;
 }
 
 function setApiSpendLimit(codexHome, query, limitUsd) {
@@ -676,7 +869,16 @@ function readLineFromTty(prompt) {
   const chunks = [];
   const buf = Buffer.alloc(1);
   while (true) {
-    const n = fs.readSync(0, buf, 0, 1, null);
+    let n = 0;
+    try {
+      n = fs.readSync(0, buf, 0, 1, null);
+    } catch (error) {
+      if (error?.code === "EAGAIN") {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        continue;
+      }
+      throw error;
+    }
     if (n === 0) break;
     if (buf[0] === 10 || buf[0] === 13) break;
     chunks.push(Buffer.from(buf));
@@ -763,7 +965,16 @@ function readSecretLineFromTty(prompt) {
     const chunks = [];
     const buf = Buffer.alloc(1);
     while (true) {
-      const n = fs.readSync(0, buf, 0, 1, null);
+      let n = 0;
+      try {
+        n = fs.readSync(0, buf, 0, 1, null);
+      } catch (error) {
+        if (error?.code === "EAGAIN") {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+          continue;
+        }
+        throw error;
+      }
       if (n === 0) break;
       if (buf[0] === 10 || buf[0] === 13) break;
       chunks.push(Buffer.from(buf));
@@ -1283,6 +1494,10 @@ if (await maybeHandleApiSpendLimitConfig(argv)) {
 }
 
 if (await maybeHandleAddApiKey(argv)) {
+  process.exit(0);
+}
+
+if (maybeHandleStoredSwitch(argv)) {
   process.exit(0);
 }
 
