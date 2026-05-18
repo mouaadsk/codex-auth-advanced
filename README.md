@@ -25,27 +25,30 @@ npm install -g @openai/codex
 
 After that, you can use `codex login`, `codex login --device-auth`, `codex-auth-advanced login`, `codex-auth-advanced login --device-auth`, or `codex-auth-advanced login --group <name>` to sign in and add accounts more easily.
 
-## Install
+## Local Setup
 
-Install with npm:
+This fork is maintained as a local laptop checkout. The npm package name is `codex-auth-advanced`, but this repository is not set up for registry publishing. The macOS arm64 binary is vendored under `vendor/darwin-arm64/bin/`, and the JavaScript wrapper runs that local binary directly instead of depending on `@loongphy/*` packages.
 
-```shell
-npm install -g codex-auth-advanced
-```
-
-  You can also run it without a global install:
+Link this checkout into your active Node install:
 
 ```shell
-npx codex-auth-advanced list
+npm link
 ```
 
-  npm packages currently support Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64, and Windows arm64.
+Confirm the global command resolves to this repository:
+
+```shell
+which codex-auth-advanced
+realpath "$(which codex-auth-advanced)"
+```
+
+The current vendored binary supports macOS arm64. Other platforms need matching binaries added under `vendor/<platform>-<arch>/bin/`.
 
 ### Uninstall
 
 #### npm
 
-Remove the npm package:
+Remove the local npm link:
 
 ```shell
 npm uninstall -g codex-auth-advanced
@@ -357,8 +360,10 @@ When choosing the next account, `codex-auth-advanced` prefers a usable account w
 The managed background worker is one long-running manager service on all supported platforms:
 
 - Linux/WSL: persistent `systemd --user` service
-- macOS: `LaunchAgent`
+- macOS: `LaunchAgent` named `com.mouaadsk.codex-auth-advanced.manager`
 - Windows: scheduled task that launches the long-running helper at logon, restarts it after failures, has no 72-hour execution cap, and also starts it immediately on enable
+
+In this local fork, API-key account switching is handled by the JavaScript wrapper for direct switch, live switch, live auto-switch, `list --live`, and the background daemon. API-key accounts are considered usable when their spend cap is not exhausted, and group copy/move/add flows repair missing API-key config files when needed.
 
 #### Usage Refresh Source
 

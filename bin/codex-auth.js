@@ -12,6 +12,8 @@ const rootPackageJsonPath = path.join(__dirname, "..", "package.json");
 const requiredNodeMajor = 22;
 const invokedCommandName = path.basename(process.argv[1] ?? "codex-auth", path.extname(process.argv[1] ?? ""));
 const apiSpendLimitFlags = new Set(["--api-spend-limit-usd", "--api-limit-usd", "--spend-limit-usd"]);
+const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
+const legacyLaunchAgentLabel = "com.loongphy.codex-auth-advanced.manager";
 
 function ensureSupportedNodeVersion() {
   const major = Number(process.versions?.node?.split(".")[0] ?? 0);
@@ -1767,8 +1769,9 @@ function xmlEscape(value) {
 
 function repairMacLaunchAgentPath() {
   if (process.platform !== "darwin") return;
-  const plistPath = path.join(userHome(), "Library", "LaunchAgents", "com.loongphy.codex-auth-advanced.manager.plist");
-  if (!fs.existsSync(plistPath)) return;
+  const launchAgentsDir = path.join(userHome(), "Library", "LaunchAgents");
+  const plistPath = path.join(launchAgentsDir, `${launchAgentLabel}.plist`);
+  const legacyPlistPath = path.join(launchAgentsDir, `${legacyLaunchAgentLabel}.plist`);
   const scriptPath = path.join(__dirname, "codex-auth-advanced.js");
   const plist = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -1776,7 +1779,7 @@ function repairMacLaunchAgentPath() {
     '<plist version="1.0">',
     '<dict>',
     '  <key>Label</key>',
-    '  <string>com.loongphy.codex-auth-advanced.manager</string>',
+    `  <string>${launchAgentLabel}</string>`,
     '  <key>ProgramArguments</key>',
     '  <array>',
     `    <string>${xmlEscape(process.execPath)}</string>`,
@@ -1799,7 +1802,11 @@ function repairMacLaunchAgentPath() {
     '</plist>',
     ''
   ].join("\n");
+  ensureDir(launchAgentsDir);
   fs.writeFileSync(plistPath, plist, "utf8");
+  if (legacyPlistPath !== plistPath && fs.existsSync(legacyPlistPath)) {
+    fs.rmSync(legacyPlistPath);
+  }
 }
 
 function resolveBinary() {
