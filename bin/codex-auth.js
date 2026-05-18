@@ -1809,6 +1809,47 @@ function repairMacLaunchAgentPath() {
   }
 }
 
+function isStatusCommand(argv) {
+  if (argv[0] === "status") return true;
+  if (argv[0] === "group" && argv[1] === "status") return true;
+  return argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "status";
+}
+
+function macLaunchAgentIsRunning() {
+  if (process.platform !== "darwin") return null;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid == null) return null;
+  const child = spawnSync("launchctl", ["print", `gui/${uid}/${launchAgentLabel}`], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8"
+  });
+  if ((child.status ?? 1) !== 0) return false;
+  return child.stdout.includes("state = running");
+}
+
+function patchStatusOutput(output) {
+  const serviceRunning = macLaunchAgentIsRunning();
+  if (serviceRunning == null) return output;
+  const serviceLine = `service: ${serviceRunning ? "running" : "stopped"}`;
+  if (/^service: .*$/m.test(output)) {
+    return output.replace(/^service: .*$/m, serviceLine);
+  }
+  return `${output.trimEnd()}\n${serviceLine}\n`;
+}
+
+function maybeRunStatus(binaryPath, argv) {
+  if (!isStatusCommand(argv)) return false;
+  const child = spawnSync(binaryPath, argv, {
+    stdio: ["inherit", "pipe", "pipe"],
+    encoding: "utf8",
+    env: childEnvForArgv(argv)
+  });
+  if (child.stdout) process.stdout.write(patchStatusOutput(child.stdout));
+  if (child.stderr) process.stderr.write(child.stderr);
+  exitFromChild(child);
+  return true;
+}
+
 function resolveBinary() {
   const platformDir = `${process.platform}-${process.arch}`;
   const vendorBinDir = path.join(__dirname, "..", "vendor", platformDir, "bin");
@@ -1871,6 +1912,10 @@ if (maybeHandleStoredSwitch(argv)) {
 }
 
 ensureAllActiveAccountConfigs();
+
+if (maybeRunStatus(binaryPath, argv)) {
+  process.exit(0);
+}
 
 function exitFromChild(child) {
   if (child.error) {
