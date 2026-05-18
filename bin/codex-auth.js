@@ -712,6 +712,17 @@ function switchToStoredAccount(codexHome, account) {
   ensureDir(codexHome);
   backupIfExists(rootAuthPath);
   copyFilePrivate(authPath, rootAuthPath);
+  if (account.auth_mode === "apikey") {
+    const rootAuth = readJsonFile(rootAuthPath);
+    if (rootAuth && typeof rootAuth === "object") {
+      rootAuth.auth_mode = "apikey";
+      rootAuth.email = account.email || account.alias || account.account_key;
+      rootAuth.alias = account.alias || "";
+      rootAuth.account_key = account.account_key;
+      writeJsonFile(rootAuthPath, rootAuth);
+      fs.chmodSync(rootAuthPath, 0o600);
+    }
+  }
 
   if (account.auth_mode === "apikey") {
     const configPath = accountConfigPath(codexHome, account.account_key);
@@ -1318,7 +1329,10 @@ function addApiKeyAccount(codexHome, options) {
 
   writeJsonFile(accountAuthPath(codexHome, accountKey), {
     auth_mode: "apikey",
-    OPENAI_API_KEY: apiKey
+    OPENAI_API_KEY: apiKey,
+    email: account.email,
+    alias: account.alias,
+    account_key: account.account_key
   });
   fs.chmodSync(accountAuthPath(codexHome, accountKey), 0o600);
 
@@ -1545,6 +1559,14 @@ function patchApiKeyMissingAuthOutput(output, checks) {
   return output;
 }
 
+function patchApiKeyMissingAuthError(output) {
+  return String(output || "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "warning: auth.json missing email; skipping sync")
+    .join("\n")
+    .replace(/\n?$/, (match) => match);
+}
+
 function matchingApiCheck(row, checks) {
   const exact = checks.find((check) =>
     accountDisplayNeedles(check.entry.account).some((needle) => row.account === needle)
@@ -1706,7 +1728,8 @@ async function maybeRunApiKeyAwareGroupList(binaryPath, argv) {
     process.stdout.write(patchApiKeyMissingAuthOutput(child.stdout, checks));
   }
   if (child.stderr) {
-    process.stderr.write(child.stderr);
+    const patchedStderr = patchApiKeyMissingAuthError(child.stderr);
+    if (patchedStderr.trim().length > 0) process.stderr.write(patchedStderr.endsWith("\n") ? patchedStderr : `${patchedStderr}\n`);
   }
   if (!child.error && !child.signal && (child.status ?? 1) === 0) {
     await syncApiKeySpendLimits();
