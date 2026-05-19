@@ -865,6 +865,19 @@ function switchToStoredAccount(codexHome, account) {
   const rootAuthPath = path.join(codexHome, "auth.json");
   const rootConfig = rootConfigPath(codexHome);
   ensureDir(codexHome);
+
+  if (account.auth_mode === "apikey") {
+    const configPath = accountConfigPath(codexHome, account.account_key);
+    if (fs.existsSync(configPath)) {
+      const nextConfig = mergeSessionModelConfig(readTextFile(configPath), readTextFile(rootConfig));
+      backupIfExists(rootConfig);
+      fs.writeFileSync(rootConfig, nextConfig, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(rootConfig, 0o600);
+      fs.writeFileSync(configPath, nextConfig, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(configPath, 0o600);
+    }
+  }
+
   backupIfExists(rootAuthPath);
   copyFilePrivate(authPath, rootAuthPath);
   if (account.auth_mode === "apikey") {
@@ -876,18 +889,6 @@ function switchToStoredAccount(codexHome, account) {
       rootAuth.account_key = account.account_key;
       writeJsonFile(rootAuthPath, rootAuth);
       fs.chmodSync(rootAuthPath, 0o600);
-    }
-  }
-
-  if (account.auth_mode === "apikey") {
-    const configPath = accountConfigPath(codexHome, account.account_key);
-    if (fs.existsSync(configPath)) {
-      const nextConfig = mergeSessionModelConfig(readTextFile(configPath), readTextFile(rootConfig));
-      backupIfExists(rootConfig);
-      fs.writeFileSync(rootConfig, nextConfig, { encoding: "utf8", mode: 0o600 });
-      fs.chmodSync(rootConfig, 0o600);
-      fs.writeFileSync(configPath, nextConfig, { encoding: "utf8", mode: 0o600 });
-      fs.chmodSync(configPath, 0o600);
     }
   }
 
