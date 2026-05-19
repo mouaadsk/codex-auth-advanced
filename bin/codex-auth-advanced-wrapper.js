@@ -124,12 +124,82 @@ function registryPath(codexHome) {
   return path.join(codexHome, "accounts", "registry.json");
 }
 
-function defaultApiKeyConfig(baseUrl) {
+const apiKeySessionConfigKeys = ["model", "review_model", "model_reasoning_effort"];
+
+function readTextFile(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function topLevelTomlValues(toml, keys) {
+  const wanted = new Set(keys);
+  const values = new Map();
+  let inTopLevel = true;
+  for (const rawLine of String(toml || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("[") && line.endsWith("]")) {
+      inTopLevel = false;
+      continue;
+    }
+    if (!inTopLevel) continue;
+    const match = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+    if (!match || !wanted.has(match[1])) continue;
+    values.set(match[1], match[2].trim());
+  }
+  return values;
+}
+
+function applyTopLevelTomlValues(toml, values) {
+  if (!values || values.size === 0) return toml;
+
+  const lines = String(toml || "").split(/\r?\n/);
+  const found = new Set();
+  let inTopLevel = true;
+  let firstSectionIndex = lines.findIndex((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith("[") && trimmed.endsWith("]");
+  });
+  if (firstSectionIndex === -1) firstSectionIndex = lines.length;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      inTopLevel = false;
+      continue;
+    }
+    if (!inTopLevel) continue;
+    const match = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=/);
+    if (!match || !values.has(match[1])) continue;
+    lines[i] = `${match[1]} = ${values.get(match[1])}`;
+    found.add(match[1]);
+  }
+
+  const missing = apiKeySessionConfigKeys
+    .filter((key) => values.has(key) && !found.has(key))
+    .map((key) => `${key} = ${values.get(key)}`);
+  if (missing.length > 0) {
+    lines.splice(firstSectionIndex, 0, ...missing, "");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function mergeSessionModelConfig(targetToml, sourceToml) {
+  return applyTopLevelTomlValues(
+    targetToml,
+    topLevelTomlValues(sourceToml, apiKeySessionConfigKeys)
+  );
+}
+
+function defaultApiKeyConfig(baseUrl, sourceToml = "") {
   const cleanedBaseUrl = String(baseUrl || "https://api.openai.com/").trim() || "https://api.openai.com/";
-  return [
+  return mergeSessionModelConfig([
     'model_provider = "OpenAI"',
-    'model = "gpt-5.4"',
-    'review_model = "gpt-5.4"',
+    'model = "gpt-5.5"',
+    'review_model = "gpt-5.5"',
     'model_reasoning_effort = "xhigh"',
     'disable_response_storage = true',
     'network_access = "enabled"',
@@ -143,7 +213,7 @@ function defaultApiKeyConfig(baseUrl) {
     'wire_api = "responses"',
     'requires_openai_auth = true',
     ""
-  ].join("\n");
+  ].join("\n"), sourceToml);
 }
 
 function apiKeyTemplate(name) {
@@ -417,21 +487,20 @@ function parseProviderUsageDetails(body) {
   const monthlyLimit = firstFinite(subscription?.monthly_limit_usd, body?.monthly_limit_usd);
   const remaining = firstFinite(body?.remaining);
   const balance = firstFinite(body?.balance);
-  const dailyPlan = /daily|每日/i.test(String(body?.planName ?? ""));
-  const primaryUsage = dailyPlan
-    ? firstFinite(daily, total, weekly, monthly)
-    : firstFinite(total, monthly, weekly, daily);
-  const primaryLimit = dailyPlan
-    ? firstFinite(
-      Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null,
-      Number.isFinite(weeklyLimit) && weeklyLimit > 0 ? weeklyLimit : null,
-      Number.isFinite(monthlyLimit) && monthlyLimit > 0 ? monthlyLimit : null
-    )
-    : firstFinite(
-      Number.isFinite(monthlyLimit) && monthlyLimit > 0 ? monthlyLimit : null,
-      Number.isFinite(weeklyLimit) && weeklyLimit > 0 ? weeklyLimit : null,
-      Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null
-    );
+  const activeLimit = firstFinite(
+    Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null,
+    Number.isFinite(weeklyLimit) && weeklyLimit > 0 ? weeklyLimit : null,
+    Number.isFinite(monthlyLimit) && monthlyLimit > 0 ? monthlyLimit : null
+  );
+  const activeUsage = Number.isFinite(dailyLimit) && dailyLimit > 0
+    ? firstFinite(daily, Number.isFinite(remaining) ? dailyLimit - remaining : null)
+    : Number.isFinite(weeklyLimit) && weeklyLimit > 0
+      ? weekly
+      : Number.isFinite(monthlyLimit) && monthlyLimit > 0
+        ? monthly
+        : firstFinite(total, monthly, weekly, daily);
+  const primaryUsage = firstFinite(activeUsage, total, monthly, weekly, daily);
+  const primaryLimit = activeLimit;
   const exhausted = remaining === 0 && (Number.isFinite(primaryLimit) || Number.isFinite(balance));
   return {
     daily: Number.isFinite(daily) ? daily : total,
@@ -813,8 +882,12 @@ function switchToStoredAccount(codexHome, account) {
   if (account.auth_mode === "apikey") {
     const configPath = accountConfigPath(codexHome, account.account_key);
     if (fs.existsSync(configPath)) {
+      const nextConfig = mergeSessionModelConfig(readTextFile(configPath), readTextFile(rootConfig));
       backupIfExists(rootConfig);
-      copyFilePrivate(configPath, rootConfig);
+      fs.writeFileSync(rootConfig, nextConfig, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(rootConfig, 0o600);
+      fs.writeFileSync(configPath, nextConfig, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(configPath, 0o600);
     }
   }
 
@@ -1424,7 +1497,7 @@ function addApiKeyAccount(codexHome, options) {
   });
   fs.chmodSync(accountAuthPath(codexHome, accountKey), 0o600);
 
-  fs.writeFileSync(accountConfigPath(codexHome, accountKey), defaultApiKeyConfig(options.baseUrl), { encoding: "utf8", mode: 0o600 });
+  fs.writeFileSync(accountConfigPath(codexHome, accountKey), defaultApiKeyConfig(options.baseUrl, readTextFile(rootConfigPath(codexHome))), { encoding: "utf8", mode: 0o600 });
   writeJsonFile(registryPath(codexHome), registry);
   fs.chmodSync(registryPath(codexHome), 0o600);
 

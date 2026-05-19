@@ -278,6 +278,7 @@ codex-auth-advanced group default config api-spend-limit codex-everywhere 50
 #### Direct API-Key Add
 
 Add a token without creating a JSON file by piping it on stdin. The supported templates are `openai`, `codex-everywhere`, and `tcdmx`; the codex-everywhere template uses `https://codex-everywhere.com/` and defaults the spend limit to `$50`, while the tcdmx template uses `https://tcdmx.com` and defaults the spend limit to `$300`.
+API-key configs inherit the current top-level `model`, `review_model`, and `model_reasoning_effort` settings when they are created or switched, so changing providers does not downgrade the selected session model.
 
 ```shell
 printf '%s' "$OPENAI_API_KEY" | codex-auth-advanced group default add-api-key --template openai --alias openai-main --stdin
