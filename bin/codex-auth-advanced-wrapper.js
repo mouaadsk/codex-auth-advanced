@@ -10,10 +10,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootPackageJsonPath = path.join(__dirname, "..", "package.json");
 const requiredNodeMajor = 22;
-const invokedCommandName = path.basename(process.argv[1] ?? "codex-auth", path.extname(process.argv[1] ?? ""));
+const invokedCommandName = path.basename(process.argv[1] ?? "codex-auth-advanced", path.extname(process.argv[1] ?? ""));
 const apiSpendLimitFlags = new Set(["--api-spend-limit-usd", "--api-limit-usd", "--spend-limit-usd"]);
 const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
-const legacyLaunchAgentLabel = "com.loongphy.codex-auth-advanced.manager";
 
 function ensureSupportedNodeVersion() {
   const major = Number(process.versions?.node?.split(".")[0] ?? 0);
@@ -163,6 +162,13 @@ function apiKeyTemplate(name) {
       defaultSpendLimitUsd: 50
     };
   }
+  if (normalized === "tcdmx") {
+    return {
+      name: "tcdmx",
+      baseUrl: "https://tcdmx.com",
+      defaultSpendLimitUsd: 300
+    };
+  }
   return null;
 }
 
@@ -266,6 +272,55 @@ function loadApiKeyAccountsFromCodexHome(groupName, codexHome) {
 }
 
 async function checkApiKeyAccount(entry) {
+  try {
+    const health = await fetchApiKeyHealth(entry);
+    const costs = health.status == null
+      ? { daily: null, weekly: null, spend: null, limitUsd: null, exhausted: false }
+      : await fetchApiKeyCosts(entry);
+    const limitUsd = apiSpendLimitUsd(entry.account) ?? costs.limitUsd;
+    const exhausted = isApiKeyLimitExhausted(health.status, costs.spend, limitUsd, {
+      providerExhausted: health.exhausted || costs.exhausted,
+      remaining: costs.remaining
+    });
+    return {
+      entry,
+      ok: health.status === 200,
+      label: exhausted ? "0%" : health.status === 200 ? "-" : health.errorName ?? String(health.status),
+      daily: costs.daily,
+      weekly: costs.weekly,
+      spend: costs.spend,
+      limitUsd,
+      exhausted,
+      status: health.status
+    };
+  } catch (error) {
+    const name = error?.name === "AbortError" ? "TimedOut" : "RequestFailed";
+    return { entry, ok: false, label: name, daily: null, weekly: null, spend: null, limitUsd: apiSpendLimitUsd(entry.account), exhausted: false, status: null };
+  }
+}
+
+function isInsufficientBalanceBody(body) {
+  if (!body) return false;
+  if (typeof body === "string") return /insufficient[_ -]?(balance|quota|credits?)/i.test(body);
+  const code = typeof body?.code === "string" ? body.code : "";
+  const message = typeof body?.message === "string" ? body.message : "";
+  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
+  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
+  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
+  return /insufficient[_ -]?(balance|quota|credits?)/i.test(text);
+}
+
+async function readResponseBody(response) {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function fetchApiKeyHealth(entry) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 7000);
   try {
@@ -277,25 +332,17 @@ async function checkApiKeyAccount(entry) {
       },
       signal: controller.signal
     });
-    const costs = response.status === 200 || response.status === 429
-      ? await fetchApiKeyCosts(entry)
-      : { daily: null, weekly: null, spend: null, limitUsd: null };
-    const limitUsd = apiSpendLimitUsd(entry.account) ?? costs.limitUsd;
-    const exhausted = isApiKeyLimitExhausted(response.status, costs.spend, limitUsd);
+    const body = response.status === 200 ? null : await readResponseBody(response);
     return {
-      entry,
-      ok: response.status === 200,
-      label: exhausted ? "0%" : response.status === 200 ? "-" : String(response.status),
-      daily: costs.daily,
-      weekly: costs.weekly,
-      spend: costs.spend,
-      limitUsd,
-      exhausted,
-      status: response.status
+      status: response.status,
+      exhausted: response.status === 429 || isInsufficientBalanceBody(body)
     };
   } catch (error) {
-    const name = error?.name === "AbortError" ? "TimedOut" : "RequestFailed";
-    return { entry, ok: false, label: name, daily: null, weekly: null, spend: null, limitUsd: apiSpendLimitUsd(entry.account), exhausted: false, status: null };
+    return {
+      status: null,
+      exhausted: false,
+      errorName: error?.name === "AbortError" ? "TimedOut" : "RequestFailed"
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -347,37 +394,53 @@ function isoDateFromSeconds(seconds) {
   return new Date(seconds * 1000).toISOString().slice(0, 10);
 }
 
+function firstFinite(...values) {
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 function parseProviderUsageDetails(body) {
   const subscription = body?.subscription;
-  const daily = Number(subscription?.daily_usage_usd);
-  const monthly = Number(subscription?.monthly_usage_usd);
-  const weekly = Number(subscription?.weekly_usage_usd);
-  const dailyLimit = Number(subscription?.daily_limit_usd);
-  const monthlyLimit = Number(subscription?.monthly_limit_usd);
-  const weeklyLimit = Number(subscription?.weekly_limit_usd);
-  const remaining = Number(body?.remaining);
-  const fallback = Number(body?.total_cost ?? body?.cost ?? body?.usage_usd);
-  const fallbackValue = Number.isFinite(fallback) ? fallback : null;
-  const primaryUsage = Number.isFinite(daily)
-    ? daily
-    : Number.isFinite(weekly)
-      ? weekly
-      : Number.isFinite(monthly)
-        ? monthly
-        : fallbackValue;
-  const primaryLimit = Number.isFinite(dailyLimit) && dailyLimit > 0
-    ? dailyLimit
-    : Number.isFinite(weeklyLimit) && weeklyLimit > 0
-      ? weeklyLimit
-      : Number.isFinite(monthlyLimit) && monthlyLimit > 0
-        ? monthlyLimit
-        : null;
+  const usage = body?.usage;
+  const todayUsage = usage?.today;
+  const totalUsage = usage?.total;
+  const daily = firstFinite(subscription?.daily_usage_usd, todayUsage?.actual_cost, todayUsage?.cost);
+  const weekly = firstFinite(subscription?.weekly_usage_usd, body?.weekly_usage_usd);
+  const monthly = firstFinite(subscription?.monthly_usage_usd, body?.monthly_usage_usd);
+  const total = firstFinite(totalUsage?.actual_cost, totalUsage?.cost, body?.total_cost, body?.cost, body?.usage_usd);
+  const dailyLimit = firstFinite(subscription?.daily_limit_usd, body?.daily_limit_usd);
+  const weeklyLimit = firstFinite(subscription?.weekly_limit_usd, body?.weekly_limit_usd);
+  const monthlyLimit = firstFinite(subscription?.monthly_limit_usd, body?.monthly_limit_usd);
+  const remaining = firstFinite(body?.remaining);
+  const balance = firstFinite(body?.balance);
+  const dailyPlan = /daily|每日/i.test(String(body?.planName ?? ""));
+  const primaryUsage = dailyPlan
+    ? firstFinite(daily, total, weekly, monthly)
+    : firstFinite(total, monthly, weekly, daily);
+  const primaryLimit = dailyPlan
+    ? firstFinite(
+      Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null,
+      Number.isFinite(weeklyLimit) && weeklyLimit > 0 ? weeklyLimit : null,
+      Number.isFinite(monthlyLimit) && monthlyLimit > 0 ? monthlyLimit : null
+    )
+    : firstFinite(
+      Number.isFinite(monthlyLimit) && monthlyLimit > 0 ? monthlyLimit : null,
+      Number.isFinite(weeklyLimit) && weeklyLimit > 0 ? weeklyLimit : null,
+      Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null
+    );
+  const exhausted = remaining === 0 && (Number.isFinite(primaryLimit) || Number.isFinite(balance));
   return {
-    daily: Number.isFinite(daily) ? daily : fallbackValue,
-    monthly: Number.isFinite(monthly) ? monthly : fallbackValue,
+    daily: Number.isFinite(daily) ? daily : total,
+    weekly: Number.isFinite(weekly) ? weekly : null,
+    monthly: Number.isFinite(monthly) ? monthly : total,
     spend: primaryUsage,
     limitUsd: primaryLimit,
-    remaining: Number.isFinite(remaining) ? remaining : null
+    remaining: Number.isFinite(remaining) ? remaining : null,
+    exhausted
   };
 }
 
@@ -404,6 +467,11 @@ async function fetchProviderUsage(entry, date) {
 
 async function fetchApiKeyCosts(entry) {
   const now = Math.floor(Date.now() / 1000);
+  if (shouldPreferProviderUsage(entry)) {
+    const providerUsage = await fetchProviderUsage(entry, isoDateFromSeconds(now));
+    if (hasProviderUsageDetails(providerUsage)) return costsFromProviderUsage(providerUsage);
+  }
+
   const dayStart = utcStartOfTodaySeconds();
   const weekStart = now - 7 * 24 * 60 * 60;
   const spendStart = now - 31 * 24 * 60 * 60;
@@ -415,12 +483,28 @@ async function fetchApiKeyCosts(entry) {
   if (daily != null || weekly != null || spend != null) return { daily, weekly, spend };
 
   const providerDaily = await fetchProviderUsage(entry, isoDateFromSeconds(now));
+  return costsFromProviderUsage(providerDaily);
+}
+
+function shouldPreferProviderUsage(entry) {
+  const apiBase = apiBaseFromModelsEndpoint(entry.endpoint).toLowerCase();
+  return !apiBase.startsWith("https://api.openai.com/v1");
+}
+
+function hasProviderUsageDetails(providerUsage) {
+  if (!providerUsage) return false;
+  return [providerUsage.daily, providerUsage.weekly, providerUsage.monthly, providerUsage.spend, providerUsage.limitUsd, providerUsage.remaining]
+    .some((value) => Number.isFinite(value));
+}
+
+function costsFromProviderUsage(providerUsage) {
   return {
-    daily: providerDaily?.daily ?? null,
-    weekly: providerDaily?.monthly ?? providerDaily?.daily ?? null,
-    spend: providerDaily?.spend ?? providerDaily?.monthly ?? providerDaily?.daily ?? null,
-    limitUsd: providerDaily?.limitUsd ?? null,
-    remaining: providerDaily?.remaining ?? null
+    daily: providerUsage?.daily ?? null,
+    weekly: providerUsage?.weekly ?? providerUsage?.monthly ?? providerUsage?.daily ?? null,
+    spend: providerUsage?.spend ?? providerUsage?.monthly ?? providerUsage?.daily ?? null,
+    limitUsd: providerUsage?.limitUsd ?? null,
+    remaining: providerUsage?.remaining ?? null,
+    exhausted: providerUsage?.exhausted === true
   };
 }
 
@@ -440,8 +524,10 @@ function apiSpendLimitUsd(account) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function isApiKeyLimitExhausted(status, spend, limitUsd) {
+function isApiKeyLimitExhausted(status, spend, limitUsd, options = {}) {
   if (status === 429) return true;
+  if (options.providerExhausted === true) return true;
+  if ((status === 402 || status === 403) && Number(options.remaining) === 0) return true;
   return Number.isFinite(limitUsd) && Number.isFinite(spend) && spend >= limitUsd;
 }
 
@@ -1133,7 +1219,7 @@ function parseAddApiKeyArgs(args) {
 
   const template = apiKeyTemplate(options.template ?? "openai");
   if (!template) {
-    console.error("--template must be either openai or codex-everywhere.");
+    console.error("--template must be one of: openai, codex-everywhere, tcdmx.");
     process.exit(1);
   }
   options.template = template.name;
@@ -1187,13 +1273,15 @@ function promptTemplateName() {
   process.stderr.write("API key add mode:\n");
   process.stderr.write("  1) Use template: OpenAI\n");
   process.stderr.write("  2) Use template: Codex-Everywhere\n");
-  process.stderr.write("  3) Custom provider (current/manual behavior)\n");
+  process.stderr.write("  3) Use template: TCDMX\n");
+  process.stderr.write("  4) Custom provider (current/manual behavior)\n");
   while (true) {
-    const choice = readLineFromTty("Choose [1-3]: ");
+    const choice = readLineFromTty("Choose [1-4]: ");
     if (choice === "" || choice === "1") return "openai";
     if (choice === "2") return "codex-everywhere";
-    if (choice === "3") return "custom";
-    process.stderr.write("Please choose 1, 2, or 3.\n");
+    if (choice === "3") return "tcdmx";
+    if (choice === "4") return "custom";
+    process.stderr.write("Please choose 1, 2, 3, or 4.\n");
   }
 }
 
@@ -1230,10 +1318,10 @@ function populateInteractiveAddApiKeyOptions(options) {
 function readApiKeyForAdd(options) {
   if (options.apiKey) return options.apiKey.trim();
   if (options.stdin) return fs.readFileSync(0, "utf8").trim();
-  if (process.env.CODEX_AUTH_API_KEY) return process.env.CODEX_AUTH_API_KEY.trim();
+  if (process.env.CODEX_AUTH_ADVANCED_API_KEY) return process.env.CODEX_AUTH_ADVANCED_API_KEY.trim();
   if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY.trim();
   if (process.stdin.isTTY && process.stderr.isTTY) return readSecretLineFromTty("API key: ");
-  console.error("add-api-key requires --stdin, --api-key, CODEX_AUTH_API_KEY, OPENAI_API_KEY, or an interactive terminal.");
+  console.error("add-api-key requires --stdin, --api-key, CODEX_AUTH_ADVANCED_API_KEY, OPENAI_API_KEY, or an interactive terminal.");
   process.exit(1);
 }
 
@@ -1453,40 +1541,25 @@ async function maybeHandleApiSpendLimitConfig(argv) {
   return true;
 }
 
-async function fetchApiKeyStatus(entry) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
-  try {
-    const response = await fetch(entry.endpoint, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${entry.apiKey}`,
-        "User-Agent": "codex-auth-advanced"
-      },
-      signal: controller.signal
-    });
-    return response.status;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function syncApiKeySpendLimits() {
   const entries = loadApiKeyAccountsForManagedList();
   if (!entries.length) return;
 
   const byRegistry = new Map();
   for (const entry of entries) {
-    const status = await fetchApiKeyStatus(entry);
-    const costs = status === 200 || status === 429 ? await fetchApiKeyCosts(entry) : { spend: null, limitUsd: null };
+    const health = await fetchApiKeyHealth(entry);
+    const costs = health.status == null
+      ? { spend: null, limitUsd: null, remaining: null, exhausted: false }
+      : await fetchApiKeyCosts(entry);
     const limitUsd = apiSpendLimitUsd(entry.account) ?? costs.limitUsd;
-    const exhausted = isApiKeyLimitExhausted(status, costs.spend, limitUsd);
+    const exhausted = isApiKeyLimitExhausted(health.status, costs.spend, limitUsd, {
+      providerExhausted: health.exhausted || costs.exhausted,
+      remaining: costs.remaining
+    });
     if (!Number.isFinite(limitUsd) && !exhausted) continue;
     const key = registryPath(entry.codexHome);
     if (!byRegistry.has(key)) byRegistry.set(key, []);
-    byRegistry.get(key).push({ accountKey: entry.account.account_key, status, spend: costs.spend, limitUsd, exhausted, remaining: costs.remaining });
+    byRegistry.get(key).push({ accountKey: entry.account.account_key, status: health.status, spend: costs.spend, limitUsd, exhausted, remaining: costs.remaining });
   }
 
   for (const [filePath, updates] of byRegistry) {
@@ -1754,7 +1827,7 @@ function maybePrintPreviewVersion(argv) {
   const rootPackage = readRootPackage();
   if (!rootPackage) return false;
 
-  const previewLabel = rootPackage.codexAuthPreviewLabel;
+  const previewLabel = rootPackage.codexAuthAdvancedPreviewLabel;
   if (typeof previewLabel !== "string" || previewLabel.length === 0) return false;
   if (typeof rootPackage.version !== "string" || rootPackage.version.length === 0) return false;
 
@@ -1769,7 +1842,7 @@ if (maybePrintPreviewVersion(process.argv.slice(2))) {
 function childEnvForArgv(argv) {
   const env = {
     ...process.env,
-    CODEX_AUTH_NODE_EXECUTABLE: process.execPath
+    CODEX_AUTH_ADVANCED_NODE_EXECUTABLE: process.execPath
   };
   if (argv[0] === "group" && argv[1] === "default") {
     env.CODEX_HOME = normalDefaultCodexHome();
@@ -1794,7 +1867,6 @@ function repairMacLaunchAgentPath() {
   if (process.platform !== "darwin") return;
   const launchAgentsDir = path.join(userHome(), "Library", "LaunchAgents");
   const plistPath = path.join(launchAgentsDir, `${launchAgentLabel}.plist`);
-  const legacyPlistPath = path.join(launchAgentsDir, `${legacyLaunchAgentLabel}.plist`);
   const scriptPath = path.join(__dirname, "codex-auth-advanced.js");
   const plist = [
     '<?xml version="1.0" encoding="UTF-8"?>',
@@ -1812,9 +1884,9 @@ function repairMacLaunchAgentPath() {
     '  </array>',
     '  <key>EnvironmentVariables</key>',
     '  <dict>',
-    '    <key>CODEX_AUTH_VERSION</key>',
+    '    <key>CODEX_AUTH_ADVANCED_VERSION</key>',
     '    <string>0.3.0-alpha.2</string>',
-    '    <key>CODEX_AUTH_NODE_EXECUTABLE</key>',
+    '    <key>CODEX_AUTH_ADVANCED_NODE_EXECUTABLE</key>',
     `    <string>${xmlEscape(process.execPath)}</string>`,
     '  </dict>',
     '  <key>RunAtLoad</key>',
@@ -1827,8 +1899,48 @@ function repairMacLaunchAgentPath() {
   ].join("\n");
   ensureDir(launchAgentsDir);
   fs.writeFileSync(plistPath, plist, "utf8");
-  if (legacyPlistPath !== plistPath && fs.existsSync(legacyPlistPath)) {
-    fs.rmSync(legacyPlistPath);
+  for (const fileName of fs.readdirSync(launchAgentsDir)) {
+    if (fileName === path.basename(plistPath)) continue;
+    if (!fileName.endsWith(".codex-auth-advanced.manager.plist")) continue;
+    fs.rmSync(path.join(launchAgentsDir, fileName));
+  }
+  unloadStaleMacLaunchAgents(launchAgentsDir, plistPath);
+}
+
+function unloadStaleMacLaunchAgents(launchAgentsDir, currentPlistPath) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid == null) return;
+
+  const labels = new Set();
+  try {
+    for (const fileName of fs.readdirSync(launchAgentsDir)) {
+      if (fileName === path.basename(currentPlistPath)) continue;
+      if (!fileName.endsWith(".codex-auth-advanced.manager.plist")) continue;
+      labels.add(fileName.slice(0, -".plist".length));
+    }
+  } catch {
+    return;
+  }
+
+  const domain = `gui/${uid}`;
+  const child = spawnSync("launchctl", ["print", domain], {
+    stdio: ["ignore", "pipe", "ignore"],
+    encoding: "utf8"
+  });
+  if ((child.status ?? 1) === 0) {
+    const labelPattern = /^\s*(?:\d+\s+\S+\s+)?([A-Za-z0-9_.-]+\.codex-auth-advanced\.manager)(?:\s*=)?\s*$/gm;
+    let match = labelPattern.exec(child.stdout);
+    while (match) {
+      if (match[1] !== launchAgentLabel) labels.add(match[1]);
+      match = labelPattern.exec(child.stdout);
+    }
+  }
+
+  for (const label of labels) {
+    if (label === launchAgentLabel) continue;
+    spawnSync("launchctl", ["bootout", `${domain}/${label}`], {
+      stdio: "ignore"
+    });
   }
 }
 
@@ -1882,18 +1994,11 @@ function resolveBinary() {
     process.exit(1);
   }
 
-  const wantsAdvancedBinary = invokedCommandName === "codex-auth-advanced";
   const advancedBinaryName = process.platform === "win32" ? "codex-auth-advanced.exe" : "codex-auth-advanced";
-  const defaultBinaryName = process.platform === "win32" ? "codex-auth.exe" : "codex-auth";
-  const binaryName = wantsAdvancedBinary ? advancedBinaryName : defaultBinaryName;
-  const binaryPath = path.join(vendorBinDir, binaryName);
+  const binaryPath = path.join(vendorBinDir, advancedBinaryName);
   if (!fs.existsSync(binaryPath)) {
-    const fallbackPath = path.join(vendorBinDir, defaultBinaryName);
-    if (!wantsAdvancedBinary || !fs.existsSync(fallbackPath)) {
-      console.error(`Missing local binary: ${binaryPath}`);
-      process.exit(1);
-    }
-    return fallbackPath;
+    console.error(`Missing local binary: ${binaryPath}`);
+    process.exit(1);
   }
   return binaryPath;
 }
@@ -1901,6 +2006,13 @@ function resolveBinary() {
 const binaryPath = resolveBinary();
 const parsedApiSpendLimitArgs = parseApiSpendLimitArgs(process.argv.slice(2));
 const argv = parsedApiSpendLimitArgs.argv;
+if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-V")) {
+  const child = spawnSync(binaryPath, argv, {
+    stdio: "inherit",
+    env: childEnvForArgv(argv)
+  });
+  exitFromChild(child);
+}
 const apiSpendLimitImportInfo = importCommandInfo(argv);
 
 if (parsedApiSpendLimitArgs.found && !apiSpendLimitImportInfo) {

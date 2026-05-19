@@ -1,3 +1,3 @@
 #!/usr/bin/env node
 
-import "./codex-auth.js";
+import "./codex-auth-advanced-wrapper.js";

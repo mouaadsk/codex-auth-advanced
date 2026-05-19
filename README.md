@@ -27,7 +27,7 @@ After that, you can use `codex login`, `codex login --device-auth`, `codex-auth-
 
 ## Local Setup
 
-This fork is maintained as a local laptop checkout. The npm package name is `codex-auth-advanced`, but this repository is not set up for registry publishing. The macOS arm64 binary is vendored under `vendor/darwin-arm64/bin/`, and the JavaScript wrapper runs that local binary directly instead of depending on `@loongphy/*` packages.
+This project is maintained as a local laptop checkout. The npm package name is `codex-auth-advanced`, but this repository is not set up for registry publishing. The macOS arm64 binary is vendored under `vendor/darwin-arm64/bin/`, and the JavaScript wrapper runs that local binary directly.
 
 Link this checkout into your active Node install:
 
@@ -82,11 +82,11 @@ sed -i '/# Added by codex-auth-advanced installer/,+3d' ~/.config/fish/config.fi
 For non-npm installs on Windows only:
 
 ```powershell
-Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth.exe" -Force -ErrorAction SilentlyContinue
-Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced.exe" -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced-auto.exe" -Force -ErrorAction SilentlyContinue
 [Environment]::SetEnvironmentVariable(
   "Path",
-  (($env:Path -split ';' | Where-Object { $_ -and $_ -ne "$env:LOCALAPPDATA\codex-auth\bin" }) -join ';'),
+  (($env:Path -split ';' | Where-Object { $_ -and $_ -ne "$env:LOCALAPPDATA\codex-auth-advanced\bin" }) -join ';'),
   "User"
 )
 ```
@@ -113,7 +113,7 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
 | `codex-auth-advanced import <path> [--alias <alias>] [--api-spend-limit-usd <amount>]` | Import a single file or batch import from a folder |
 | `codex-auth-advanced import --cpa [<path>] [--api-spend-limit-usd <amount>]` | Import [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) token JSON |
 | `codex-auth-advanced import --purge [<path>]` | Rebuild `registry.json` from existing auth files |
-| `codex-auth-advanced add-api-key --template openai\|codex-everywhere --alias <alias> --stdin` | Add an API key directly without creating a JSON file |
+| `codex-auth-advanced add-api-key --template openai\|codex-everywhere\|tcdmx --alias <alias> --stdin` | Add an API key directly without creating a JSON file |
 
 ### Configuration
 
@@ -131,7 +131,7 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
 | `codex-auth-advanced group list` | List managed account groups and their `CODEX_HOME` folders |
 | `codex-auth-advanced group create <name> [<account>...]` | Create a group under `~/codex-auth-advanced/groups/` and optionally add accounts |
 | `codex-auth-advanced group <name> login [--device-auth]` | Log in and add the new account directly to that group |
-| `codex-auth-advanced group <name> add-api-key --template openai\|codex-everywhere --alias <alias> --stdin` | Add an API key directly to that group |
+| `codex-auth-advanced group <name> add-api-key --template openai\|codex-everywhere\|tcdmx --alias <alias> --stdin` | Add an API key directly to that group |
 | `codex-auth-advanced group <name> add <account>...` | Copy existing accounts from any known group into the target group |
 | `codex-auth-advanced group <name> copy [<account>...]` | Copy accounts into the target group. With no account selector, choose interactively. |
 | `codex-auth-advanced group <name> move [<account>...]` | Move accounts into the target group by copying them, then removing them from their source group. With no account selector, choose interactively. |
@@ -277,11 +277,12 @@ codex-auth-advanced group default config api-spend-limit codex-everywhere 50
 
 #### Direct API-Key Add
 
-Add a token without creating a JSON file by piping it on stdin. The supported templates are `openai` and `codex-everywhere`; the codex-everywhere template uses `https://codex-everywhere.com/` and defaults the spend limit to `$50`.
+Add a token without creating a JSON file by piping it on stdin. The supported templates are `openai`, `codex-everywhere`, and `tcdmx`; the codex-everywhere template uses `https://codex-everywhere.com/` and defaults the spend limit to `$50`, while the tcdmx template uses `https://tcdmx.com` and defaults the spend limit to `$300`.
 
 ```shell
 printf '%s' "$OPENAI_API_KEY" | codex-auth-advanced group default add-api-key --template openai --alias openai-main --stdin
 printf '%s' "$CODEX_EVERYWHERE_API_KEY" | codex-auth-advanced group default add-api-key --template codex-everywhere --alias codex-everywhere-2 --stdin
+printf '%s' "$TCDMX_API_KEY" | codex-auth-advanced group default add-api-key --template tcdmx --alias tcdmx --stdin
 ```
 
 #### Batch Import from a Folder
