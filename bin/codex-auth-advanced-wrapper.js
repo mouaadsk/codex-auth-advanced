@@ -64,12 +64,40 @@ function readJsonFile(filePath) {
 }
 
 function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  writeTextFilePrivate(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function copyFilePrivate(sourcePath, targetPath) {
-  fs.copyFileSync(sourcePath, targetPath);
-  fs.chmodSync(targetPath, 0o600);
+  const tempPath = privateTempPath(targetPath);
+  try {
+    fs.copyFileSync(sourcePath, tempPath);
+    fs.chmodSync(tempPath, 0o600);
+    fs.renameSync(tempPath, targetPath);
+  } finally {
+    if (fs.existsSync(tempPath)) {
+      fs.rmSync(tempPath, { force: true });
+    }
+  }
+}
+
+function privateTempPath(filePath) {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const suffix = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+  return path.join(dir, `.${base}.${suffix}.tmp`);
+}
+
+function writeTextFilePrivate(filePath, value, mode = 0o600) {
+  const tempPath = privateTempPath(filePath);
+  try {
+    fs.writeFileSync(tempPath, value, { encoding: "utf8", mode });
+    fs.chmodSync(tempPath, mode);
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fs.existsSync(tempPath)) {
+      fs.rmSync(tempPath, { force: true });
+    }
+  }
 }
 
 function timestampForBackup() {
@@ -871,10 +899,8 @@ function switchToStoredAccount(codexHome, account) {
     if (fs.existsSync(configPath)) {
       const nextConfig = mergeSessionModelConfig(readTextFile(configPath), readTextFile(rootConfig));
       backupIfExists(rootConfig);
-      fs.writeFileSync(rootConfig, nextConfig, { encoding: "utf8", mode: 0o600 });
-      fs.chmodSync(rootConfig, 0o600);
-      fs.writeFileSync(configPath, nextConfig, { encoding: "utf8", mode: 0o600 });
-      fs.chmodSync(configPath, 0o600);
+      writeTextFilePrivate(rootConfig, nextConfig, 0o600);
+      writeTextFilePrivate(configPath, nextConfig, 0o600);
     }
   }
 
@@ -1498,7 +1524,7 @@ function addApiKeyAccount(codexHome, options) {
   });
   fs.chmodSync(accountAuthPath(codexHome, accountKey), 0o600);
 
-  fs.writeFileSync(accountConfigPath(codexHome, accountKey), defaultApiKeyConfig(options.baseUrl, readTextFile(rootConfigPath(codexHome))), { encoding: "utf8", mode: 0o600 });
+  writeTextFilePrivate(accountConfigPath(codexHome, accountKey), defaultApiKeyConfig(options.baseUrl, readTextFile(rootConfigPath(codexHome))), 0o600);
   writeJsonFile(registryPath(codexHome), registry);
   fs.chmodSync(registryPath(codexHome), 0o600);
 
@@ -1577,7 +1603,7 @@ function ensureActiveAccountConfig(codexHome) {
     new Set(["model_providers.OpenAI"])
   );
   if (next !== current) {
-    fs.writeFileSync(configPath, next, "utf8");
+    writeTextFilePrivate(configPath, next, 0o600);
   }
 }
 
