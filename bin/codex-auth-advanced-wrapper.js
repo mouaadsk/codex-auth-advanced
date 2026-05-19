@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,6 +15,10 @@ const requiredNodeMajor = 22;
 const invokedCommandName = path.basename(process.argv[1] ?? "codex-auth-advanced", path.extname(process.argv[1] ?? ""));
 const apiSpendLimitFlags = new Set(["--api-spend-limit-usd", "--api-limit-usd", "--spend-limit-usd"]);
 const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
+const providerProxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
+const providerProxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
+const providerProxyPrefix = "/_codex-auth-advanced";
+const chatgptCloudflareCookies = new Map();
 
 function ensureSupportedNodeVersion() {
   const major = Number(process.versions?.node?.split(".")[0] ?? 0);
@@ -42,9 +48,13 @@ function normalDefaultCodexHome() {
 
 function managedGroupCodexHome(groupName) {
   if (groupName === "default") {
-    return normalDefaultCodexHome();
+    return defaultCodexHome();
   }
   return path.join(userHome(), "codex-auth-advanced", "groups", groupName);
+}
+
+function projectsConfigPath() {
+  return path.join(userHome(), "codex-auth-advanced", "projects.json");
 }
 
 function isApiKeyAwareGroupList(argv) {
@@ -222,10 +232,73 @@ function mergeSessionModelConfig(targetToml, sourceToml) {
   );
 }
 
+function providerProxyGroupId(codexHome) {
+  return Buffer.from(path.resolve(codexHome), "utf8").toString("base64url");
+}
+
+function codexHomeFromProviderProxyGroupId(groupId) {
+  return Buffer.from(String(groupId || ""), "base64url").toString("utf8");
+}
+
+function providerProxyBaseUrl(codexHome) {
+  return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
+}
+
+function providerProxyHealthUrl() {
+  return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/health`;
+}
+
+function isProviderProxyBaseUrl(baseUrl) {
+  try {
+    const parsed = new URL(String(baseUrl || ""));
+    const expectedPort = String(providerProxyPort);
+    const actualPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    return parsed.hostname === providerProxyHost
+      && actualPort === expectedPort
+      && parsed.pathname.startsWith(`${providerProxyPrefix}/`);
+  } catch {
+    return false;
+  }
+}
+
+function apiKeyProxyConfig(codexHome, accountToml, rootToml) {
+  const baseToml = String(rootToml || "").trim() ? rootToml : accountToml;
+  return upsertOpenAiProviderConfig(
+    mergeSessionModelConfig(baseToml, rootToml || accountToml),
+    providerProxyBaseUrl(codexHome)
+  );
+}
+
+function upsertOpenAiProviderConfig(toml, baseUrl) {
+  const sourceToml = String(toml || "").trim()
+    ? String(toml || "")
+    : defaultApiKeyConfig(baseUrl, "");
+  const withoutOpenAiProvider = removeTomlTopLevelKeyAndSection(
+    sourceToml,
+    new Set(["model_provider", "openai_base_url"]),
+    new Set(["model_providers.OpenAI"])
+  ).trimEnd();
+  const lines = withoutOpenAiProvider ? withoutOpenAiProvider.split(/\r?\n/) : [];
+  let firstSectionIndex = lines.findIndex((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith("[") && trimmed.endsWith("]");
+  });
+  if (firstSectionIndex === -1) firstSectionIndex = lines.length;
+
+  const prefix = [
+    "model_provider = \"openai\"",
+    `openai_base_url = ${JSON.stringify(baseUrl)}`
+  ];
+  if (firstSectionIndex > 0) prefix.push("");
+  lines.splice(firstSectionIndex, 0, ...prefix);
+  return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
+}
+
 function defaultApiKeyConfig(baseUrl, sourceToml = "") {
   const cleanedBaseUrl = String(baseUrl || "https://api.openai.com/").trim() || "https://api.openai.com/";
   return mergeSessionModelConfig([
-    'model_provider = "OpenAI"',
+    'model_provider = "openai"',
+    `openai_base_url = ${JSON.stringify(cleanedBaseUrl)}`,
     'model = "gpt-5.5"',
     'review_model = "gpt-5.5"',
     'model_reasoning_effort = "xhigh"',
@@ -235,12 +308,6 @@ function defaultApiKeyConfig(baseUrl, sourceToml = "") {
     'model_context_window = 1000000',
     'model_auto_compact_token_limit = 900000',
     "",
-    "[model_providers.OpenAI]",
-    'name = "OpenAI"',
-    `base_url = ${JSON.stringify(cleanedBaseUrl)}`,
-    'wire_api = "responses"',
-    'requires_openai_auth = true',
-    ""
   ].join("\n"), sourceToml);
 }
 
@@ -282,21 +349,154 @@ function parseTomlString(value) {
   }
 }
 
+function tomlLiteralForCli(rawValue) {
+  const value = String(rawValue || "").trim();
+  return value.length > 0 ? value : null;
+}
+
+function tomlStringForCli(rawValue) {
+  const value = tomlLiteralForCli(rawValue);
+  if (!value) return null;
+  return parseTomlString(value);
+}
+
+function realPathIfPossible(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+function pathContains(parentPath, childPath) {
+  const relative = path.relative(parentPath, childPath);
+  return relative === "" || (relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function rememberedProjectGroupForCwd(cwd = process.cwd()) {
+  const config = readJsonFile(projectsConfigPath());
+  if (!config || !Array.isArray(config.projects)) return "default";
+
+  const currentPath = realPathIfPossible(cwd);
+  let best = null;
+  for (const project of config.projects) {
+    if (typeof project?.root !== "string" || typeof project?.group !== "string") continue;
+    const rootPath = realPathIfPossible(project.root);
+    if (!pathContains(rootPath, currentPath)) continue;
+    if (!best || rootPath.length > best.rootPath.length) {
+      best = { rootPath, group: project.group };
+    }
+  }
+  return best?.group || "default";
+}
+
+function launchCodexHome(argv) {
+  if (argv[0] === "launch") {
+    return managedGroupCodexHome(rememberedProjectGroupForCwd());
+  }
+  if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "launch") {
+    return managedGroupCodexHome(argv[1]);
+  }
+  return null;
+}
+
+function hasArg(args, names) {
+  const wanted = new Set(names);
+  return args.some((arg) => wanted.has(arg) || [...wanted].some((name) => arg.startsWith(`${name}=`)));
+}
+
+function configOverrideValue(arg) {
+  const eq = String(arg || "").indexOf("=");
+  if (eq <= 0) return null;
+  return String(arg).slice(0, eq).trim();
+}
+
+function hasConfigOverride(args, key) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    let value = null;
+    if (arg === "-c" || arg === "--config") {
+      value = args[i + 1];
+      i += 1;
+    } else if (arg.startsWith("--config=")) {
+      value = arg.slice("--config=".length);
+    }
+    if (configOverrideValue(value) === key) return true;
+  }
+  return false;
+}
+
+function launchPassthroughArgs(argv) {
+  const separatorIndex = argv.indexOf("--");
+  if (separatorIndex === -1) {
+    return { head: argv, passthrough: [] };
+  }
+  return {
+    head: argv.slice(0, separatorIndex),
+    passthrough: argv.slice(separatorIndex + 1)
+  };
+}
+
+function isHelpOrVersionArgs(args) {
+  return hasArg(args, ["--help", "-h", "--version", "-V"]);
+}
+
+function launchConfigOverrideArgs(codexHome, passthrough) {
+  const values = topLevelTomlValues(readTextFile(rootConfigPath(codexHome)), apiKeySessionConfigKeys);
+  const overrides = [];
+  const model = tomlStringForCli(values.get("model"));
+  if (model && !hasArg(passthrough, ["--model", "-m"]) && !hasConfigOverride(passthrough, "model")) {
+    overrides.push("--model", model);
+  }
+  const reasoningEffort = tomlLiteralForCli(values.get("model_reasoning_effort"));
+  if (reasoningEffort && !hasConfigOverride(passthrough, "model_reasoning_effort")) {
+    overrides.push("-c", `model_reasoning_effort=${reasoningEffort}`);
+  }
+  return overrides;
+}
+
+function launchArgvWithCurrentConfig(argv) {
+  const codexHome = launchCodexHome(argv);
+  if (!codexHome) return argv;
+  if (isHelpOrVersionArgs(argv)) return argv;
+
+  const { head, passthrough } = launchPassthroughArgs(argv);
+  if (isHelpOrVersionArgs(passthrough)) return argv;
+
+  const overrides = launchConfigOverrideArgs(codexHome, passthrough);
+  if (overrides.length === 0) return argv;
+  return [...head, "--", ...overrides, ...passthrough];
+}
+
 function readBaseUrl(configPath) {
+  const values = readConfigBaseUrls(configPath);
+  return values.baseUrl || values.openaiBaseUrl || null;
+}
+
+function readConfigBaseUrls(configPath) {
+  const values = { openaiBaseUrl: null, baseUrl: null };
+  let currentSection = null;
   try {
     const data = fs.readFileSync(configPath, "utf8");
     for (const rawLine of data.split(/\r?\n/)) {
       const line = rawLine.trim();
-      if (!line.startsWith("base_url")) continue;
+      const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+      if (sectionMatch) {
+        currentSection = sectionMatch[1];
+        continue;
+      }
       const eq = line.indexOf("=");
       if (eq === -1) continue;
+      const key = line.slice(0, eq).trim();
       const value = parseTomlString(line.slice(eq + 1));
-      if (value) return value;
+      if (!value) continue;
+      if (!currentSection && key === "openai_base_url") values.openaiBaseUrl = value;
+      if (key === "base_url") values.baseUrl = value;
     }
   } catch {
-    return null;
+    return values;
   }
-  return null;
+  return values;
 }
 
 function modelsEndpointFromBaseUrl(baseUrl) {
@@ -332,7 +532,7 @@ function loadApiKeyAccountsForGroup(groupName) {
 }
 
 function loadManagedGroups() {
-  const groups = [{ name: "default", codexHome: normalDefaultCodexHome() }];
+  const groups = [{ name: "default", codexHome: defaultCodexHome() }];
   const config = readJsonFile(path.join(userHome(), "codex-auth-advanced", "config.json"));
   if (config && Array.isArray(config.groups)) {
     for (const group of config.groups) {
@@ -586,6 +786,283 @@ async function fetchApiKeyCosts(entry) {
 function shouldPreferProviderUsage(entry) {
   const apiBase = apiBaseFromModelsEndpoint(entry.endpoint).toLowerCase();
   return !apiBase.startsWith("https://api.openai.com/v1");
+}
+
+function upstreamBaseFromAccountConfig(codexHome, accountKey) {
+  const baseUrl = readBaseUrl(accountConfigPath(codexHome, accountKey));
+  if (!baseUrl || isProviderProxyBaseUrl(baseUrl)) return null;
+  return String(baseUrl).trim().replace(/\/+$/, "");
+}
+
+function activeApiProxyTarget(codexHome) {
+  const registry = readJsonFile(registryPath(codexHome));
+  const account = activeRegistryAccountFromRegistry(registry);
+  if (!account) {
+    return { error: "No active account for this group.", status: 409 };
+  }
+
+  if (account.auth_mode !== "apikey") {
+    return {
+      account,
+      apiKey: null,
+      upstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
+      chatgpt: true
+    };
+  }
+
+  const authJson = readJsonFile(accountAuthPath(codexHome, account.account_key));
+  const apiKey = typeof authJson?.OPENAI_API_KEY === "string" ? authJson.OPENAI_API_KEY : "";
+  if (!apiKey) {
+    return { error: `Missing API key for ${accountLabel(account)}.`, status: 500 };
+  }
+
+  const upstreamBaseUrl = upstreamBaseFromAccountConfig(codexHome, account.account_key);
+  if (!upstreamBaseUrl) {
+    return { error: `Missing upstream base_url for ${accountLabel(account)}.`, status: 500 };
+  }
+
+  return { account, apiKey, upstreamBaseUrl, chatgpt: false };
+}
+
+function targetUrlForProxyRequest(req, codexHome) {
+  const groupPath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
+  const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
+  let rest = incoming.pathname.startsWith(groupPath)
+    ? incoming.pathname.slice(groupPath.length)
+    : incoming.pathname;
+  if (!rest.startsWith("/")) rest = `/${rest}`;
+  if (rest === "/") rest = "";
+  const target = activeApiProxyTarget(codexHome);
+  if (target.error) return target;
+  return {
+    ...target,
+    url: `${target.upstreamBaseUrl}${rest}${incoming.search}`
+  };
+}
+
+function stripHopByHopHeaders(headers) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (Array.isArray(value)) out[key] = value.join(", ");
+    else if (value != null) out[key] = String(value);
+  }
+  for (const name of [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length"
+  ]) {
+    delete out[name];
+  }
+  return out;
+}
+
+function stripProxyResponseHeaders(headers) {
+  const out = {};
+  headers.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if ([
+      "connection",
+      "content-encoding",
+      "content-length",
+      "keep-alive",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "te",
+      "trailer",
+      "transfer-encoding",
+      "upgrade"
+    ].includes(lower)) {
+      return;
+    }
+    out[key] = value;
+  });
+  return out;
+}
+
+function isAllowedCloudflareCookieName(name) {
+  return [
+    "__cf_bm",
+    "__cflb",
+    "__cfruid",
+    "__cfseq",
+    "__cfwaitingroom",
+    "_cfuvid",
+    "cf_clearance",
+    "cf_ob_info",
+    "cf_use_ob"
+  ].includes(name) || name.startsWith("cf_chl_");
+}
+
+function cookieNameFromSetCookie(header) {
+  const name = String(header || "").split("=", 1)[0]?.trim();
+  return name || null;
+}
+
+function captureChatgptCloudflareCookies(headers) {
+  const setCookies = typeof headers.getSetCookie === "function"
+    ? headers.getSetCookie()
+    : [];
+  for (const header of setCookies) {
+    const name = cookieNameFromSetCookie(header);
+    if (!name || !isAllowedCloudflareCookieName(name)) continue;
+    const value = String(header).split(";", 1)[0]?.trim();
+    if (value) chatgptCloudflareCookies.set(name, value);
+  }
+}
+
+function chatgptCloudflareCookieHeader() {
+  return [...chatgptCloudflareCookies.values()].join("; ");
+}
+
+function writeProxyError(res, status, message) {
+  const body = JSON.stringify({ error: { message, type: "codex_auth_advanced_proxy" } });
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body)
+  });
+  res.end(body);
+}
+
+async function handleProviderProxyRequest(req, res) {
+  const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
+  if (incoming.pathname === `${providerProxyPrefix}/health`) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  const pathMatch = incoming.pathname.match(new RegExp(`^${providerProxyPrefix.replaceAll("/", "\\/")}\\/([^/]+)(?:\\/|$)`));
+  if (!pathMatch) {
+    writeProxyError(res, 404, "Unknown codex-auth-advanced proxy route.");
+    return;
+  }
+
+  let codexHome = "";
+  try {
+    codexHome = codexHomeFromProviderProxyGroupId(pathMatch[1]);
+  } catch {
+    writeProxyError(res, 400, "Invalid codex-auth-advanced proxy group id.");
+    return;
+  }
+
+  const target = targetUrlForProxyRequest(req, codexHome);
+  if (target.error) {
+    writeProxyError(res, target.status || 500, target.error);
+    return;
+  }
+
+  try {
+    const headers = stripHopByHopHeaders(req.headers);
+    if (!target.chatgpt) {
+      headers.authorization = `Bearer ${target.apiKey}`;
+    } else if (chatgptCloudflareCookies.size > 0) {
+      const existingCookie = headers.cookie ? `${headers.cookie}; ` : "";
+      headers.cookie = `${existingCookie}${chatgptCloudflareCookieHeader()}`;
+    }
+    headers["user-agent"] = headers["user-agent"] || "codex-auth-advanced-proxy";
+    const upstream = await fetch(target.url, {
+      method: req.method,
+      headers,
+      body: ["GET", "HEAD"].includes(req.method || "GET") ? undefined : Readable.toWeb(req),
+      duplex: "half"
+    });
+    if (target.chatgpt) {
+      captureChatgptCloudflareCookies(upstream.headers);
+    }
+
+    res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+    Readable.fromWeb(upstream.body).on("error", () => res.destroy()).pipe(res);
+  } catch (error) {
+    writeProxyError(res, 502, `Provider proxy request failed: ${error?.message || error}`);
+  }
+}
+
+function startProviderProxyServer() {
+  const server = http.createServer((req, res) => {
+    handleProviderProxyRequest(req, res).catch((error) => {
+      writeProxyError(res, 500, `Provider proxy crashed: ${error?.message || error}`);
+    });
+  });
+  server.listen(providerProxyPort, providerProxyHost, () => {
+    process.stdout.write(`codex-auth-advanced provider proxy listening on http://${providerProxyHost}:${providerProxyPort}\n`);
+  });
+  server.on("error", (error) => {
+    if (error?.code === "EADDRINUSE") {
+      process.stderr.write(`Provider proxy port ${providerProxyPort} is already in use.\n`);
+    } else {
+      process.stderr.write(`Provider proxy failed: ${error?.message || error}\n`);
+    }
+    process.exit(1);
+  });
+}
+
+async function providerProxyIsRunning() {
+  try {
+    const response = await fetch(providerProxyHealthUrl(), { signal: AbortSignal.timeout(700) });
+    return response.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+function detachedProxyEnv() {
+  return {
+    ...process.env,
+    CODEX_AUTH_ADVANCED_NODE_EXECUTABLE: process.execPath,
+    CODEX_AUTH_ADVANCED_PROVIDER_PROXY_CHILD: "1"
+  };
+}
+
+async function ensureProviderProxyRunning({ quiet = false } = {}) {
+  if (await providerProxyIsRunning()) return true;
+  const scriptPath = path.join(__dirname, "codex-auth-advanced.js");
+  const child = spawn(process.execPath, [scriptPath, "proxy", "serve"], {
+    detached: true,
+    stdio: "ignore",
+    env: detachedProxyEnv()
+  });
+  child.unref();
+  for (let i = 0; i < 20; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (await providerProxyIsRunning()) {
+      if (!quiet) process.stdout.write(`Started codex-auth-advanced provider proxy at http://${providerProxyHost}:${providerProxyPort}.\n`);
+      return true;
+    }
+  }
+  if (!quiet) process.stderr.write(`Warning: provider proxy did not respond at ${providerProxyHealthUrl()}.\n`);
+  return false;
+}
+
+async function maybeHandleProviderProxy(argv) {
+  if (argv[0] !== "proxy") return false;
+  const subcommand = argv[1] || "status";
+  if (subcommand === "serve") {
+    startProviderProxyServer();
+    await new Promise(() => {});
+    return true;
+  }
+  if (subcommand === "start") {
+    const ok = await ensureProviderProxyRunning();
+    process.exit(ok ? 0 : 1);
+  }
+  if (subcommand === "status") {
+    const ok = await providerProxyIsRunning();
+    process.stdout.write(`provider proxy: ${ok ? "running" : "stopped"} (${providerProxyHealthUrl()})\n`);
+    process.exit(ok ? 0 : 1);
+  }
+  console.error("Usage: codex-auth-advanced proxy status|start|serve");
+  process.exit(1);
 }
 
 function hasProviderUsageDetails(providerUsage) {
@@ -883,7 +1360,7 @@ function switchFlags(args) {
   return flags;
 }
 
-function switchToStoredAccount(codexHome, account) {
+async function switchToStoredAccount(codexHome, account) {
   const authPath = accountAuthPath(codexHome, account.account_key);
   if (!fs.existsSync(authPath)) {
     console.error(`Missing auth file for ${accountLabel(account)}: ${authPath}`);
@@ -897,11 +1374,23 @@ function switchToStoredAccount(codexHome, account) {
   if (account.auth_mode === "apikey") {
     const configPath = accountConfigPath(codexHome, account.account_key);
     if (fs.existsSync(configPath)) {
-      const nextConfig = mergeSessionModelConfig(readTextFile(configPath), readTextFile(rootConfig));
+      const accountConfig = readTextFile(configPath);
+      const nextConfig = apiKeyProxyConfig(codexHome, accountConfig, readTextFile(rootConfig));
       backupIfExists(rootConfig);
       writeTextFilePrivate(rootConfig, nextConfig, 0o600);
-      writeTextFilePrivate(configPath, nextConfig, 0o600);
+      const refreshedAccountConfig = mergeSessionModelConfig(accountConfig, readTextFile(rootConfig));
+      if (refreshedAccountConfig !== accountConfig) {
+        writeTextFilePrivate(configPath, refreshedAccountConfig, 0o600);
+      }
     }
+    await ensureProviderProxyRunning();
+  } else {
+    const currentConfig = readTextFile(rootConfig);
+    if (currentConfig.trim()) {
+      backupIfExists(rootConfig);
+      writeTextFilePrivate(rootConfig, upsertOpenAiProviderConfig(currentConfig, providerProxyBaseUrl(codexHome)), 0o600);
+    }
+    await ensureProviderProxyRunning();
   }
 
   backupIfExists(rootAuthPath);
@@ -928,10 +1417,6 @@ function switchToStoredAccount(codexHome, account) {
     writeJsonFile(registryFile, registry);
     fs.chmodSync(registryFile, 0o600);
   }
-  if (account.auth_mode !== "apikey") {
-    ensureActiveAccountConfig(codexHome);
-  }
-
   process.stdout.write(`Switched to ${accountLabel(account)}.\n`);
 }
 
@@ -1067,7 +1552,7 @@ async function maybeHandleStoredListLive(argv) {
   }
 }
 
-function maybeHandleStoredSwitch(argv) {
+async function maybeHandleStoredSwitch(argv) {
   const command = parseSwitchCommand(argv);
   if (!command || hasUnsupportedSwitchFlags(command.args)) return false;
 
@@ -1082,7 +1567,7 @@ function maybeHandleStoredSwitch(argv) {
   }
 
   if (flags.live) {
-    handleLiveStoredSwitch(command.codexHome, flags.auto);
+    await handleLiveStoredSwitch(command.codexHome, flags.auto);
     return true;
   }
 
@@ -1097,7 +1582,7 @@ function maybeHandleStoredSwitch(argv) {
       console.error(`No account matched "${query}".`);
       process.exit(1);
     }
-    switchToStoredAccount(command.codexHome, result.account);
+    await switchToStoredAccount(command.codexHome, result.account);
     return true;
   }
 
@@ -1118,7 +1603,7 @@ function maybeHandleStoredSwitch(argv) {
     console.error(`No account matched "${selected}".`);
     process.exit(1);
   }
-  switchToStoredAccount(command.codexHome, result.account);
+  await switchToStoredAccount(command.codexHome, result.account);
   return true;
 }
 
@@ -1142,7 +1627,7 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function handleLiveStoredSwitch(codexHome, auto) {
+async function handleLiveStoredSwitch(codexHome, auto) {
   while (true) {
     const registry = readJsonFile(registryPath(codexHome));
     if (!registry || !Array.isArray(registry.accounts)) {
@@ -1158,7 +1643,7 @@ function handleLiveStoredSwitch(codexHome, auto) {
       if (accountShouldAutoSwitch(active, registry)) {
         const candidate = firstUsableSwitchCandidate(registry);
         if (candidate) {
-          switchToStoredAccount(codexHome, candidate);
+          await switchToStoredAccount(codexHome, candidate);
         } else {
           process.stdout.write("No usable switch candidate found.\n");
         }
@@ -1183,7 +1668,7 @@ function handleLiveStoredSwitch(codexHome, auto) {
       sleep(1200);
       continue;
     }
-    switchToStoredAccount(codexHome, result.account);
+    await switchToStoredAccount(codexHome, result.account);
     sleep(1200);
   }
 }
@@ -1193,21 +1678,22 @@ function autoSwitchEnabled(registry) {
   return auto?.enabled === true;
 }
 
-function autoSwitchCycleForGroup(group) {
+async function autoSwitchCycleForGroup(group) {
   const registry = readJsonFile(registryPath(group.codexHome));
   if (!registry || !Array.isArray(registry.accounts) || !autoSwitchEnabled(registry)) return;
   const active = activeRegistryAccountFromRegistry(registry);
   if (!accountShouldAutoSwitch(active, registry)) return;
   const candidate = firstUsableSwitchCandidate(registry);
   if (!candidate) return;
-  switchToStoredAccount(group.codexHome, candidate);
+  await switchToStoredAccount(group.codexHome, candidate);
 }
 
 async function runAutoSwitchCycle() {
   syncMissingApiKeyConfigsAllGroups();
+  await ensureProviderProxyForActiveApiAccounts();
   await syncApiKeySpendLimits();
   for (const group of loadManagedGroups()) {
-    autoSwitchCycleForGroup(group);
+    await autoSwitchCycleForGroup(group);
   }
 }
 
@@ -1487,6 +1973,8 @@ function addApiKeyAccount(codexHome, options) {
 
   const registry = loadOrCreateRegistry(codexHome);
   const existing = registry.accounts.find((account) => account?.account_key === accountKey);
+  const existingConfigPath = accountConfigPath(codexHome, accountKey);
+  const existingBaseUrl = existing ? readBaseUrl(existingConfigPath) : null;
   const account = existing ?? {
     account_key: accountKey,
     chatgpt_account_id: accountKey,
@@ -1504,6 +1992,9 @@ function addApiKeyAccount(codexHome, options) {
   };
 
   account.api_template = options.template;
+  if (existingBaseUrl && !isProviderProxyBaseUrl(existingBaseUrl) && options.baseUrl === apiKeyTemplate(options.template)?.baseUrl) {
+    options.baseUrl = existingBaseUrl;
+  }
   account.email = options.email || account.email || options.alias || accountKey;
   account.alias = options.alias || account.alias || "";
   account.auth_mode = "apikey";
@@ -1586,8 +2077,8 @@ function removeTomlTopLevelKeyAndSection(toml, topLevelKeys, sections) {
 }
 
 function ensureActiveAccountConfig(codexHome) {
-  const active = activeRegistryAccount(codexHome);
-  if (!active || active.auth_mode === "apikey") return;
+  const registry = readJsonFile(registryPath(codexHome));
+  if (!registry?.active_account_key) return;
 
   const configPath = rootConfigPath(codexHome);
   let current = "";
@@ -1597,11 +2088,7 @@ function ensureActiveAccountConfig(codexHome) {
     return;
   }
 
-  const next = removeTomlTopLevelKeyAndSection(
-    current,
-    new Set(["model_provider"]),
-    new Set(["model_providers.OpenAI"])
-  );
+  const next = upsertOpenAiProviderConfig(current, providerProxyBaseUrl(codexHome));
   if (next !== current) {
     writeTextFilePrivate(configPath, next, 0o600);
   }
@@ -1610,6 +2097,16 @@ function ensureActiveAccountConfig(codexHome) {
 function ensureAllActiveAccountConfigs() {
   for (const group of loadManagedGroups()) {
     ensureActiveAccountConfig(group.codexHome);
+  }
+}
+
+async function ensureProviderProxyForActiveApiAccounts() {
+  for (const group of loadManagedGroups()) {
+    const registry = readJsonFile(registryPath(group.codexHome));
+    if (registry?.active_account_key) {
+      await ensureProviderProxyRunning({ quiet: true });
+      return;
+    }
   }
 }
 
@@ -1945,7 +2442,7 @@ function childEnvForArgv(argv) {
     CODEX_AUTH_ADVANCED_NODE_EXECUTABLE: process.execPath
   };
   if (argv[0] === "group" && argv[1] === "default") {
-    env.CODEX_HOME = normalDefaultCodexHome();
+    env.CODEX_HOME = defaultCodexHome();
   }
   return env;
 }
@@ -2105,7 +2602,7 @@ function resolveBinary() {
 
 const binaryPath = resolveBinary();
 const parsedApiSpendLimitArgs = parseApiSpendLimitArgs(process.argv.slice(2));
-const argv = parsedApiSpendLimitArgs.argv;
+const argv = launchArgvWithCurrentConfig(parsedApiSpendLimitArgs.argv);
 if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-V")) {
   const child = spawnSync(binaryPath, argv, {
     stdio: "inherit",
@@ -2118,6 +2615,10 @@ const apiSpendLimitImportInfo = importCommandInfo(argv);
 if (parsedApiSpendLimitArgs.found && !apiSpendLimitImportInfo) {
   console.error("--api-spend-limit-usd can only be used with `import` or `group <name> import`.");
   process.exit(1);
+}
+
+if (await maybeHandleProviderProxy(argv)) {
+  process.exit(0);
 }
 
 if (await maybeHandleApiSpendLimitConfig(argv)) {
@@ -2142,7 +2643,7 @@ if (await maybeHandleStoredListLive(argv)) {
   process.exit(0);
 }
 
-if (maybeHandleStoredSwitch(argv)) {
+if (await maybeHandleStoredSwitch(argv)) {
   process.exit(0);
 }
 

@@ -114,6 +114,7 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced-auto.
 | `codex-auth-advanced import --cpa [<path>] [--api-spend-limit-usd <amount>]` | Import [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) token JSON |
 | `codex-auth-advanced import --purge [<path>]` | Rebuild `registry.json` from existing auth files |
 | `codex-auth-advanced add-api-key --template openai\|codex-everywhere\|tcdmx --alias <alias> --stdin` | Add an API key directly without creating a JSON file |
+| `codex-auth-advanced proxy status\|start\|serve` | Inspect or run the local provider proxy used for hot API-provider switching |
 
 ### Configuration
 
@@ -140,11 +141,13 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced-auto.
 | `codex-auth-advanced group <name> auto enable\|disable` | Enable or disable auto-switching for that group |
 | `codex-auth-advanced group <name> config api-spend-limit <api-account> <amount>` | Set or update an API-key dollar spend limit inside that group |
 | `codex-auth-advanced group <name> config api enable\|disable` | Enable or disable usage and account API calls for that group |
-| `codex-auth-advanced group <name> launch [resume [session]] [-- <codext-arg>...]` | Launch `codext` with that group as `CODEX_HOME` |
+| `codex-auth-advanced group <name> launch [resume [session]] [-- <codext-arg>...]` | Launch `codext` with that group as `CODEX_HOME` and pass the group's current model settings |
 | `codex-auth-advanced project set-group <name>` | Remember a group for the current project directory |
-| `codex-auth-advanced launch [resume [session]] [-- <codext-arg>...]` | Launch `codext` using the remembered project group, or `default` |
+| `codex-auth-advanced launch [resume [session]] [-- <codext-arg>...]` | Launch `codext` using the remembered project group, or `default`, and pass the group's current model settings |
 
 `default` maps to the normal `~/.codex`. Other managed groups live under `~/codex-auth-advanced/groups/`, each gets its own display color for the grouped list dashboard, and the single advanced auto-switch manager can watch all enabled groups at once.
+
+Launch commands read the selected group's `config.toml` and forward its top-level `model` and `model_reasoning_effort` to `codext` unless you already pass `--model` or a matching `-c` override yourself. This keeps resumed sessions aligned with the current group config instead of letting stale saved thread metadata silently restore an older model.
 
 ---
 
@@ -279,6 +282,7 @@ codex-auth-advanced group default config api-spend-limit codex-everywhere 50
 
 Add a token without creating a JSON file by piping it on stdin. The supported templates are `openai`, `codex-everywhere`, and `tcdmx`; the codex-everywhere template uses `https://codex-everywhere.com/` and defaults the spend limit to `$50`, while the tcdmx template uses `https://tcdmx.com` and defaults the spend limit to `$300`.
 API-key configs inherit the current top-level `model`, `review_model`, and `model_reasoning_effort` settings when they are created or switched, so changing providers does not downgrade the selected session model.
+When an API-key account is active, the root `config.toml` keeps `model_provider = "openai"` and points `openai_base_url` at the local `codex-auth-advanced` provider proxy. The per-account config still stores the real upstream URL, and the proxy forwards each request to the currently active upstream with the currently active API key. Keeping the provider id as lowercase `openai` preserves `codext` resume visibility for older sessions. After the first switch that enables the proxy URL, restart any already-running `codext` session once so it picks up the localhost base URL; later API-to-API switches can happen without changing `codext`'s in-memory provider config.
 
 ```shell
 printf '%s' "$OPENAI_API_KEY" | codex-auth-advanced group default add-api-key --template openai --alias openai-main --stdin
@@ -365,7 +369,7 @@ The managed background worker is one long-running manager service on all support
 - macOS: `LaunchAgent` named `com.mouaadsk.codex-auth-advanced.manager`
 - Windows: scheduled task that launches the long-running helper at logon, restarts it after failures, has no 72-hour execution cap, and also starts it immediately on enable
 
-In this local fork, API-key account switching is handled by the JavaScript wrapper for direct switch, live switch, live auto-switch, `list --live`, and the background daemon. API-key accounts are considered usable when their spend cap is not exhausted, and group copy/move/add flows repair missing API-key config files when needed.
+In this local fork, API-key account switching is handled by the JavaScript wrapper for direct switch, live switch, live auto-switch, `list --live`, and the background daemon. API-key accounts are considered usable when their spend cap is not exhausted, group copy/move/add flows repair missing API-key config files when needed, and the local provider proxy keeps `codext` on a stable localhost endpoint while routing requests to the selected API provider.
 
 #### Usage Refresh Source
 
