@@ -77,6 +77,10 @@ function writeJsonFile(filePath, value) {
   writeTextFilePrivate(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function writeJsonFileInPlace(filePath, value) {
+  writeTextFilePrivateInPlace(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
 function copyFilePrivate(sourcePath, targetPath) {
   const tempPath = privateTempPath(targetPath);
   try {
@@ -108,6 +112,11 @@ function writeTextFilePrivate(filePath, value, mode = 0o600) {
       fs.rmSync(tempPath, { force: true });
     }
   }
+}
+
+function writeTextFilePrivateInPlace(filePath, value, mode = 0o600) {
+  fs.writeFileSync(filePath, value, { encoding: "utf8", mode });
+  fs.chmodSync(filePath, mode);
 }
 
 function timestampForBackup() {
@@ -623,6 +632,17 @@ function isInsufficientBalanceBody(body) {
   return /insufficient[_ -]?(balance|quota|credits?)/i.test(text);
 }
 
+function isInvalidApiKeyBody(body) {
+  if (!body) return false;
+  if (typeof body === "string") return /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i.test(body);
+  const code = typeof body?.code === "string" ? body.code : "";
+  const message = typeof body?.message === "string" ? body.message : "";
+  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
+  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
+  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
+  return /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i.test(text);
+}
+
 async function readResponseBody(response) {
   const text = await response.text();
   if (!text) return null;
@@ -630,6 +650,14 @@ async function readResponseBody(response) {
     return JSON.parse(text);
   } catch {
     return text;
+  }
+}
+
+async function readClonedResponseBody(response) {
+  try {
+    return await readResponseBody(response.clone());
+  } catch {
+    return null;
   }
 }
 
@@ -648,7 +676,7 @@ async function fetchApiKeyHealth(entry) {
     const body = response.status === 200 ? null : await readResponseBody(response);
     return {
       status: response.status,
-      exhausted: response.status === 429 || isInsufficientBalanceBody(body)
+      exhausted: response.status === 429 || isInsufficientBalanceBody(body) || isInvalidApiKeyBody(body)
     };
   } catch (error) {
     return {
@@ -839,6 +867,41 @@ function activeApiProxyTarget(codexHome) {
   return { account, apiKey, upstreamBaseUrl, chatgpt: false };
 }
 
+function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
+  const filePath = registryPath(codexHome);
+  const registry = readJsonFile(filePath);
+  if (!registry || !Array.isArray(registry.accounts)) return null;
+
+  const existing = registry.accounts.find((item) => item?.account_key === account?.account_key);
+  if (!existing) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const limitUsd = apiSpendLimitUsd(existing);
+  existing.api_spend = {
+    spend_usd: Number.isFinite(Number(existing.api_spend?.spend_usd)) ? Number(existing.api_spend.spend_usd) : null,
+    limit_usd: limitUsd,
+    remaining_usd: 0,
+    status,
+    exhausted: true,
+    checked_at: now
+  };
+  existing.last_usage = usageSnapshotForApiSpend(existing.api_spend.spend_usd, limitUsd, true);
+  existing.last_usage_at = now;
+  existing.api_exhausted_reason = isInvalidApiKeyBody(body) ? "invalid_api_key" : "provider_limit";
+  writeJsonFile(filePath, registry);
+  return registry;
+}
+
+async function switchFromExhaustedApiAccount(codexHome, account, status, body) {
+  const registry = markApiAccountExhaustedFromProxy(codexHome, account, status, body);
+  if (!registry || !autoSwitchEnabled(registry)) return false;
+
+  const candidate = firstUsableSwitchCandidate(registry);
+  if (!candidate) return false;
+  await switchToStoredAccount(codexHome, candidate);
+  return true;
+}
+
 function targetUrlForProxyRequest(req, codexHome) {
   const groupPath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
   const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
@@ -1003,6 +1066,13 @@ async function handleProviderProxyRequest(req, res) {
     });
     if (target.chatgpt) {
       captureChatgptCloudflareCookies(upstream.headers);
+    } else if ([401, 402, 403, 429].includes(upstream.status)) {
+      const responseBody = await readClonedResponseBody(upstream);
+      const providerExhausted = isInsufficientBalanceBody(responseBody) || isInvalidApiKeyBody(responseBody);
+      const exhausted = upstream.status === 429 || providerExhausted;
+      if (exhausted) {
+        switchFromExhaustedApiAccount(codexHome, target.account, upstream.status, responseBody).catch(() => {});
+      }
     }
 
     res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
@@ -1422,17 +1492,17 @@ async function switchToStoredAccount(codexHome, account) {
   }
 
   backupIfExists(rootAuthPath);
-  copyFilePrivate(authPath, rootAuthPath);
-  if (account.auth_mode === "apikey") {
-    const rootAuth = readJsonFile(rootAuthPath);
-    if (rootAuth && typeof rootAuth === "object") {
+  const rootAuth = readJsonFile(authPath);
+  if (rootAuth && typeof rootAuth === "object") {
+    if (account.auth_mode === "apikey") {
       rootAuth.auth_mode = "apikey";
       rootAuth.email = account.email || account.alias || account.account_key;
       rootAuth.alias = account.alias || "";
       rootAuth.account_key = account.account_key;
-      writeJsonFile(rootAuthPath, rootAuth);
-      fs.chmodSync(rootAuthPath, 0o600);
+      rootAuth.codex_auth_advanced_switch_nonce = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
     }
+    writeJsonFileInPlace(rootAuthPath, rootAuth);
+    fs.chmodSync(rootAuthPath, 0o600);
   }
 
   const registryFile = registryPath(codexHome);
