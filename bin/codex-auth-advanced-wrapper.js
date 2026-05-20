@@ -962,6 +962,19 @@ async function handleProviderProxyRequest(req, res) {
     const headers = stripHopByHopHeaders(req.headers);
     if (!target.chatgpt) {
       headers.authorization = `Bearer ${target.apiKey}`;
+      for (const key of Object.keys(headers)) {
+        const lower = key.toLowerCase();
+        if (
+          lower === "cookie" ||
+          lower.startsWith("oai-") ||
+          lower === "x-authorization" ||
+          lower.startsWith("sec-") ||
+          lower === "referer" ||
+          lower === "origin"
+        ) {
+          delete headers[key];
+        }
+      }
     } else if (chatgptCloudflareCookies.size > 0) {
       const existingCookie = headers.cookie ? `${headers.cookie}; ` : "";
       headers.cookie = `${existingCookie}${chatgptCloudflareCookieHeader()}`;
