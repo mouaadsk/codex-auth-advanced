@@ -897,7 +897,7 @@ async function switchFromExhaustedApiAccount(codexHome, account, status, body) {
   const registry = markApiAccountExhaustedFromProxy(codexHome, account, status, body);
   if (!registry || !autoSwitchEnabled(registry)) return false;
 
-  const candidate = firstUsableSwitchCandidate(registry);
+  const candidate = firstUsableSwitchCandidate(registry, { preferredAuthMode: "apikey" });
   if (!candidate) return false;
   await switchToStoredAccount(codexHome, candidate);
   return true;
@@ -1040,7 +1040,7 @@ function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}
     if (!websocket && (lower === "connection" || lower === "upgrade")) continue;
     if (lower === "accept-encoding" && websocket) continue;
     if (!target.chatgpt) {
-      if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-")) continue;
+      if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-") || (!websocket && lower.startsWith("sec-"))) continue;
     }
     out[key] = Array.isArray(value) ? value.join(", ") : String(value);
   }
@@ -1054,6 +1054,37 @@ function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}
 
   out["user-agent"] = out["user-agent"] || "codex-auth-advanced-proxy";
   return out;
+}
+
+async function readProxyRequestBody(req) {
+  if (["GET", "HEAD"].includes(req.method || "GET")) return undefined;
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function fetchProviderTarget(req, target, body) {
+  return fetch(target.url, {
+    method: req.method,
+    headers: sanitizeProxyRequestHeaders(req.headers, target),
+    body,
+    duplex: body == null ? undefined : "half"
+  });
+}
+
+async function exhaustedApiResponse(upstream) {
+  if (![401, 402, 403, 429].includes(upstream.status)) {
+    return { exhausted: false, body: null };
+  }
+
+  const body = await readClonedResponseBody(upstream);
+  const providerExhausted = isInsufficientBalanceBody(body) || isInvalidApiKeyBody(body);
+  return {
+    exhausted: upstream.status === 429 || providerExhausted,
+    body
+  };
 }
 
 function writeProxySocketResponseHead(socket, status, headers, { allowUpgrade = false } = {}) {
@@ -1185,48 +1216,31 @@ async function handleProviderProxyRequest(req, res) {
     return;
   }
 
-  const target = targetUrlForProxyRequest(req, codexHome);
+  let target = targetUrlForProxyRequest(req, codexHome);
   if (target.error) {
     writeProxyError(res, target.status || 500, target.error);
     return;
   }
 
   try {
-    const headers = stripHopByHopHeaders(req.headers);
-    if (!target.chatgpt) {
-      headers.authorization = `Bearer ${target.apiKey}`;
-      for (const key of Object.keys(headers)) {
-        const lower = key.toLowerCase();
-        if (
-          lower === "cookie" ||
-          lower.startsWith("oai-") ||
-          lower === "x-authorization" ||
-          lower.startsWith("sec-") ||
-          lower === "referer" ||
-          lower === "origin"
-        ) {
-          delete headers[key];
-        }
-      }
-    } else if (chatgptCloudflareCookies.size > 0) {
-      const existingCookie = headers.cookie ? `${headers.cookie}; ` : "";
-      headers.cookie = `${existingCookie}${chatgptCloudflareCookieHeader()}`;
-    }
-    headers["user-agent"] = headers["user-agent"] || "codex-auth-advanced-proxy";
-    const upstream = await fetch(target.url, {
-      method: req.method,
-      headers,
-      body: ["GET", "HEAD"].includes(req.method || "GET") ? undefined : Readable.toWeb(req),
-      duplex: "half"
-    });
+    const body = await readProxyRequestBody(req);
+    let upstream = await fetchProviderTarget(req, target, body);
     if (target.chatgpt) {
       captureChatgptCloudflareCookies(upstream.headers);
-    } else if ([401, 402, 403, 429].includes(upstream.status)) {
-      const responseBody = await readClonedResponseBody(upstream);
-      const providerExhausted = isInsufficientBalanceBody(responseBody) || isInvalidApiKeyBody(responseBody);
-      const exhausted = upstream.status === 429 || providerExhausted;
+    } else {
+      const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream);
       if (exhausted) {
-        switchFromExhaustedApiAccount(codexHome, target.account, upstream.status, responseBody).catch(() => {});
+        const switched = await switchFromExhaustedApiAccount(codexHome, target.account, upstream.status, responseBody);
+        if (switched) {
+          const retryTarget = targetUrlForProxyRequest(req, codexHome);
+          if (!retryTarget.error && retryTarget.account?.account_key !== target.account?.account_key) {
+            upstream = await fetchProviderTarget(req, retryTarget, body);
+            target = retryTarget;
+            if (target.chatgpt) {
+              captureChatgptCloudflareCookies(upstream.headers);
+            }
+          }
+        }
       }
     }
 
@@ -1876,9 +1890,15 @@ function activeRegistryAccountFromRegistry(registry) {
   return registry.accounts.find((account) => account?.account_key === registry.active_account_key) ?? null;
 }
 
-function firstUsableSwitchCandidate(registry) {
+function firstUsableSwitchCandidate(registry, { preferredAuthMode = null } = {}) {
   const active = registry.active_account_key;
-  return sortedRegistryAccounts(registry).find((account) => account.account_key !== active && accountIsSwitchCandidate(account)) ?? null;
+  const candidates = sortedRegistryAccounts(registry)
+    .filter((account) => account.account_key !== active && accountIsSwitchCandidate(account));
+  if (preferredAuthMode) {
+    const preferred = candidates.find((account) => account.auth_mode === preferredAuthMode);
+    if (preferred) return preferred;
+  }
+  return candidates[0] ?? null;
 }
 
 function sleep(ms) {
@@ -1899,7 +1919,7 @@ async function handleLiveStoredSwitch(codexHome, auto) {
     if (auto) {
       const active = activeRegistryAccountFromRegistry(registry);
       if (accountShouldAutoSwitch(active, registry)) {
-        const candidate = firstUsableSwitchCandidate(registry);
+        const candidate = firstUsableSwitchCandidate(registry, { preferredAuthMode: active?.auth_mode || null });
         if (candidate) {
           await switchToStoredAccount(codexHome, candidate);
         } else {
@@ -1941,7 +1961,7 @@ async function autoSwitchCycleForGroup(group) {
   if (!registry || !Array.isArray(registry.accounts) || !autoSwitchEnabled(registry)) return;
   const active = activeRegistryAccountFromRegistry(registry);
   if (!accountShouldAutoSwitch(active, registry)) return;
-  const candidate = firstUsableSwitchCandidate(registry);
+  const candidate = firstUsableSwitchCandidate(registry, { preferredAuthMode: active?.auth_mode || null });
   if (!candidate) return;
   await switchToStoredAccount(group.codexHome, candidate);
 }
