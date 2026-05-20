@@ -294,8 +294,17 @@ function upsertOpenAiProviderConfig(toml, baseUrl) {
   return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
 
-function defaultApiKeyConfig(baseUrl, sourceToml = "") {
+function apiKeyContextDefaults(templateName) {
+  const template = apiKeyTemplate(templateName);
+  return {
+    modelContextWindow: Number.isFinite(template?.defaultModelContextWindow) ? template.defaultModelContextWindow : 512000,
+    autoCompactTokenLimit: Number.isFinite(template?.defaultAutoCompactTokenLimit) ? template.defaultAutoCompactTokenLimit : 400000
+  };
+}
+
+function defaultApiKeyConfig(baseUrl, sourceToml = "", templateName = null) {
   const cleanedBaseUrl = String(baseUrl || "https://api.openai.com/").trim() || "https://api.openai.com/";
+  const contextDefaults = apiKeyContextDefaults(templateName);
   return mergeSessionModelConfig([
     'model_provider = "openai"',
     `openai_base_url = ${JSON.stringify(cleanedBaseUrl)}`,
@@ -305,8 +314,8 @@ function defaultApiKeyConfig(baseUrl, sourceToml = "") {
     'disable_response_storage = true',
     'network_access = "enabled"',
     'windows_wsl_setup_acknowledged = true',
-    'model_context_window = 512000',
-    'model_auto_compact_token_limit = 400000',
+    `model_context_window = ${contextDefaults.modelContextWindow}`,
+    `model_auto_compact_token_limit = ${contextDefaults.autoCompactTokenLimit}`,
     "",
   ].join("\n"), sourceToml);
 }
@@ -317,21 +326,27 @@ function apiKeyTemplate(name) {
     return {
       name: "openai",
       baseUrl: "https://api.openai.com/v1",
-      defaultSpendLimitUsd: null
+      defaultSpendLimitUsd: null,
+      defaultModelContextWindow: 512000,
+      defaultAutoCompactTokenLimit: 400000
     };
   }
   if (normalized === "codex-everywhere" || normalized === "codex_everywhere" || normalized === "everywhere") {
     return {
       name: "codex-everywhere",
       baseUrl: "https://codex-everywhere.com/",
-      defaultSpendLimitUsd: 50
+      defaultSpendLimitUsd: 50,
+      defaultModelContextWindow: 512000,
+      defaultAutoCompactTokenLimit: 300000
     };
   }
   if (normalized === "tcdmx") {
     return {
       name: "tcdmx",
       baseUrl: "https://tcdmx.com",
-      defaultSpendLimitUsd: 300
+      defaultSpendLimitUsd: 300,
+      defaultModelContextWindow: 512000,
+      defaultAutoCompactTokenLimit: 400000
     };
   }
   return null;
@@ -2028,7 +2043,7 @@ function addApiKeyAccount(codexHome, options) {
   });
   fs.chmodSync(accountAuthPath(codexHome, accountKey), 0o600);
 
-  writeTextFilePrivate(accountConfigPath(codexHome, accountKey), defaultApiKeyConfig(options.baseUrl, readTextFile(rootConfigPath(codexHome))), 0o600);
+  writeTextFilePrivate(accountConfigPath(codexHome, accountKey), defaultApiKeyConfig(options.baseUrl, readTextFile(rootConfigPath(codexHome)), options.template), 0o600);
   writeJsonFile(registryPath(codexHome), registry);
   fs.chmodSync(registryPath(codexHome), 0o600);
 

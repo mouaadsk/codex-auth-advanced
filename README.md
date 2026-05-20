@@ -282,6 +282,7 @@ codex-auth-advanced group default config api-spend-limit codex-everywhere 50
 
 Add a token without creating a JSON file by piping it on stdin. The supported templates are `openai`, `codex-everywhere`, and `tcdmx`; the codex-everywhere template uses `https://codex-everywhere.com/` and defaults the spend limit to `$50`, while the tcdmx template uses `https://tcdmx.com` and defaults the spend limit to `$300`.
 API-key configs inherit the current top-level `model`, `review_model`, and `model_reasoning_effort` settings when they are created or switched, so changing providers does not downgrade the selected session model.
+Generated API-key configs default `model_context_window` to `512000`; the codex-everywhere template uses `model_auto_compact_token_limit = 300000`, while the tcdmx template uses `model_auto_compact_token_limit = 400000`.
 When an API-key account is active, the root `config.toml` keeps `model_provider = "openai"` and points `openai_base_url` at the local `codex-auth-advanced` provider proxy. The per-account config still stores the real upstream URL, and the proxy forwards each request to the currently active upstream with the currently active API key. Keeping the provider id as lowercase `openai` preserves `codext` resume visibility for older sessions. After the first switch that enables the proxy URL, restart any already-running `codext` session once so it picks up the localhost base URL; later API-to-API switches can happen without changing `codext`'s in-memory provider config.
 
 ```shell
