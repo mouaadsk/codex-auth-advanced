@@ -4,6 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -983,11 +984,19 @@ function cookieNameFromSetCookie(header) {
   return name || null;
 }
 
+function responseSetCookieHeaders(headers) {
+  if (!headers) return [];
+  if (typeof headers.getSetCookie === "function") {
+    return headers.getSetCookie();
+  }
+  const setCookie = headers["set-cookie"] ?? headers["Set-Cookie"];
+  if (Array.isArray(setCookie)) return setCookie;
+  if (typeof setCookie === "string" && setCookie.length > 0) return [setCookie];
+  return [];
+}
+
 function captureChatgptCloudflareCookies(headers) {
-  const setCookies = typeof headers.getSetCookie === "function"
-    ? headers.getSetCookie()
-    : [];
-  for (const header of setCookies) {
+  for (const header of responseSetCookieHeaders(headers)) {
     const name = cookieNameFromSetCookie(header);
     if (!name || !isAllowedCloudflareCookieName(name)) continue;
     const value = String(header).split(";", 1)[0]?.trim();
@@ -1006,6 +1015,152 @@ function writeProxyError(res, status, message) {
     "content-length": Buffer.byteLength(body)
   });
   res.end(body);
+}
+
+function writeProxySocketError(socket, status, message) {
+  if (socket.destroyed || !socket.writable) return;
+  const body = JSON.stringify({ error: { message, type: "codex_auth_advanced_proxy" } });
+  const statusMessage = http.STATUS_CODES[status] || "Error";
+  socket.end([
+    `HTTP/1.1 ${status} ${statusMessage}`,
+    "content-type: application/json",
+    `content-length: ${Buffer.byteLength(body)}`,
+    "connection: close",
+    "",
+    body
+  ].join("\r\n"));
+}
+
+function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    const lower = key.toLowerCase();
+    if (lower === "host" || lower === "content-length") continue;
+    if (lower === "proxy-authenticate" || lower === "proxy-authorization" || lower === "proxy-connection" || lower === "te" || lower === "trailer" || lower === "transfer-encoding") continue;
+    if (!websocket && (lower === "connection" || lower === "upgrade")) continue;
+    if (lower === "accept-encoding" && websocket) continue;
+    if (!target.chatgpt) {
+      if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-")) continue;
+    }
+    out[key] = Array.isArray(value) ? value.join(", ") : String(value);
+  }
+
+  if (!target.chatgpt) {
+    out.authorization = `Bearer ${target.apiKey}`;
+  } else if (chatgptCloudflareCookies.size > 0) {
+    const existingCookie = out.cookie ? `${out.cookie}; ` : "";
+    out.cookie = `${existingCookie}${chatgptCloudflareCookieHeader()}`;
+  }
+
+  out["user-agent"] = out["user-agent"] || "codex-auth-advanced-proxy";
+  return out;
+}
+
+function writeProxySocketResponseHead(socket, status, headers, { allowUpgrade = false } = {}) {
+  const statusMessage = http.STATUS_CODES[status] || "OK";
+  socket.write(`HTTP/1.1 ${status} ${statusMessage}\r\n`);
+  for (const [key, value] of Object.entries(headers || {})) {
+    const lower = key.toLowerCase();
+    if (lower === "host" || lower === "content-length" || lower === "keep-alive" || lower === "proxy-authenticate" || lower === "proxy-authorization" || lower === "te" || lower === "trailer" || lower === "transfer-encoding") {
+      continue;
+    }
+    if (!allowUpgrade && (lower === "connection" || lower === "upgrade")) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item != null) socket.write(`${key}: ${item}\r\n`);
+      }
+      continue;
+    }
+    if (value != null) socket.write(`${key}: ${value}\r\n`);
+  }
+  socket.write("\r\n");
+}
+
+function bindProxySocketTunnel(clientSocket, upstreamSocket) {
+  const destroyPeer = (peer) => () => {
+    if (!peer.destroyed) peer.destroy();
+  };
+  clientSocket.on("error", destroyPeer(upstreamSocket));
+  upstreamSocket.on("error", destroyPeer(clientSocket));
+  clientSocket.on("close", destroyPeer(upstreamSocket));
+  upstreamSocket.on("close", destroyPeer(clientSocket));
+  clientSocket.pipe(upstreamSocket);
+  upstreamSocket.pipe(clientSocket);
+}
+
+async function handleProviderProxyUpgrade(req, socket, head) {
+  const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
+  if (incoming.pathname === `${providerProxyPrefix}/health`) {
+    writeProxySocketError(socket, 400, "WebSocket upgrades are not supported on the health route.");
+    return;
+  }
+
+  const pathMatch = incoming.pathname.match(new RegExp(`^${providerProxyPrefix.replaceAll("/", "\\/")}\\/([^/]+)(?:\\/|$)`));
+  if (!pathMatch) {
+    writeProxySocketError(socket, 404, "Unknown codex-auth-advanced proxy route.");
+    return;
+  }
+
+  let codexHome = "";
+  try {
+    codexHome = codexHomeFromProviderProxyGroupId(pathMatch[1]);
+  } catch {
+    writeProxySocketError(socket, 400, "Invalid codex-auth-advanced proxy group id.");
+    return;
+  }
+
+  const target = targetUrlForProxyRequest(req, codexHome);
+  if (target.error) {
+    writeProxySocketError(socket, target.status || 500, target.error);
+    return;
+  }
+
+  try {
+    const upstreamUrl = new URL(target.url);
+    const headers = sanitizeProxyRequestHeaders(req.headers, target, { websocket: true });
+    const requestHeaders = {
+      ...headers,
+      host: upstreamUrl.host
+    };
+
+    const requestOptions = {
+      protocol: upstreamUrl.protocol,
+      hostname: upstreamUrl.hostname,
+      port: upstreamUrl.port,
+      method: req.method || "GET",
+      path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+      headers: requestHeaders
+    };
+
+    const client = upstreamUrl.protocol === "https:" ? https : http;
+    const upstreamRequest = client.request(requestOptions);
+
+    upstreamRequest.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+      if (target.chatgpt) {
+        captureChatgptCloudflareCookies(upstreamRes.headers);
+      }
+      writeProxySocketResponseHead(socket, upstreamRes.statusCode || 101, upstreamRes.headers, { allowUpgrade: true });
+      if (upstreamHead?.length) socket.write(upstreamHead);
+      if (head?.length) upstreamSocket.write(head);
+      bindProxySocketTunnel(socket, upstreamSocket);
+    });
+
+    upstreamRequest.on("response", (upstreamRes) => {
+      if (target.chatgpt) {
+        captureChatgptCloudflareCookies(upstreamRes.headers);
+      }
+      writeProxySocketResponseHead(socket, upstreamRes.statusCode || 500, upstreamRes.headers);
+      upstreamRes.pipe(socket);
+    });
+
+    upstreamRequest.on("error", (error) => {
+      writeProxySocketError(socket, 502, `Provider proxy request failed: ${error?.message || error}`);
+    });
+
+    upstreamRequest.end();
+  } catch (error) {
+    writeProxySocketError(socket, 502, `Provider proxy request failed: ${error?.message || error}`);
+  }
 }
 
 async function handleProviderProxyRequest(req, res) {
@@ -1090,6 +1245,11 @@ function startProviderProxyServer() {
   const server = http.createServer((req, res) => {
     handleProviderProxyRequest(req, res).catch((error) => {
       writeProxyError(res, 500, `Provider proxy crashed: ${error?.message || error}`);
+    });
+  });
+  server.on("upgrade", (req, socket, head) => {
+    handleProviderProxyUpgrade(req, socket, head).catch((error) => {
+      writeProxySocketError(socket, 500, `Provider proxy crashed: ${error?.message || error}`);
     });
   });
   server.listen(providerProxyPort, providerProxyHost, () => {
