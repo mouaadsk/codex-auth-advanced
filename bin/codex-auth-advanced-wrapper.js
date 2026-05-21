@@ -19,6 +19,7 @@ const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
 const providerProxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
 const providerProxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
 const providerProxyPrefix = "/_codex-auth-advanced";
+const chatgptCodexBaseUrl = process.env.CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api/codex";
 const chatgptCloudflareCookies = new Map();
 
 function ensureSupportedNodeVersion() {
@@ -56,6 +57,10 @@ function managedGroupCodexHome(groupName) {
 
 function projectsConfigPath() {
   return path.join(userHome(), "codex-auth-advanced", "projects.json");
+}
+
+function managerPidPath() {
+  return path.join(userHome(), "codex-auth-advanced", "manager.pid");
 }
 
 function isApiKeyAwareGroupList(argv) {
@@ -120,6 +125,51 @@ function writeTextFilePrivateInPlace(filePath, value, mode = 0o600) {
   fs.chmodSync(filePath, mode);
 }
 
+function writeManagerPidFile() {
+  ensureDir(path.dirname(managerPidPath()));
+  writeTextFilePrivate(managerPidPath(), `${process.pid}\n`, 0o600);
+}
+
+function removeManagerPidFile() {
+  try {
+    const existing = readTextFile(managerPidPath()).trim();
+    if (!existing || Number(existing) === process.pid) fs.rmSync(managerPidPath(), { force: true });
+  } catch {
+    // Best effort cleanup only.
+  }
+}
+
+function processIsRunning(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function fallbackManagerIsRunning() {
+  return processIsRunning(readTextFile(managerPidPath()).trim());
+}
+
+function stopFallbackManager() {
+  const pid = Number(readTextFile(managerPidPath()).trim());
+  if (processIsRunning(pid)) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Best effort; a stale pid file is removed below.
+    }
+  }
+  try {
+    fs.rmSync(managerPidPath(), { force: true });
+  } catch {
+    // Best effort cleanup only.
+  }
+}
+
 function timestampForBackup() {
   const now = new Date();
   const pad2 = (value) => String(value).padStart(2, "0");
@@ -173,6 +223,13 @@ function registryPath(codexHome) {
 }
 
 const apiKeySessionConfigKeys = ["model", "review_model", "model_reasoning_effort"];
+const apiKeyRuntimeConfigKeys = [
+  "disable_response_storage",
+  "network_access",
+  "windows_wsl_setup_acknowledged",
+  "model_context_window",
+  "model_auto_compact_token_limit"
+];
 
 function readTextFile(filePath) {
   try {
@@ -200,7 +257,7 @@ function topLevelTomlValues(toml, keys) {
   return values;
 }
 
-function applyTopLevelTomlValues(toml, values) {
+function applyTopLevelTomlValues(toml, values, insertKeys = [...values.keys()]) {
   if (!values || values.size === 0) return toml;
 
   const lines = String(toml || "").split(/\r?\n/);
@@ -225,7 +282,7 @@ function applyTopLevelTomlValues(toml, values) {
     found.add(match[1]);
   }
 
-  const missing = apiKeySessionConfigKeys
+  const missing = insertKeys
     .filter((key) => values.has(key) && !found.has(key))
     .map((key) => `${key} = ${values.get(key)}`);
   if (missing.length > 0) {
@@ -238,7 +295,16 @@ function applyTopLevelTomlValues(toml, values) {
 function mergeSessionModelConfig(targetToml, sourceToml) {
   return applyTopLevelTomlValues(
     targetToml,
-    topLevelTomlValues(sourceToml, apiKeySessionConfigKeys)
+    topLevelTomlValues(sourceToml, apiKeySessionConfigKeys),
+    apiKeySessionConfigKeys
+  );
+}
+
+function mergeApiRuntimeConfig(targetToml, sourceToml) {
+  return applyTopLevelTomlValues(
+    targetToml,
+    topLevelTomlValues(sourceToml, apiKeyRuntimeConfigKeys),
+    apiKeyRuntimeConfigKeys
   );
 }
 
@@ -273,8 +339,9 @@ function isProviderProxyBaseUrl(baseUrl) {
 
 function apiKeyProxyConfig(codexHome, accountToml, rootToml) {
   const baseToml = String(rootToml || "").trim() ? rootToml : accountToml;
+  const withApiRuntimeConfig = mergeApiRuntimeConfig(baseToml, accountToml);
   return upsertOpenAiProviderConfig(
-    mergeSessionModelConfig(baseToml, rootToml || accountToml),
+    mergeSessionModelConfig(withApiRuntimeConfig, rootToml || accountToml),
     providerProxyBaseUrl(codexHome)
   );
 }
@@ -316,8 +383,7 @@ function defaultApiKeyConfig(baseUrl, sourceToml = "", templateName = null) {
   const cleanedBaseUrl = String(baseUrl || "https://api.openai.com/").trim() || "https://api.openai.com/";
   const contextDefaults = apiKeyContextDefaults(templateName);
   return mergeSessionModelConfig([
-    'model_provider = "openai"',
-    `openai_base_url = ${JSON.stringify(cleanedBaseUrl)}`,
+    'model_provider = "OpenAI"',
     'model = "gpt-5.5"',
     'review_model = "gpt-5.5"',
     'model_reasoning_effort = "xhigh"',
@@ -326,6 +392,12 @@ function defaultApiKeyConfig(baseUrl, sourceToml = "", templateName = null) {
     'windows_wsl_setup_acknowledged = true',
     `model_context_window = ${contextDefaults.modelContextWindow}`,
     `model_auto_compact_token_limit = ${contextDefaults.autoCompactTokenLimit}`,
+    "",
+    "[model_providers.OpenAI]",
+    'name = "OpenAI"',
+    `base_url = ${JSON.stringify(cleanedBaseUrl)}`,
+    'wire_api = "responses"',
+    'requires_openai_auth = true',
     "",
   ].join("\n"), sourceToml);
 }
@@ -338,7 +410,8 @@ function apiKeyTemplate(name) {
       baseUrl: "https://api.openai.com/v1",
       defaultSpendLimitUsd: null,
       defaultModelContextWindow: 512000,
-      defaultAutoCompactTokenLimit: 400000
+      defaultAutoCompactTokenLimit: 400000,
+      repairInvalidEncryptedContent: false
     };
   }
   if (normalized === "codex-everywhere" || normalized === "codex_everywhere" || normalized === "everywhere") {
@@ -347,7 +420,8 @@ function apiKeyTemplate(name) {
       baseUrl: "https://codex-everywhere.com/",
       defaultSpendLimitUsd: 50,
       defaultModelContextWindow: 512000,
-      defaultAutoCompactTokenLimit: 300000
+      defaultAutoCompactTokenLimit: 300000,
+      repairInvalidEncryptedContent: false
     };
   }
   if (normalized === "tcdmx") {
@@ -356,10 +430,35 @@ function apiKeyTemplate(name) {
       baseUrl: "https://tcdmx.com",
       defaultSpendLimitUsd: 300,
       defaultModelContextWindow: 512000,
-      defaultAutoCompactTokenLimit: 400000
+      defaultAutoCompactTokenLimit: 400000,
+      repairInvalidEncryptedContent: true
     };
   }
   return null;
+}
+
+function inferApiKeyTemplateName(account, upstreamBaseUrl = "") {
+  const explicit = apiKeyTemplate(account?.api_template)?.name;
+  if (explicit) return explicit;
+
+  let hostname = "";
+  try {
+    hostname = new URL(String(upstreamBaseUrl || "")).hostname.toLowerCase();
+  } catch {
+    hostname = "";
+  }
+  const label = [account?.alias, account?.email, account?.account_name, account?.account_key]
+    .filter((value) => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+
+  if (hostname === "tcdmx.com" || label.includes("tcdmx")) return "tcdmx";
+  if (hostname === "codex-everywhere.com" || label.includes("codex-everywhere")) return "codex-everywhere";
+  return "openai";
+}
+
+function apiKeyTemplateForAccount(account, upstreamBaseUrl = "") {
+  return apiKeyTemplate(inferApiKeyTemplateName(account, upstreamBaseUrl));
 }
 
 function parseTomlString(value) {
@@ -647,6 +746,19 @@ function isInvalidApiKeyBody(body) {
   return /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i.test(text);
 }
 
+function isInvalidEncryptedContentBody(body) {
+  if (!body) return false;
+  if (typeof body === "string") {
+    return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)/i.test(body);
+  }
+  const code = typeof body?.code === "string" ? body.code : "";
+  const message = typeof body?.message === "string" ? body.message : "";
+  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
+  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
+  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
+  return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)/i.test(text);
+}
+
 async function readResponseBody(response) {
   const text = await response.text();
   if (!text) return null;
@@ -841,18 +953,19 @@ function upstreamBaseFromAccountConfig(codexHome, accountKey) {
   return String(baseUrl).trim().replace(/\/+$/, "");
 }
 
-function activeApiProxyTarget(codexHome) {
-  const registry = readJsonFile(registryPath(codexHome));
-  const account = activeRegistryAccountFromRegistry(registry);
+function apiProxyTargetForAccount(codexHome, account) {
   if (!account) {
     return { error: "No active account for this group.", status: 409 };
   }
 
   if (account.auth_mode !== "apikey") {
+    const authJson = readJsonFile(accountAuthPath(codexHome, account.account_key));
+    const accessToken = typeof authJson?.tokens?.access_token === "string" ? authJson.tokens.access_token : "";
     return {
       account,
       apiKey: null,
-      upstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
+      accessToken,
+      upstreamBaseUrl: chatgptCodexBaseUrl,
       chatgpt: true
     };
   }
@@ -868,7 +981,20 @@ function activeApiProxyTarget(codexHome) {
     return { error: `Missing upstream base_url for ${accountLabel(account)}.`, status: 500 };
   }
 
-  return { account, apiKey, upstreamBaseUrl, chatgpt: false };
+  const template = apiKeyTemplateForAccount(account, upstreamBaseUrl);
+  return {
+    account,
+    apiKey,
+    upstreamBaseUrl,
+    chatgpt: false,
+    apiTemplate: template?.name || "openai",
+    repairInvalidEncryptedContent: template?.repairInvalidEncryptedContent === true
+  };
+}
+
+function activeApiProxyTarget(codexHome) {
+  const registry = readJsonFile(registryPath(codexHome));
+  return apiProxyTargetForAccount(codexHome, activeRegistryAccountFromRegistry(registry));
 }
 
 function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
@@ -896,17 +1022,38 @@ function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
   return registry;
 }
 
-async function switchFromExhaustedApiAccount(codexHome, account, status, body) {
+async function switchFromExhaustedApiAccount(codexHome, account, status, body, options = {}) {
   const registry = markApiAccountExhaustedFromProxy(codexHome, account, status, body);
   if (!registry || !autoSwitchEnabled(registry)) return false;
 
-  const candidate = firstUsableSwitchCandidate(registry, { preferredAuthMode: "apikey" });
+  const candidate = firstUsableSwitchCandidate(registry, {
+    preferredAuthMode: "apikey",
+    excludeAccountKeys: options.excludeAccountKeys
+  });
   if (!candidate) return false;
   await switchToStoredAccount(codexHome, candidate);
   return true;
 }
 
-function targetUrlForProxyRequest(req, codexHome) {
+async function targetFromTransientApiFailure(codexHome, req, options = {}) {
+  const registry = readJsonFile(registryPath(codexHome));
+  if (!registry || !autoSwitchEnabled(registry)) return null;
+
+  const candidate = firstUsableSwitchCandidate(registry, {
+    preferredAuthMode: "apikey",
+    excludeAccountKeys: options.excludeAccountKeys
+  });
+  if (!candidate) return null;
+  const target = apiProxyTargetForAccount(codexHome, candidate);
+  if (target.error) return null;
+  return proxyRequestTargetUrl(req, codexHome, target);
+}
+
+function isTransientApiFailureStatus(status) {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function proxyRequestTargetUrl(req, codexHome, target) {
   const groupPath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
   const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
   let rest = incoming.pathname.startsWith(groupPath)
@@ -914,12 +1061,16 @@ function targetUrlForProxyRequest(req, codexHome) {
     : incoming.pathname;
   if (!rest.startsWith("/")) rest = `/${rest}`;
   if (rest === "/") rest = "";
-  const target = activeApiProxyTarget(codexHome);
-  if (target.error) return target;
   return {
     ...target,
     url: `${target.upstreamBaseUrl}${rest}${incoming.search}`
   };
+}
+
+function targetUrlForProxyRequest(req, codexHome) {
+  const target = activeApiProxyTarget(codexHome);
+  if (target.error) return target;
+  return proxyRequestTargetUrl(req, codexHome, target);
 }
 
 function stripHopByHopHeaders(headers) {
@@ -1044,13 +1195,19 @@ function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}
     if (lower === "accept-encoding" && websocket) continue;
     if (!target.chatgpt) {
       if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-") || (!websocket && lower.startsWith("sec-"))) continue;
+    } else if (lower === "authorization" || lower === "x-authorization") {
+      continue;
     }
     out[key] = Array.isArray(value) ? value.join(", ") : String(value);
   }
 
   if (!target.chatgpt) {
     out.authorization = `Bearer ${target.apiKey}`;
-  } else if (chatgptCloudflareCookies.size > 0) {
+  } else if (target.accessToken) {
+    out.authorization = `Bearer ${target.accessToken}`;
+  }
+
+  if (target.chatgpt && chatgptCloudflareCookies.size > 0) {
     const existingCookie = out.cookie ? `${out.cookie}; ` : "";
     out.cookie = `${existingCookie}${chatgptCloudflareCookieHeader()}`;
   }
@@ -1066,6 +1223,70 @@ async function readProxyRequestBody(req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
+}
+
+const dropProxyJsonValue = Symbol("dropProxyJsonValue");
+
+function hasMeaningfulReasoningPayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (Array.isArray(value.summary) && value.summary.length > 0) return true;
+  if (Array.isArray(value.content)) return value.content.length > 0;
+  return value.content != null;
+}
+
+function stripEncryptedContentFromJson(value) {
+  if (Array.isArray(value)) {
+    let removed = false;
+    const items = [];
+    for (const item of value) {
+      const next = stripEncryptedContentFromJson(item);
+      if (next.removed) removed = true;
+      if (next.value === dropProxyJsonValue) {
+        removed = true;
+        continue;
+      }
+      items.push(next.value);
+    }
+    return { value: items, removed };
+  }
+
+  if (!value || typeof value !== "object") {
+    return { value, removed: false };
+  }
+
+  let removed = false;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "encrypted_content") {
+      removed = true;
+      continue;
+    }
+    const next = stripEncryptedContentFromJson(child);
+    if (next.removed) removed = true;
+    if (next.value !== dropProxyJsonValue) out[key] = next.value;
+  }
+
+  if (value.type === "reasoning" && typeof value.encrypted_content === "string" && !hasMeaningfulReasoningPayload(out)) {
+    return { value: dropProxyJsonValue, removed: true };
+  }
+
+  return { value: out, removed };
+}
+
+function stripEncryptedContentFromProxyBody(body) {
+  if (!body || !Buffer.isBuffer(body) || body.length === 0) return { body, removed: false };
+  let parsed = null;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return { body, removed: false };
+  }
+  const stripped = stripEncryptedContentFromJson(parsed);
+  if (!stripped.removed || stripped.value === dropProxyJsonValue) return { body, removed: false };
+  return {
+    body: Buffer.from(JSON.stringify(stripped.value)),
+    removed: true
+  };
 }
 
 async function fetchProviderTarget(req, target, body) {
@@ -1086,6 +1307,17 @@ async function exhaustedApiResponse(upstream) {
   const providerExhausted = isInsufficientBalanceBody(body) || isInvalidApiKeyBody(body);
   return {
     exhausted: upstream.status === 429 || providerExhausted,
+    body
+  };
+}
+
+async function invalidEncryptedContentResponse(upstream) {
+  if (![400, 422].includes(upstream.status)) {
+    return { invalid: false, body: null };
+  }
+  const body = await readClonedResponseBody(upstream);
+  return {
+    invalid: isInvalidEncryptedContentBody(body),
     body
   };
 }
@@ -1226,25 +1458,49 @@ async function handleProviderProxyRequest(req, res) {
   }
 
   try {
-    const body = await readProxyRequestBody(req);
-    let upstream = await fetchProviderTarget(req, target, body);
-    if (target.chatgpt) {
-      captureChatgptCloudflareCookies(upstream.headers);
-    } else {
-      const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream);
-      if (exhausted) {
-        const switched = await switchFromExhaustedApiAccount(codexHome, target.account, upstream.status, responseBody);
-        if (switched) {
-          const retryTarget = targetUrlForProxyRequest(req, codexHome);
-          if (!retryTarget.error && retryTarget.account?.account_key !== target.account?.account_key) {
-            upstream = await fetchProviderTarget(req, retryTarget, body);
-            target = retryTarget;
-            if (target.chatgpt) {
-              captureChatgptCloudflareCookies(upstream.headers);
-            }
+    let body = await readProxyRequestBody(req);
+    let upstream = null;
+    const attemptedAccountKeys = new Set();
+    let retriedWithoutEncryptedContent = false;
+    while (true) {
+      if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
+      upstream = await fetchProviderTarget(req, target, body);
+      if (target.chatgpt) {
+        captureChatgptCloudflareCookies(upstream.headers);
+        break;
+      }
+
+      if (target.repairInvalidEncryptedContent && !retriedWithoutEncryptedContent) {
+        const { invalid } = await invalidEncryptedContentResponse(upstream);
+        if (invalid) {
+          const stripped = stripEncryptedContentFromProxyBody(body);
+          if (stripped.removed) {
+            body = stripped.body;
+            retriedWithoutEncryptedContent = true;
+            continue;
           }
         }
       }
+
+      const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream);
+      const shouldFailOver = exhausted || isTransientApiFailureStatus(upstream.status);
+      if (!shouldFailOver) break;
+
+      const retryTarget = exhausted
+        ? await (async () => {
+          const switched = await switchFromExhaustedApiAccount(codexHome, target.account, upstream.status, responseBody, {
+            excludeAccountKeys: attemptedAccountKeys
+          });
+          return switched ? targetUrlForProxyRequest(req, codexHome) : null;
+        })()
+        : await targetFromTransientApiFailure(codexHome, req, {
+          excludeAccountKeys: attemptedAccountKeys
+        });
+      if (!retryTarget) break;
+      if (retryTarget.error || retryTarget.account?.account_key === target.account?.account_key || attemptedAccountKeys.has(retryTarget.account?.account_key)) {
+        break;
+      }
+      target = retryTarget;
     }
 
     res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
@@ -1671,12 +1927,14 @@ async function switchToStoredAccount(codexHome, account) {
   backupIfExists(rootAuthPath);
   const rootAuth = readJsonFile(authPath);
   if (rootAuth && typeof rootAuth === "object") {
+    rootAuth.auth_mode = account.auth_mode === "apikey" ? "apikey" : "chatgpt";
+    rootAuth.email = account.email || rootAuth.email || "";
+    rootAuth.alias = account.alias || rootAuth.alias || "";
+    rootAuth.account_key = account.account_key;
+    rootAuth.codex_auth_advanced_switch_nonce = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
     if (account.auth_mode === "apikey") {
-      rootAuth.auth_mode = "apikey";
       rootAuth.email = account.email || account.alias || account.account_key;
-      rootAuth.alias = account.alias || "";
-      rootAuth.account_key = account.account_key;
-      rootAuth.codex_auth_advanced_switch_nonce = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+      rootAuth.alias = account.alias || rootAuth.alias || "";
     }
     writeJsonFileInPlace(rootAuthPath, rootAuth);
     fs.chmodSync(rootAuthPath, 0o600);
@@ -1893,10 +2151,11 @@ function activeRegistryAccountFromRegistry(registry) {
   return registry.accounts.find((account) => account?.account_key === registry.active_account_key) ?? null;
 }
 
-function firstUsableSwitchCandidate(registry, { preferredAuthMode = null } = {}) {
+function firstUsableSwitchCandidate(registry, { preferredAuthMode = null, excludeAccountKeys = null } = {}) {
   const active = registry.active_account_key;
+  const excluded = new Set(excludeAccountKeys || []);
   const candidates = sortedRegistryAccounts(registry)
-    .filter((account) => account.account_key !== active && accountIsSwitchCandidate(account));
+    .filter((account) => account.account_key !== active && !excluded.has(account.account_key) && accountIsSwitchCandidate(account));
   if (preferredAuthMode) {
     const preferred = candidates.find((account) => account.auth_mode === preferredAuthMode);
     if (preferred) return preferred;
@@ -1987,6 +2246,16 @@ async function maybeHandleDaemon(argv) {
     await runAutoSwitchCycle();
     return true;
   }
+  writeManagerPidFile();
+  process.once("exit", removeManagerPidFile);
+  process.once("SIGTERM", () => {
+    removeManagerPidFile();
+    process.exit(0);
+  });
+  process.once("SIGINT", () => {
+    removeManagerPidFile();
+    process.exit(0);
+  });
   while (true) {
     await runAutoSwitchCycle();
     sleep(30000);
@@ -2733,12 +3002,31 @@ function isAutoConfigCommand(argv) {
   return argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "auto";
 }
 
+function autoConfigAction(argv) {
+  if (argv[0] === "config" && argv[1] === "auto") return argv[2] || "";
+  if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "auto") return argv[3] || "";
+  return "";
+}
+
 function xmlEscape(value) {
   return String(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function launchAgentPathEnv() {
+  return [...new Set([
+    path.dirname(process.execPath),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin"
+  ])].join(":");
 }
 
 function repairMacLaunchAgentPath() {
@@ -2766,6 +3054,10 @@ function repairMacLaunchAgentPath() {
     '    <string>0.3.0-alpha.2</string>',
     '    <key>CODEX_AUTH_ADVANCED_NODE_EXECUTABLE</key>',
     `    <string>${xmlEscape(process.execPath)}</string>`,
+    '    <key>HOME</key>',
+    `    <string>${xmlEscape(userHome())}</string>`,
+    '    <key>PATH</key>',
+    `    <string>${xmlEscape(launchAgentPathEnv())}</string>`,
     '  </dict>',
     '  <key>RunAtLoad</key>',
     '  <true/>',
@@ -2783,6 +3075,73 @@ function repairMacLaunchAgentPath() {
     fs.rmSync(path.join(launchAgentsDir, fileName));
   }
   unloadStaleMacLaunchAgents(launchAgentsDir, plistPath);
+}
+
+function macLaunchAgentDomain() {
+  if (process.platform !== "darwin") return null;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  return uid == null ? null : `gui/${uid}`;
+}
+
+function macLaunchAgentPlistPath() {
+  return path.join(userHome(), "Library", "LaunchAgents", `${launchAgentLabel}.plist`);
+}
+
+function bootoutMacLaunchAgent() {
+  const domain = macLaunchAgentDomain();
+  if (!domain) return;
+  spawnSync("launchctl", ["bootout", `${domain}/${launchAgentLabel}`], {
+    stdio: "ignore"
+  });
+}
+
+function bootstrapMacLaunchAgent() {
+  const domain = macLaunchAgentDomain();
+  if (!domain) return;
+  const plistPath = macLaunchAgentPlistPath();
+  if (!fs.existsSync(plistPath)) return;
+  bootoutMacLaunchAgent();
+  spawnSync("launchctl", ["bootstrap", domain, plistPath], {
+    stdio: "ignore"
+  });
+  spawnSync("launchctl", ["kickstart", "-k", `${domain}/${launchAgentLabel}`], {
+    stdio: "ignore"
+  });
+}
+
+function startDetachedManagerFallback() {
+  if (fallbackManagerIsRunning()) return;
+  const scriptPath = path.join(__dirname, "codex-auth-advanced.js");
+  const child = spawn(process.execPath, [scriptPath, "daemon", "--manager"], {
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      CODEX_AUTH_ADVANCED_NODE_EXECUTABLE: process.execPath,
+      HOME: userHome()
+    }
+  });
+  child.unref();
+  ensureDir(path.dirname(managerPidPath()));
+  writeTextFilePrivate(managerPidPath(), `${child.pid}\n`, 0o600);
+}
+
+function ensureAutoSwitchManagerRunning() {
+  stopFallbackManager();
+  repairMacLaunchAgentPath();
+  bootstrapMacLaunchAgent();
+  for (let i = 0; i < 20; i += 1) {
+    if (macLaunchAgentIsRunning()) return;
+    sleep(100);
+  }
+  if (!macLaunchAgentIsRunning()) {
+    startDetachedManagerFallback();
+  }
+}
+
+function stopAutoSwitchManager() {
+  bootoutMacLaunchAgent();
+  stopFallbackManager();
 }
 
 function unloadStaleMacLaunchAgents(launchAgentsDir, currentPlistPath) {
@@ -2828,11 +3187,21 @@ function isStatusCommand(argv) {
   return argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "status";
 }
 
+function statusCodexHome(argv) {
+  if (argv[0] === "status") return defaultCodexHome();
+  if (argv[0] === "group" && argv[1] === "status" && typeof argv[2] === "string") {
+    return managedGroupCodexHome(argv[2]);
+  }
+  if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "status") {
+    return managedGroupCodexHome(argv[1]);
+  }
+  return null;
+}
+
 function macLaunchAgentIsRunning() {
-  if (process.platform !== "darwin") return null;
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (uid == null) return null;
-  const child = spawnSync("launchctl", ["print", `gui/${uid}/${launchAgentLabel}`], {
+  const domain = macLaunchAgentDomain();
+  if (!domain) return null;
+  const child = spawnSync("launchctl", ["print", `${domain}/${launchAgentLabel}`], {
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8"
   });
@@ -2840,14 +3209,38 @@ function macLaunchAgentIsRunning() {
   return child.stdout.includes("state = running");
 }
 
-function patchStatusOutput(output) {
-  const serviceRunning = macLaunchAgentIsRunning();
-  if (serviceRunning == null) return output;
-  const serviceLine = `service: ${serviceRunning ? "running" : "stopped"}`;
-  if (/^service: .*$/m.test(output)) {
-    return output.replace(/^service: .*$/m, serviceLine);
+function autoSwitchServiceIsRunning() {
+  const launchAgentRunning = macLaunchAgentIsRunning();
+  if (launchAgentRunning == null) return fallbackManagerIsRunning() ? true : null;
+  return launchAgentRunning || fallbackManagerIsRunning();
+}
+
+function activeAccountStatusLine(codexHome) {
+  if (!codexHome) return null;
+  const registry = readJsonFile(registryPath(codexHome));
+  const active = activeRegistryAccountFromRegistry(registry);
+  if (!active) return null;
+  const plan = accountPlanLabel(active);
+  return `account: ${accountLabel(active)}${plan && plan !== "-" ? ` (${plan})` : ""}`;
+}
+
+function patchStatusOutput(output, argv) {
+  const serviceRunning = autoSwitchServiceIsRunning();
+  let patched = output;
+  const accountLine = activeAccountStatusLine(statusCodexHome(argv));
+  if (accountLine) {
+    if (/^account: .*$/m.test(patched)) {
+      patched = patched.replace(/^account: .*$/m, accountLine);
+    } else {
+      patched = `${patched.trimEnd()}\n${accountLine}\n`;
+    }
   }
-  return `${output.trimEnd()}\n${serviceLine}\n`;
+  if (serviceRunning == null) return patched;
+  const serviceLine = `service: ${serviceRunning ? "running" : "stopped"}`;
+  if (/^service: .*$/m.test(patched)) {
+    return patched.replace(/^service: .*$/m, serviceLine);
+  }
+  return `${patched.trimEnd()}\n${serviceLine}\n`;
 }
 
 function maybeRunStatus(binaryPath, argv) {
@@ -2857,7 +3250,7 @@ function maybeRunStatus(binaryPath, argv) {
     encoding: "utf8",
     env: childEnvForArgv(argv)
   });
-  if (child.stdout) process.stdout.write(patchStatusOutput(child.stdout));
+  if (child.stdout) process.stdout.write(patchStatusOutput(child.stdout, argv));
   if (child.stderr) process.stderr.write(child.stderr);
   exitFromChild(child);
   return true;
@@ -2960,7 +3353,11 @@ if (!(await maybeRunApiKeyAwareGroupList(binaryPath, argv))) {
     await syncApiKeySpendLimits();
     syncMissingApiKeyConfigsAllGroups();
     if (isAutoConfigCommand(argv)) {
-      repairMacLaunchAgentPath();
+      if (autoConfigAction(argv) === "disable") {
+        stopAutoSwitchManager();
+      } else {
+        ensureAutoSwitchManagerRunning();
+      }
     }
     ensureAllActiveAccountConfigs();
   }
