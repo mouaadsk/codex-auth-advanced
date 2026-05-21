@@ -596,22 +596,25 @@ function loadApiKeyAccountsFromCodexHome(groupName, codexHome) {
 
 async function checkApiKeyAccount(entry) {
   try {
-    const health = await fetchApiKeyHealth(entry);
-    const costs = health.status == null
+    const [health, costs] = await Promise.all([
+      fetchApiKeyHealth(entry),
+      fetchApiKeyCosts(entry)
+    ]);
+    const cleanCosts = health.status == null || !costs
       ? { daily: null, weekly: null, spend: null, limitUsd: null, exhausted: false }
-      : await fetchApiKeyCosts(entry);
-    const limitUsd = apiSpendLimitUsd(entry.account) ?? costs.limitUsd;
-    const exhausted = isApiKeyLimitExhausted(health.status, costs.spend, limitUsd, {
-      providerExhausted: health.exhausted || costs.exhausted,
-      remaining: costs.remaining
+      : costs;
+    const limitUsd = apiSpendLimitUsd(entry.account) ?? cleanCosts.limitUsd;
+    const exhausted = isApiKeyLimitExhausted(health.status, cleanCosts.spend, limitUsd, {
+      providerExhausted: health.exhausted || cleanCosts.exhausted,
+      remaining: cleanCosts.remaining
     });
     return {
       entry,
       ok: health.status === 200,
       label: exhausted ? "0%" : health.status === 200 ? "-" : health.errorName ?? String(health.status),
-      daily: costs.daily,
-      weekly: costs.weekly,
-      spend: costs.spend,
+      daily: cleanCosts.daily,
+      weekly: cleanCosts.weekly,
+      spend: cleanCosts.spend,
       limitUsd,
       exhausted,
       status: health.status
@@ -664,7 +667,7 @@ async function readClonedResponseBody(response) {
 
 async function fetchApiKeyHealth(entry) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
+  const timeout = setTimeout(() => controller.abort(), 5000);
   try {
     const response = await fetch(entry.endpoint, {
       method: "GET",
@@ -713,7 +716,7 @@ function parseCostsTotal(body) {
 
 async function fetchCostTotal(entry, startTime, endTime) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
     const response = await fetch(costsEndpointFromModelsEndpoint(entry.endpoint, startTime, endTime), {
       method: "GET",
@@ -787,7 +790,7 @@ function parseProviderUsageDetails(body) {
 
 async function fetchProviderUsage(entry, date) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
     const response = await fetch(usageEndpointFromModelsEndpoint(entry.endpoint, date), {
       method: "GET",
