@@ -716,7 +716,7 @@ function parseCostsTotal(body) {
 
 async function fetchCostTotal(entry, startTime, endTime) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), 15000);
   try {
     const response = await fetch(costsEndpointFromModelsEndpoint(entry.endpoint, startTime, endTime), {
       method: "GET",
@@ -790,7 +790,7 @@ function parseProviderUsageDetails(body) {
 
 async function fetchProviderUsage(entry, date) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), 15000);
   try {
     const response = await fetch(usageEndpointFromModelsEndpoint(entry.endpoint, date), {
       method: "GET",
