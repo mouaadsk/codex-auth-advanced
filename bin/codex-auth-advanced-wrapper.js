@@ -421,7 +421,7 @@ function apiKeyTemplate(name) {
       defaultSpendLimitUsd: 50,
       defaultModelContextWindow: 512000,
       defaultAutoCompactTokenLimit: 300000,
-      repairInvalidEncryptedContent: false
+      repairInvalidEncryptedContent: true
     };
   }
   if (normalized === "tcdmx") {
@@ -1322,6 +1322,25 @@ async function invalidEncryptedContentResponse(upstream) {
   };
 }
 
+function isCompactProxyTarget(target) {
+  try {
+    return new URL(target.url).pathname.endsWith("/responses/compact");
+  } catch {
+    return false;
+  }
+}
+
+function maybeRepairProviderProxyBody(target, body) {
+  if (!target.repairInvalidEncryptedContent || !isCompactProxyTarget(target)) {
+    return { body, repaired: false };
+  }
+  const stripped = stripEncryptedContentFromProxyBody(body);
+  return {
+    body: stripped.body,
+    repaired: stripped.removed
+  };
+}
+
 function writeProxySocketResponseHead(socket, status, headers, { allowUpgrade = false } = {}) {
   const statusMessage = http.STATUS_CODES[status] || "OK";
   socket.write(`HTTP/1.1 ${status} ${statusMessage}\r\n`);
@@ -1461,22 +1480,21 @@ async function handleProviderProxyRequest(req, res) {
     let body = await readProxyRequestBody(req);
     let upstream = null;
     const attemptedAccountKeys = new Set();
-    let retriedWithoutEncryptedContent = false;
     while (true) {
       if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
-      upstream = await fetchProviderTarget(req, target, body);
+      const repairedRequest = maybeRepairProviderProxyBody(target, body);
+      upstream = await fetchProviderTarget(req, target, repairedRequest.body);
       if (target.chatgpt) {
         captureChatgptCloudflareCookies(upstream.headers);
         break;
       }
 
-      if (target.repairInvalidEncryptedContent && !retriedWithoutEncryptedContent) {
+      if (target.repairInvalidEncryptedContent && !repairedRequest.repaired) {
         const { invalid } = await invalidEncryptedContentResponse(upstream);
         if (invalid) {
           const stripped = stripEncryptedContentFromProxyBody(body);
           if (stripped.removed) {
             body = stripped.body;
-            retriedWithoutEncryptedContent = true;
             continue;
           }
         }
