@@ -1201,6 +1201,10 @@ function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}
     out[key] = Array.isArray(value) ? value.join(", ") : String(value);
   }
 
+  if (!target.chatgpt && target.repairInvalidEncryptedContent) {
+    out["accept-encoding"] = "identity";
+  }
+
   if (!target.chatgpt) {
     out.authorization = `Bearer ${target.apiKey}`;
   } else if (target.accessToken) {
@@ -1227,11 +1231,8 @@ async function readProxyRequestBody(req) {
 
 const dropProxyJsonValue = Symbol("dropProxyJsonValue");
 
-function hasMeaningfulReasoningPayload(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  if (Array.isArray(value.summary) && value.summary.length > 0) return true;
-  if (Array.isArray(value.content)) return value.content.length > 0;
-  return value.content != null;
+function isEncryptedContentKey(key) {
+  return String(key || "").replaceAll(/[_-]/g, "").toLowerCase() === "encryptedcontent";
 }
 
 function stripEncryptedContentFromJson(value) {
@@ -1254,20 +1255,20 @@ function stripEncryptedContentFromJson(value) {
     return { value, removed: false };
   }
 
+  if (value.type === "reasoning") {
+    return { value: dropProxyJsonValue, removed: true };
+  }
+
   let removed = false;
   const out = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === "encrypted_content") {
+    if (isEncryptedContentKey(key)) {
       removed = true;
       continue;
     }
     const next = stripEncryptedContentFromJson(child);
     if (next.removed) removed = true;
     if (next.value !== dropProxyJsonValue) out[key] = next.value;
-  }
-
-  if (value.type === "reasoning" && typeof value.encrypted_content === "string" && !hasMeaningfulReasoningPayload(out)) {
-    return { value: dropProxyJsonValue, removed: true };
   }
 
   return { value: out, removed };
@@ -1399,6 +1400,10 @@ async function handleProviderProxyUpgrade(req, socket, head) {
     writeProxySocketError(socket, target.status || 500, target.error);
     return;
   }
+  if (!target.chatgpt) {
+    writeProxySocketError(socket, 426, "WebSocket transport is not supported for API-key provider proxy targets.");
+    return;
+  }
 
   try {
     const upstreamUrl = new URL(target.url);
@@ -1489,7 +1494,7 @@ async function handleProviderProxyRequest(req, res) {
         break;
       }
 
-      if (target.repairInvalidEncryptedContent && !repairedRequest.repaired) {
+      if (target.repairInvalidEncryptedContent && isCompactProxyTarget(target) && !repairedRequest.repaired) {
         const { invalid } = await invalidEncryptedContentResponse(upstream);
         if (invalid) {
           const stripped = stripEncryptedContentFromProxyBody(body);
