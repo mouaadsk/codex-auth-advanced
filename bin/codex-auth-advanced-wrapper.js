@@ -6,8 +6,9 @@ import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -374,8 +375,8 @@ function upsertOpenAiProviderConfig(toml, baseUrl) {
 function apiKeyContextDefaults(templateName) {
   const template = apiKeyTemplate(templateName);
   return {
-    modelContextWindow: Number.isFinite(template?.defaultModelContextWindow) ? template.defaultModelContextWindow : 512000,
-    autoCompactTokenLimit: Number.isFinite(template?.defaultAutoCompactTokenLimit) ? template.defaultAutoCompactTokenLimit : 400000
+    modelContextWindow: Number.isFinite(template?.defaultModelContextWindow) ? template.defaultModelContextWindow : 320000,
+    autoCompactTokenLimit: Number.isFinite(template?.defaultAutoCompactTokenLimit) ? template.defaultAutoCompactTokenLimit : 250000
   };
 }
 
@@ -409,8 +410,8 @@ function apiKeyTemplate(name) {
       name: "openai",
       baseUrl: "https://api.openai.com/v1",
       defaultSpendLimitUsd: null,
-      defaultModelContextWindow: 512000,
-      defaultAutoCompactTokenLimit: 400000,
+      defaultModelContextWindow: 320000,
+      defaultAutoCompactTokenLimit: 250000,
       repairInvalidEncryptedContent: false
     };
   }
@@ -419,8 +420,8 @@ function apiKeyTemplate(name) {
       name: "codex-everywhere",
       baseUrl: "https://codex-everywhere.com/",
       defaultSpendLimitUsd: 50,
-      defaultModelContextWindow: 512000,
-      defaultAutoCompactTokenLimit: 300000,
+      defaultModelContextWindow: 320000,
+      defaultAutoCompactTokenLimit: 250000,
       repairInvalidEncryptedContent: true
     };
   }
@@ -429,8 +430,8 @@ function apiKeyTemplate(name) {
       name: "tcdmx",
       baseUrl: "https://tcdmx.com",
       defaultSpendLimitUsd: 300,
-      defaultModelContextWindow: 512000,
-      defaultAutoCompactTokenLimit: 400000,
+      defaultModelContextWindow: 320000,
+      defaultAutoCompactTokenLimit: 250000,
       repairInvalidEncryptedContent: true
     };
   }
@@ -550,15 +551,24 @@ function hasConfigOverride(args, key) {
   return false;
 }
 
+const codexSubcommands = new Set(["resume", "fork", "exec", "review", "apply"]);
+
 function launchPassthroughArgs(argv) {
   const separatorIndex = argv.indexOf("--");
-  if (separatorIndex === -1) {
-    return { head: argv, passthrough: [] };
+  if (separatorIndex !== -1) {
+    return {
+      head: argv.slice(0, separatorIndex),
+      passthrough: argv.slice(separatorIndex + 1)
+    };
   }
-  return {
-    head: argv.slice(0, separatorIndex),
-    passthrough: argv.slice(separatorIndex + 1)
-  };
+  const subIndex = argv.findIndex((arg) => codexSubcommands.has(arg));
+  if (subIndex !== -1) {
+    return {
+      head: argv.slice(0, subIndex),
+      passthrough: argv.slice(subIndex)
+    };
+  }
+  return { head: argv, passthrough: [] };
 }
 
 function isHelpOrVersionArgs(args) {
@@ -749,14 +759,16 @@ function isInvalidApiKeyBody(body) {
 function isInvalidEncryptedContentBody(body) {
   if (!body) return false;
   if (typeof body === "string") {
-    return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)/i.test(body);
+    return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)|missing required parameter.*encrypted[_ -]?content/i.test(body);
   }
   const code = typeof body?.code === "string" ? body.code : "";
   const message = typeof body?.message === "string" ? body.message : "";
   const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
   const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
-  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
-  return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)/i.test(text);
+  const param = typeof body?.param === "string" ? body.param : "";
+  const errorParam = typeof body?.error?.param === "string" ? body.error.param : "";
+  const text = `${code} ${message} ${errorCode} ${errorMessage} ${param} ${errorParam}`;
+  return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)|missing[_ -]?required[_ -]?parameter.*encrypted[_ -]?content|missing required parameter.*encrypted[_ -]?content/i.test(text);
 }
 
 async function readResponseBody(response) {
@@ -921,11 +933,62 @@ async function fetchProviderUsage(entry, date) {
   }
 }
 
+async function fetchNewApiBilling(entry) {
+  const apiBase = apiBaseFromModelsEndpoint(entry.endpoint);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const [subRes, usageRes] = await Promise.all([
+      fetch(`${apiBase}/dashboard/billing/subscription`, {
+        headers: { Authorization: `Bearer ${entry.apiKey}`, "User-Agent": "codex-auth-advanced" },
+        signal: controller.signal
+      }),
+      fetch(`${apiBase}/dashboard/billing/usage`, {
+        headers: { Authorization: `Bearer ${entry.apiKey}`, "User-Agent": "codex-auth-advanced" },
+        signal: controller.signal
+      })
+    ]);
+
+    if (subRes.status !== 200 || usageRes.status !== 200) {
+      return null;
+    }
+
+    const subData = await subRes.json();
+    const usageData = await usageRes.json();
+
+    const hardLimit = Number(subData?.hard_limit_usd);
+    const totalUsageCents = Number(usageData?.total_usage);
+
+    if (!Number.isFinite(totalUsageCents)) return null;
+
+    const spend = totalUsageCents / 100;
+    const limitUsd = (Number.isFinite(hardLimit) && hardLimit < 9999999) ? hardLimit : null;
+    const remaining = Number.isFinite(limitUsd) ? Math.max(0, limitUsd - spend) : null;
+
+    return {
+      daily: spend,
+      weekly: spend,
+      monthly: spend,
+      spend: spend,
+      limitUsd: limitUsd,
+      remaining: remaining,
+      exhausted: Number.isFinite(limitUsd) && remaining <= 0
+    };
+  } catch (err) {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function fetchApiKeyCosts(entry) {
   const now = Math.floor(Date.now() / 1000);
   if (shouldPreferProviderUsage(entry)) {
     const providerUsage = await fetchProviderUsage(entry, isoDateFromSeconds(now));
     if (hasProviderUsageDetails(providerUsage)) return costsFromProviderUsage(providerUsage);
+
+    const newApiBilling = await fetchNewApiBilling(entry);
+    if (newApiBilling) return newApiBilling;
   }
 
   const dayStart = utcStartOfTodaySeconds();
@@ -1061,6 +1124,12 @@ function proxyRequestTargetUrl(req, codexHome, target) {
     : incoming.pathname;
   if (!rest.startsWith("/")) rest = `/${rest}`;
   if (rest === "/") rest = "";
+
+  const isTargetNeedV1 = rest === "/responses" || rest.startsWith("/responses/") || rest === "/chat/completions" || rest.startsWith("/chat/completions/");
+  if (isTargetNeedV1 && target.upstreamBaseUrl && !target.upstreamBaseUrl.includes("/v1")) {
+    rest = `/v1${rest}`;
+  }
+
   return {
     ...target,
     url: `${target.upstreamBaseUrl}${rest}${incoming.search}`
@@ -1185,11 +1254,12 @@ function writeProxySocketError(socket, status, message) {
   ].join("\r\n"));
 }
 
-function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}) {
+function sanitizeProxyRequestHeaders(headers, target, { websocket = false, omitContentEncoding = false } = {}) {
   const out = {};
   for (const [key, value] of Object.entries(headers || {})) {
     const lower = key.toLowerCase();
     if (lower === "host" || lower === "content-length") continue;
+    if (omitContentEncoding && lower === "content-encoding") continue;
     if (lower === "proxy-authenticate" || lower === "proxy-authorization" || lower === "proxy-connection" || lower === "te" || lower === "trailer" || lower === "transfer-encoding") continue;
     if (!websocket && (lower === "connection" || lower === "upgrade")) continue;
     if (lower === "accept-encoding" && websocket) continue;
@@ -1201,7 +1271,7 @@ function sanitizeProxyRequestHeaders(headers, target, { websocket = false } = {}
     out[key] = Array.isArray(value) ? value.join(", ") : String(value);
   }
 
-  if (!target.chatgpt && target.repairInvalidEncryptedContent) {
+  if (!target.chatgpt) {
     out["accept-encoding"] = "identity";
   }
 
@@ -1235,12 +1305,90 @@ function isEncryptedContentKey(key) {
   return String(key || "").replaceAll(/[_-]/g, "").toLowerCase() === "encryptedcontent";
 }
 
-function stripEncryptedContentFromJson(value) {
+function shouldDropAfterEncryptedContentRemoval(value) {
+  if (!value || typeof value !== "object") return false;
+  if (value.type === "message" && value.role !== "user" && value.content === undefined) return true;
+  return false;
+}
+
+function sanitizePlaintextContentPart(part) {
+  if (!part || typeof part !== "object") return part;
+  const type = typeof part.type === "string" ? part.type : "";
+  if (type === "input_text" || type === "output_text" || type === "text") {
+    const text = typeof part.text === "string" ? part.text : "";
+    return text ? { type, text } : dropProxyJsonValue;
+  }
+  return dropProxyJsonValue;
+}
+
+function sanitizePlaintextMessage(item) {
+  if (!item || typeof item !== "object" || item.type !== "message") return dropProxyJsonValue;
+  if (item.role !== "user" && item.role !== "assistant") return dropProxyJsonValue;
+
+  if (Array.isArray(item.content)) {
+    const content = [];
+    for (const part of item.content) {
+      const sanitized = sanitizePlaintextContentPart(part);
+      if (sanitized !== dropProxyJsonValue) content.push(sanitized);
+    }
+    if (content.length === 0) return dropProxyJsonValue;
+    return {
+      type: "message",
+      role: item.role,
+      content
+    };
+  }
+
+  if (typeof item.content === "string" && item.content.trim()) {
+    return {
+      type: "message",
+      role: item.role,
+      content: item.content
+    };
+  }
+
+  return dropProxyJsonValue;
+}
+
+function sanitizeCompactPlaintextJson(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { value, removed: false };
+
+  let removed = false;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key !== "input" || !Array.isArray(child)) {
+      const stripped = stripEncryptedContentFromJson(child);
+      if (stripped.removed) removed = true;
+      if (stripped.value !== dropProxyJsonValue) out[key] = stripped.value;
+      continue;
+    }
+
+    const input = [];
+    for (const item of child) {
+      const sanitized = sanitizePlaintextMessage(item);
+      if (sanitized === dropProxyJsonValue) {
+        removed = true;
+        continue;
+      }
+      input.push(sanitized);
+      if (sanitized !== item) removed = true;
+    }
+    out.input = input;
+  }
+
+  return { value: out, removed };
+}
+
+function stripEncryptedContentFromJson(value, options = {}) {
+  if (options.plaintextOnlyCompact) {
+    return sanitizeCompactPlaintextJson(value);
+  }
+
   if (Array.isArray(value)) {
     let removed = false;
     const items = [];
     for (const item of value) {
-      const next = stripEncryptedContentFromJson(item);
+      const next = stripEncryptedContentFromJson(item, options);
       if (next.removed) removed = true;
       if (next.value === dropProxyJsonValue) {
         removed = true;
@@ -1260,40 +1408,244 @@ function stripEncryptedContentFromJson(value) {
   }
 
   let removed = false;
+  let removedOwnEncryptedContent = false;
   const out = {};
   for (const [key, child] of Object.entries(value)) {
     if (isEncryptedContentKey(key)) {
       removed = true;
+      removedOwnEncryptedContent = true;
       continue;
     }
-    const next = stripEncryptedContentFromJson(child);
+    const next = stripEncryptedContentFromJson(child, options);
     if (next.removed) removed = true;
     if (next.value !== dropProxyJsonValue) out[key] = next.value;
+  }
+
+  if (removedOwnEncryptedContent && shouldDropAfterEncryptedContentRemoval(out)) {
+    return { value: dropProxyJsonValue, removed: true };
   }
 
   return { value: out, removed };
 }
 
-function stripEncryptedContentFromProxyBody(body) {
+function proxyRequestContentEncodings(headers) {
+  const raw = headers?.["content-encoding"] ?? headers?.["Content-Encoding"];
+  if (!raw) return [];
+  const joined = Array.isArray(raw) ? raw.join(",") : String(raw);
+  return joined
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item && item !== "identity");
+}
+
+function decodeProxyJsonBody(body, headers, { alreadyDecoded = false } = {}) {
+  if (alreadyDecoded) return { body, decoded: false, decodeFailed: false };
+  const encodings = proxyRequestContentEncodings(headers);
+  if (encodings.length === 0) return { body, decoded: false, decodeFailed: false };
+  if (encodings.length !== 1) return { body, decoded: false, decodeFailed: true };
+
+  try {
+    const encoding = encodings[0];
+    if (encoding === "gzip" || encoding === "x-gzip") {
+      return { body: zlib.gunzipSync(body), decoded: true, decodeFailed: false };
+    }
+    if (encoding === "deflate") {
+      return { body: zlib.inflateSync(body), decoded: true, decodeFailed: false };
+    }
+    if (encoding === "br") {
+      return { body: zlib.brotliDecompressSync(body), decoded: true, decodeFailed: false };
+    }
+  } catch {
+    return { body, decoded: false, decodeFailed: true };
+  }
+
+  return { body, decoded: false, decodeFailed: true };
+}
+
+function stripEncryptedContentFromProxyBody(body, headers = {}, options = {}) {
   if (!body || !Buffer.isBuffer(body) || body.length === 0) return { body, removed: false };
+  const decoded = decodeProxyJsonBody(body, headers, options);
   let parsed = null;
   try {
-    parsed = JSON.parse(body.toString("utf8"));
+    parsed = JSON.parse(decoded.body.toString("utf8"));
   } catch {
-    return { body, removed: false };
+    return { body, removed: false, decoded: decoded.decoded, decodeFailed: decoded.decodeFailed };
   }
-  const stripped = stripEncryptedContentFromJson(parsed);
-  if (!stripped.removed || stripped.value === dropProxyJsonValue) return { body, removed: false };
+  const stripped = stripEncryptedContentFromJson(parsed, options);
+  if (!stripped.removed || stripped.value === dropProxyJsonValue) {
+    return {
+      body: decoded.decoded ? decoded.body : body,
+      removed: false,
+      decoded: decoded.decoded,
+      decodeFailed: decoded.decodeFailed
+    };
+  }
   return {
     body: Buffer.from(JSON.stringify(stripped.value)),
-    removed: true
+    removed: true,
+    decoded: decoded.decoded,
+    decodeFailed: decoded.decodeFailed
   };
 }
 
-async function fetchProviderTarget(req, target, body) {
+function ensureEncryptedContent(val) {
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      ensureEncryptedContent(item);
+    }
+    return;
+  }
+  if (!val || typeof val !== "object") {
+    return;
+  }
+  const hasTypeOrRole = typeof val.type === "string" || typeof val.role === "string";
+  if (hasTypeOrRole) {
+    if (val.encrypted_content === undefined && val.encryptedContent === undefined) {
+      val.encrypted_content = "";
+    }
+  }
+  if (typeof val.content === "string") {
+    val.content = [
+      {
+        type: "text",
+        text: val.content
+      }
+    ];
+  }
+  for (const child of Object.values(val)) {
+    ensureEncryptedContent(child);
+  }
+}
+
+function isResponsesProxyTarget(target) {
+  try {
+    const pathname = new URL(target.url).pathname.replace(/\/$/, "");
+    return pathname.endsWith("/responses");
+  } catch {
+    return false;
+  }
+}
+
+function createSseResponseTransformStream(target, isEventStream) {
+  let buffer = "";
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      if (isEventStream) {
+        buffer += chunk.toString("utf8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        let out = "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("data: ")) {
+            const jsonText = trimmed.slice(6).trim();
+            if (jsonText && jsonText !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(jsonText);
+                ensureEncryptedContent(parsed);
+                out += `data: ${JSON.stringify(parsed)}\n`;
+                continue;
+              } catch {
+                // Ignore and pass through original
+              }
+            }
+          } else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (parsed.type === "response.compaction") {
+                if (parsed.messages && !parsed.output) {
+                  parsed.output = parsed.messages;
+                }
+                if (parsed.output && !parsed.messages) {
+                  parsed.messages = parsed.output;
+                }
+              }
+              ensureEncryptedContent(parsed);
+              out += JSON.stringify(parsed) + "\n";
+              continue;
+            } catch {
+              // Ignore and pass through original
+            }
+          }
+          out += line + "\n";
+        }
+        if (out) {
+          this.push(Buffer.from(out, "utf8"));
+        }
+        callback();
+      } else {
+        buffer += chunk.toString("utf8");
+        callback();
+      }
+    },
+    flush(callback) {
+      if (isEventStream) {
+        if (buffer) {
+          let out = buffer;
+          const trimmed = buffer.trim();
+          if (trimmed.startsWith("data: ")) {
+            const jsonText = trimmed.slice(6).trim();
+            if (jsonText && jsonText !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(jsonText);
+                ensureEncryptedContent(parsed);
+                out = `data: ${JSON.stringify(parsed)}`;
+              } catch {
+                // Ignore
+              }
+            }
+          } else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (parsed.type === "response.compaction") {
+                if (parsed.messages && !parsed.output) {
+                  parsed.output = parsed.messages;
+                }
+                if (parsed.output && !parsed.messages) {
+                  parsed.messages = parsed.output;
+                }
+              }
+              ensureEncryptedContent(parsed);
+              out = JSON.stringify(parsed);
+            } catch {
+              // Ignore
+            }
+          }
+          this.push(Buffer.from(out, "utf8"));
+        }
+        callback();
+      } else {
+        if (buffer) {
+          let out = buffer;
+          try {
+            const parsed = JSON.parse(buffer);
+            if (parsed.type === "response.compaction") {
+              if (parsed.messages && !parsed.output) {
+                parsed.output = parsed.messages;
+              }
+              if (parsed.output && !parsed.messages) {
+                parsed.messages = parsed.output;
+              }
+            }
+            ensureEncryptedContent(parsed);
+            out = JSON.stringify(parsed);
+          } catch (e) {
+            console.error("[Proxy Transform] Failed to parse/normalize unary JSON response:", e.message);
+          }
+          this.push(Buffer.from(out, "utf8"));
+        }
+        callback();
+      }
+    }
+  });
+}
+
+async function fetchProviderTarget(req, target, body, options = {}) {
   return fetch(target.url, {
     method: req.method,
-    headers: sanitizeProxyRequestHeaders(req.headers, target),
+    headers: sanitizeProxyRequestHeaders(req.headers, target, {
+      omitContentEncoding: options.omitContentEncoding === true
+    }),
     body,
     duplex: body == null ? undefined : "half"
   });
@@ -1331,14 +1683,19 @@ function isCompactProxyTarget(target) {
   }
 }
 
-function maybeRepairProviderProxyBody(target, body) {
+function repairProviderProxyBodyPlaintext(target, body, headers = {}, options = {}) {
   if (!target.repairInvalidEncryptedContent || !isCompactProxyTarget(target)) {
     return { body, repaired: false };
   }
-  const stripped = stripEncryptedContentFromProxyBody(body);
+  const stripped = stripEncryptedContentFromProxyBody(body, headers, {
+    ...options,
+    plaintextOnlyCompact: true
+  });
   return {
     body: stripped.body,
-    repaired: stripped.removed
+    repaired: stripped.removed,
+    decoded: stripped.decoded === true,
+    decodeFailed: stripped.decodeFailed === true
   };
 }
 
@@ -1453,6 +1810,217 @@ async function handleProviderProxyUpgrade(req, socket, head) {
   }
 }
 
+async function runLocalCompactionFallback(target, body, headers, alreadyDecoded) {
+  const startTime = Date.now();
+  const completionsUrl = target.url.replace(/\/responses\/compact\/?$/, "/chat/completions");
+  console.log(`[Proxy Local Compaction] Starting local compaction fallback using completions on ${completionsUrl}...`);
+
+  const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
+  let parsed = null;
+  try {
+    parsed = JSON.parse(decoded.body.toString("utf8"));
+  } catch (err) {
+    console.error(`[Proxy Local Compaction] Failed to parse request body as JSON:`, err);
+    return null;
+  }
+
+  const inputItems = parsed.input || [];
+  const processedItems = [];
+  if (inputItems.length <= 25) {
+    processedItems.push(...inputItems);
+  } else {
+    processedItems.push(...inputItems.slice(0, 5));
+    processedItems.push(...inputItems.slice(-15));
+  }
+
+  let conversationText = "";
+  for (const item of processedItems) {
+    if (item.type === "message") {
+      const role = item.role || "unknown";
+      const parts = [];
+      if (Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (part && typeof part.text === "string") {
+            let text = part.text;
+            if (text.length > 3000) {
+              text = text.slice(0, 3000) + "\n\n... [TRUNCATED] ...";
+            }
+            parts.push(text);
+          }
+        }
+      } else if (typeof item.content === "string") {
+        let text = item.content;
+        if (text.length > 3000) {
+          text = text.slice(0, 3000) + "\n\n... [TRUNCATED] ...";
+        }
+        parts.push(text);
+      }
+      conversationText += `[${role}]: ${parts.join("\n")}\n\n`;
+    } else if (item.type === "function_call") {
+      conversationText += `[assistant called function]: ${item.name} with arguments ${item.arguments}\n\n`;
+    } else if (item.type === "function_call_output") {
+      let outStr = item.output || "";
+      if (outStr.length > 2000) {
+        outStr = outStr.slice(0, 2000) + "\n\n... [TRUNCATED] ...";
+      }
+      conversationText += `[function output]: ${outStr}\n\n`;
+    }
+  }
+
+  const systemPrompt = `You are a helper that compacts and summarizes conversational context for an AI agent.
+Analyze the following conversation history and produce a concise, highly detailed summary of what has been discussed and accomplished so far.
+Focus on:
+1. The user's goal and requirements.
+2. The key technical details, decisions, and instructions established.
+3. Code blocks, modifications, or implementations that were written or modified.
+4. Current outstanding tasks or next steps.
+
+Produce a clear, structured summary in Markdown format. Keep the summary under 800 words.`;
+
+  const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
+
+  const authHeaders = sanitizeProxyRequestHeaders(headers, target, {
+    omitContentEncoding: true
+  });
+  
+  const completionBody = {
+    model: parsed.model || "gpt-5.5",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    stream: true
+  };
+
+  try {
+    const res = await fetch(completionsUrl, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(completionBody),
+      signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+    });
+
+    if (res.status !== 200) {
+      console.error(`[Proxy Local Compaction] completions endpoint failed with status: ${res.status}`);
+      return null;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf8");
+    let summaryText = "";
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("data: ")) {
+          const jsonText = trimmed.slice(6).trim();
+          if (jsonText && jsonText !== "[DONE]") {
+            try {
+              const parsedText = JSON.parse(jsonText);
+              const content = parsedText.choices?.[0]?.delta?.content || "";
+              summaryText += content;
+            } catch {
+              // Ignore
+            }
+          }
+        }
+      }
+    }
+
+    console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
+
+    const compactionResponse = {
+      type: "response.compaction",
+      encrypted_content: "",
+      messages: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: summaryText
+            }
+          ],
+          encrypted_content: ""
+        }
+      ],
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: summaryText
+            }
+          ],
+          encrypted_content: ""
+        }
+      ]
+    };
+
+    return new Response(JSON.stringify(compactionResponse), {
+      status: 200,
+      headers: new Headers({
+        "content-type": "application/json; charset=utf-8"
+      })
+    });
+  } catch (err) {
+    console.error(`[Proxy Local Compaction] Fallback failed with error:`, err);
+    return null;
+  }
+}
+
+function dummyCompactionResponse(errorMsg) {
+  const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a dummy placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
+  const compactionResponse = {
+    type: "response.compaction",
+    encrypted_content: "",
+    messages: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: summaryText
+          }
+        ],
+        encrypted_content: ""
+      }
+    ],
+    output: [
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: summaryText
+          }
+        ],
+        encrypted_content: ""
+      }
+    ]
+  };
+  return new Response(JSON.stringify(compactionResponse), {
+    status: 200,
+    headers: new Headers({
+      "content-type": "application/json; charset=utf-8"
+    })
+  });
+}
+
 async function handleProviderProxyRequest(req, res) {
   const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
   if (incoming.pathname === `${providerProxyPrefix}/health`) {
@@ -1482,24 +2050,95 @@ async function handleProviderProxyRequest(req, res) {
   }
 
   try {
+    console.log(`[Proxy Request] ${req.method} ${req.url} -> target: ${target.url}`);
     let body = await readProxyRequestBody(req);
+    if (isCompactProxyTarget(target)) {
+      console.log(`[Proxy Compact Request] headers:`, JSON.stringify(req.headers));
+      console.log(`[Proxy Compact Request] body:`, Buffer.isBuffer(body) ? body.toString("utf8") : String(body));
+      try {
+        const parsedBody = JSON.parse(body.toString("utf8"));
+        if (parsedBody && parsedBody.client_metadata !== undefined) {
+          delete parsedBody.client_metadata;
+          body = Buffer.from(JSON.stringify(parsedBody), "utf8");
+          console.log(`[Proxy] Stripped client_metadata from compaction request body for compatibility.`);
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+    const isVsllm = target.account?.email === "vsllm" || target.account?.alias === "vsllm" || (target.url && target.url.includes("vsllm.com"));
+    const isTcdmx = target.account?.email === "tcdmx" || target.account?.alias === "tcdmx" || (target.url && target.url.includes("tcdmx.com"));
+    const shouldDirectCompact = isTcdmx;
+    if (isCompactProxyTarget(target) && shouldDirectCompact) {
+      console.log(`[Proxy] Compaction requested for custom provider. Running local compaction fallback directly...`);
+      let localCompacted = await runLocalCompactionFallback(target, body, req.headers, false);
+      if (!localCompacted) {
+        console.warn(`[Proxy] Local compaction fallback failed. Generating dummy placeholder compaction response to avoid client crash...`);
+        localCompacted = dummyCompactionResponse("Fallback failed due to timeout or completions API error");
+      }
+      if (localCompacted) {
+        console.log(`[Proxy Response] ${req.url} -> status: 200 (Direct Local Compaction)`);
+        res.writeHead(200, stripProxyResponseHeaders(localCompacted.headers));
+        if (localCompacted.body) {
+          const responseStream = Readable.fromWeb(localCompacted.body).on("error", () => res.destroy());
+          responseStream.pipe(res);
+        } else {
+          res.end();
+        }
+        return;
+      }
+    }
     let upstream = null;
     const attemptedAccountKeys = new Set();
+    let bodyAlreadyDecoded = false;
+    let triedPlaintextCompactRepair = false;
     while (true) {
       if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
-      const repairedRequest = maybeRepairProviderProxyBody(target, body);
-      upstream = await fetchProviderTarget(req, target, repairedRequest.body);
-      if (target.chatgpt) {
+      
+      let fetchFailed = false;
+      let fetchError = null;
+      try {
+        upstream = await fetchProviderTarget(req, target, body, {
+          omitContentEncoding: bodyAlreadyDecoded,
+          timeout: (isCompactProxyTarget(target) && !target.chatgpt) ? 15000 : undefined
+        });
+      } catch (err) {
+        fetchFailed = true;
+        fetchError = err;
+      }
+
+      if (target.chatgpt && !fetchFailed) {
         captureChatgptCloudflareCookies(upstream.headers);
         break;
       }
 
-      if (target.repairInvalidEncryptedContent && isCompactProxyTarget(target) && !repairedRequest.repaired) {
+      if (isCompactProxyTarget(target) && (fetchFailed || [502, 503, 504, 524, 404, 405].includes(upstream.status))) {
+        console.log(`[Proxy] Compaction failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
+        let localCompacted = await runLocalCompactionFallback(target, body, req.headers, bodyAlreadyDecoded);
+        if (!localCompacted) {
+          console.warn(`[Proxy] Local compaction fallback failed during error handler. Generating dummy placeholder...`);
+          localCompacted = dummyCompactionResponse(fetchError?.message || `Upstream status ${upstream?.status}`);
+        }
+        if (localCompacted) {
+          upstream = localCompacted;
+          break;
+        }
+      }
+
+      if (fetchFailed) {
+        throw fetchError;
+      }
+
+      if (target.repairInvalidEncryptedContent && isCompactProxyTarget(target) && !triedPlaintextCompactRepair) {
         const { invalid } = await invalidEncryptedContentResponse(upstream);
         if (invalid) {
-          const stripped = stripEncryptedContentFromProxyBody(body);
-          if (stripped.removed) {
+          const stripped = repairProviderProxyBodyPlaintext(target, body, req.headers, {
+            alreadyDecoded: bodyAlreadyDecoded
+          });
+          if (stripped.repaired) {
             body = stripped.body;
+            bodyAlreadyDecoded = bodyAlreadyDecoded || stripped.decoded === true;
+            triedPlaintextCompactRepair = true;
             continue;
           }
         }
@@ -1526,13 +2165,29 @@ async function handleProviderProxyRequest(req, res) {
       target = retryTarget;
     }
 
+    console.log(`[Proxy Response] ${req.url} -> status: ${upstream.status}`);
     res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
     if (!upstream.body) {
       res.end();
       return;
     }
-    Readable.fromWeb(upstream.body).on("error", () => res.destroy()).pipe(res);
+    const contentEncoding = String(upstream.headers.get("content-encoding") || "").toLowerCase();
+    let responseStream = Readable.fromWeb(upstream.body).on("error", () => res.destroy());
+    if (contentEncoding === "gzip" || contentEncoding === "x-gzip") {
+      responseStream = responseStream.pipe(zlib.createGunzip());
+    } else if (contentEncoding === "deflate") {
+      responseStream = responseStream.pipe(zlib.createInflate());
+    } else if (contentEncoding === "br") {
+      responseStream = responseStream.pipe(zlib.createBrotliDecompress());
+    }
+    const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
+    const isStream = contentType.includes("event-stream") || isCompactProxyTarget(target) || isResponsesProxyTarget(target);
+    if (!target.chatgpt && isStream) {
+      responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream")));
+    }
+    responseStream.pipe(res);
   } catch (error) {
+    console.error(`[Proxy Error] ${req.url} failed:`, error);
     writeProxyError(res, 502, `Provider proxy request failed: ${error?.message || error}`);
   }
 }
@@ -1580,10 +2235,14 @@ function detachedProxyEnv() {
 
 async function ensureProviderProxyRunning({ quiet = false } = {}) {
   if (await providerProxyIsRunning()) return true;
+  const logDir = path.join(userHome(), "codex-auth-advanced");
+  const logFile = path.join(logDir, "proxy.log");
+  ensureDir(logDir);
+  const outFd = fs.openSync(logFile, "a");
   const scriptPath = path.join(__dirname, "codex-auth-advanced.js");
   const child = spawn(process.execPath, [scriptPath, "proxy", "serve"], {
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", outFd, outFd],
     env: detachedProxyEnv()
   });
   child.unref();
@@ -2726,7 +3385,7 @@ async function syncApiKeySpendLimits() {
       providerExhausted: health.exhausted || costs.exhausted,
       remaining: costs.remaining
     });
-    if (!Number.isFinite(limitUsd) && !exhausted) continue;
+    if (!Number.isFinite(limitUsd) && !exhausted && !Number.isFinite(costs.spend)) continue;
     const key = registryPath(entry.codexHome);
     if (!byRegistry.has(key)) byRegistry.set(key, []);
     byRegistry.get(key).push({ accountKey: entry.account.account_key, status: health.status, spend: costs.spend, limitUsd, exhausted, remaining: costs.remaining });
@@ -3364,6 +4023,9 @@ function exitFromChild(child) {
 }
 
 if (!(await maybeRunApiKeyAwareGroupList(binaryPath, argv))) {
+  if (argv.includes("launch")) {
+    await ensureProviderProxyForActiveApiAccounts();
+  }
   const child = spawnSync(binaryPath, argv, {
     stdio: "inherit",
     env: childEnvForArgv(argv)
