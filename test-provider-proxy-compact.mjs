@@ -29,6 +29,16 @@ const upstream = http.createServer(async (req, res) => {
   });
   const compactFailure = req.url.endsWith("/compact") ? compactFailures.shift() : null;
   if (compactFailure) {
+    if (compactFailure === "not_found") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "Compact endpoint not found.",
+          code: "not_found"
+        }
+      }));
+      return;
+    }
     res.writeHead(400, { "content-type": "application/json" });
     if (compactFailure === "missing_encrypted_content") {
       res.end(JSON.stringify({
@@ -51,24 +61,23 @@ const upstream = http.createServer(async (req, res) => {
   if (req.url.endsWith("/compact")) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
-      type: "response.compaction",
-      messages: [
+      object: "response.compaction",
+      output: [
         { type: "message", role: "assistant", content: "compacted message text" }
       ]
     }));
   } else if (req.url.endsWith("/chat/completions")) {
-    res.writeHead(200, { "content-type": "text/event-stream" });
-    res.write("data: " + JSON.stringify({
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
       choices: [
         {
-          delta: {
+          message: {
+            role: "assistant",
             content: "compacted message text"
           }
         }
       ]
-    }) + "\n");
-    res.write("data: [DONE]\n");
-    res.end();
+    }));
   } else {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ type: "response.completed" }));
@@ -242,11 +251,29 @@ function assertLatestRequest(expected) {
   assertRequestAt(upstreamRequests.length - 1, expected);
 }
 
+function assertCompactResponseTextContent(label, compactResponse, expectedText = "compacted message text") {
+  const message = compactResponse?.messages?.[0];
+  const output = compactResponse?.output?.[0];
+  if (!message || !output) {
+    throw new Error(`${label} should include messages[0] and output[0], got: ${JSON.stringify(compactResponse)}`);
+  }
+  if (message.encrypted_content !== "" || output.encrypted_content !== "") {
+    throw new Error(`${label} should include empty encrypted_content fields, got: ${JSON.stringify(compactResponse)}`);
+  }
+  if (message.content?.[0]?.text !== expectedText || output.content?.[0]?.text !== expectedText) {
+    throw new Error(`${label} should preserve compact text content parts, got: ${JSON.stringify(compactResponse)}`);
+  }
+  if (message.content?.[0]?.type !== "output_text" || output.content?.[0]?.type !== "output_text") {
+    throw new Error(`${label} should normalize compact text parts to output_text, got: ${JSON.stringify(compactResponse)}`);
+  }
+}
+
 const upstreamPort = await listen(upstream);
 const upstreamBaseUrl = `http://127.0.0.1:${upstreamPort}`;
 const accounts = [
   writeAccount({ key: "apikey-codex-everywhere", alias: "codex-everywhere", template: null, baseUrl: upstreamBaseUrl }),
   writeAccount({ key: "apikey-tcdmx", alias: "tcdmx", template: null, baseUrl: upstreamBaseUrl }),
+  writeAccount({ key: "apikey-vsllm", alias: "vsllm", template: null, baseUrl: upstreamBaseUrl }),
   writeAccount({ key: "apikey-openai", alias: "openai", template: "openai", baseUrl: upstreamBaseUrl }),
   writeAccount({ key: "chatgpt-business", alias: "business", template: null, baseUrl: upstreamBaseUrl, authMode: "chatgpt" })
 ];
@@ -330,26 +357,61 @@ try {
     ]
   };
 
-  setActive("apikey-tcdmx");
+  setActive("apikey-vsllm");
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestReq = upstreamRequests.at(-1);
-  if (!latestReq || !latestReq.url.endsWith("/chat/completions")) {
-    throw new Error(`expected tcdmx to run local compaction fallback on completions, got url: ${latestReq?.url}`);
+  if (!latestReq || !latestReq.url.endsWith("/responses/compact")) {
+    throw new Error(`expected vsllm to use native compact endpoint, got url: ${latestReq?.url}`);
   }
-  assertLatestRequest({ label: "tcdmx local compaction fallback", bearer: "tcdmx-secret", acceptEncoding: "identity", expectEncryptedContent: false });
-  if (!compactRes1.messages || compactRes1.messages[0].encrypted_content !== "" || compactRes1.messages[0].content[0].text !== "compacted message text") {
-    throw new Error(`expected local compaction summary in tcdmx response, got: ${JSON.stringify(compactRes1)}`);
+  assertLatestRequest({ label: "vsllm native compact", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertCompactResponseTextContent("vsllm native compact response", compactRes1);
+
+  compactFailures.push("not_found");
+  const beforeVsllmFallback = upstreamRequests.length;
+  const compactRes1Fallback = await proxyRequest(proxyPort, "/responses/compact", body);
+  if (upstreamRequests.length !== beforeVsllmFallback + 2) {
+    throw new Error(`expected vsllm compact fallback to make 2 upstream requests, got ${upstreamRequests.length - beforeVsllmFallback}`);
   }
+  assertRequestAt(beforeVsllmFallback, { label: "vsllm compact first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const vsllmFallbackReq = upstreamRequests.at(-1);
+  if (!vsllmFallbackReq || !vsllmFallbackReq.url.endsWith("/chat/completions")) {
+    throw new Error(`expected vsllm compact fallback to use chat completions, got url: ${vsllmFallbackReq?.url}`);
+  }
+  const vsllmFallbackReqBody = JSON.parse(vsllmFallbackReq.bodyText);
+  if (vsllmFallbackReqBody.stream === true) {
+    throw new Error(`expected vsllm compact fallback to use non-streaming chat completions, got: ${vsllmFallbackReq.bodyText}`);
+  }
+  if (!Array.isArray(vsllmFallbackReqBody.messages) || vsllmFallbackReqBody.messages.length !== 2) {
+    throw new Error(`expected vsllm compact fallback to send chat messages, got: ${vsllmFallbackReq.bodyText}`);
+  }
+  assertLatestRequest({ label: "vsllm compact fallback", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false });
+  assertCompactResponseTextContent("vsllm compact fallback response", compactRes1Fallback);
+
+  setActive("apikey-tcdmx");
+  const compactRes2 = await proxyRequest(proxyPort, "/responses/compact", body);
+  const latestTcdmxReq = upstreamRequests.at(-1);
+  if (!latestTcdmxReq || !latestTcdmxReq.url.endsWith("/responses/compact")) {
+    throw new Error(`expected tcdmx to use native compact endpoint, got url: ${latestTcdmxReq?.url}`);
+  }
+  assertLatestRequest({ label: "tcdmx native compact", bearer: "tcdmx-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertCompactResponseTextContent("tcdmx native compact response", compactRes2);
 
   await proxyRequest(proxyPort, "/responses", body);
   assertLatestRequest({ label: "tcdmx responses", bearer: "tcdmx-secret", acceptEncoding: "identity", expectEncryptedContent: true });
 
+  compactFailures.push("invalid_encrypted_content");
+  const beforeTcdmxFallback = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses/compact", body);
+  if (upstreamRequests.length !== beforeTcdmxFallback + 2) {
+    throw new Error(`expected tcdmx compact fallback to make 2 upstream requests, got ${upstreamRequests.length - beforeTcdmxFallback}`);
+  }
+  assertRequestAt(beforeTcdmxFallback, { label: "tcdmx compact first attempt", bearer: "tcdmx-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertRequestAt(beforeTcdmxFallback + 1, { label: "tcdmx compact plaintext fallback", bearer: "tcdmx-secret", acceptEncoding: "identity", expectEncryptedContent: false, expectReasoning: false, expectPlaintextCompactOnly: true });
+
   setActive("apikey-codex-everywhere");
   const compactRes3 = await proxyRequest(proxyPort, "/responses/compact", body);
   assertLatestRequest({ label: "codex-everywhere native compact", bearer: "codex-everywhere-secret", acceptEncoding: "identity", expectEncryptedContent: true });
-  if (!compactRes3.messages || compactRes3.messages[0].encrypted_content !== "") {
-    throw new Error(`expected encrypted_content to be populated in codex-everywhere compact response, got: ${JSON.stringify(compactRes3)}`);
-  }
+  assertCompactResponseTextContent("codex-everywhere native compact response", compactRes3);
 
   compactFailures.push("missing_encrypted_content");
   const beforeEverywhereFallback = upstreamRequests.length;

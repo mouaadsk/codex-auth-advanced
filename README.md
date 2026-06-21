@@ -270,7 +270,7 @@ codex-auth-advanced import /path/to/auth.json --alias personal
 codex-auth-advanced import /path/to/api-auth.json --alias codex-everywhere --api-spend-limit-usd 50
 ```
 
-For API-key imports, `--api-spend-limit-usd <amount>` stores a dollar cap on the imported API key. When the API reports HTTP 429 or the tracked spend reaches that cap, the wrapper marks that account as exhausted in local usage data so account switching can move to the next usable account.
+For API-key imports, `--api-spend-limit-usd <amount>` stores a dollar cap on the imported API key. When the API reports HTTP 429 or the tracked spend reaches that cap, the wrapper marks that account as exhausted in local usage data so account switching can move to the next usable account. The `vsllm` provider is treated as a rolling 5-hour quota provider: its New API billing endpoint reports total usage, so `codex-auth-advanced` keeps that total as telemetry and tracks only increases during the last 5 hours against the local cap, defaulting to `$5`.
 For an API key that was already imported, set or update the cap with:
 
 ```shell
@@ -286,6 +286,7 @@ Generated API-key configs default `model_context_window` to `512000`; the codex-
 Stored API-key configs use a custom `model_providers.OpenAI` section with `wire_api = "responses"` and the provider-specific `base_url`, so codex-everywhere and tcdmx keep the same Responses-provider structure while pointing at their own domains.
 When an API-key account is active, the root `config.toml` keeps `model_provider = "openai"` and points `openai_base_url` at the local `codex-auth-advanced` provider proxy. The per-account config still stores the real upstream URL, and the proxy forwards each request to the currently active upstream with the currently active API key. Keeping the provider id as lowercase `openai` preserves `codext` resume visibility for older sessions. After the first switch that enables the proxy URL, restart any already-running `codext` session once so it picks up the localhost base URL; later API-to-API switches can happen without changing `codext`'s in-memory provider config.
 The codex-everywhere and tcdmx templates, plus ChatGPT account compact requests, sanitize compact payloads before forwarding them: the proxy removes encrypted reasoning blobs that the next provider/account cannot decrypt after a switch. Normal chat requests stay pass-through. The codex-everywhere and tcdmx templates also force `accept-encoding: identity` through the proxy to avoid compressed SSE stream disconnects.
+For `vsllm` API-key accounts, the proxy forwards Codex compact requests to the provider's native `/v1/responses/compact` endpoint first. If that endpoint is unavailable or times out, the proxy falls back to a local `/v1/chat/completions` summary and returns it in Codex compact response format.
 
 ```shell
 printf '%s' "$OPENAI_API_KEY" | codex-auth-advanced group default add-api-key --template openai --alias openai-main --stdin

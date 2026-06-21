@@ -712,7 +712,7 @@ async function checkApiKeyAccount(entry) {
     const cleanCosts = health.status == null || !costs
       ? { daily: null, weekly: null, spend: null, limitUsd: null, exhausted: false }
       : costs;
-    const limitUsd = apiSpendLimitUsd(entry.account) ?? cleanCosts.limitUsd;
+    const limitUsd = apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }) ?? cleanCosts.limitUsd;
     const exhausted = isApiKeyLimitExhausted(health.status, cleanCosts.spend, limitUsd, {
       providerExhausted: health.exhausted || cleanCosts.exhausted,
       remaining: cleanCosts.remaining
@@ -720,17 +720,21 @@ async function checkApiKeyAccount(entry) {
     return {
       entry,
       ok: health.status === 200,
-      label: exhausted ? "0%" : health.status === 200 ? "-" : health.errorName ?? String(health.status),
+      label: health.status === 200
+        ? apiSpendRemainingLabel(cleanCosts.spend, limitUsd, exhausted, { windowMinutes: cleanCosts.spendWindowMinutes })
+        : health.errorName ?? String(health.status),
       daily: cleanCosts.daily,
       weekly: cleanCosts.weekly,
       spend: cleanCosts.spend,
+      totalSpend: cleanCosts.totalSpend,
       limitUsd,
+      windowMinutes: cleanCosts.spendWindowMinutes,
       exhausted,
       status: health.status
     };
   } catch (error) {
     const name = error?.name === "AbortError" ? "TimedOut" : "RequestFailed";
-    return { entry, ok: false, label: name, daily: null, weekly: null, spend: null, limitUsd: apiSpendLimitUsd(entry.account), exhausted: false, status: null };
+    return { entry, ok: false, label: name, daily: null, weekly: null, spend: null, totalSpend: null, limitUsd: apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }), windowMinutes: null, exhausted: false, status: null };
   }
 }
 
@@ -872,6 +876,18 @@ function firstFinite(...values) {
   return null;
 }
 
+function accountOrEndpointMatches(value, pattern) {
+  return typeof value === "string" && value.toLowerCase().includes(pattern);
+}
+
+function isVsllmApiAccount(account, endpoint = "") {
+  const label = [account?.alias, account?.email, account?.account_name, account?.account_key, account?.api_template]
+    .filter((value) => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  return label.includes("vsllm") || accountOrEndpointMatches(endpoint, "vsllm.com");
+}
+
 function parseProviderUsageDetails(body) {
   const subscription = body?.subscription;
   const usage = body?.usage;
@@ -906,6 +922,7 @@ function parseProviderUsageDetails(body) {
     weekly: Number.isFinite(weekly) ? weekly : null,
     monthly: Number.isFinite(monthly) ? monthly : total,
     spend: primaryUsage,
+    totalSpend: Number.isFinite(total) ? total : null,
     limitUsd: primaryLimit,
     remaining: Number.isFinite(remaining) ? remaining : null,
     exhausted
@@ -970,6 +987,7 @@ async function fetchNewApiBilling(entry) {
       weekly: spend,
       monthly: spend,
       spend: spend,
+      totalSpend: spend,
       limitUsd: limitUsd,
       remaining: remaining,
       exhausted: Number.isFinite(limitUsd) && remaining <= 0
@@ -981,14 +999,92 @@ async function fetchNewApiBilling(entry) {
   }
 }
 
+function normalizeRollingSpendSamples(samples) {
+  if (!Array.isArray(samples)) return [];
+  return samples
+    .map((sample) => {
+      const at = Number(sample?.at);
+      const spendUsd = Number(sample?.spend_usd);
+      if (!Number.isFinite(at) || !Number.isFinite(spendUsd) || spendUsd <= 0) return null;
+      return {
+        at: Math.floor(at),
+        spend_usd: spendUsd,
+        total_spend_usd: Number.isFinite(Number(sample?.total_spend_usd)) ? Number(sample.total_spend_usd) : null
+      };
+    })
+    .filter(Boolean);
+}
+
+function rollingApiSpendFromTotal(account, totalSpend, windowMinutes, nowSeconds = Math.floor(Date.now() / 1000)) {
+  const windowSeconds = Math.max(60, Math.floor(Number(windowMinutes) * 60));
+  const previous = account?.api_spend_window || account?.api_spend?.rolling || {};
+  const previousTotal = Number(previous.total_spend_usd);
+  let samples = normalizeRollingSpendSamples(previous.samples);
+
+  if (Number.isFinite(totalSpend)) {
+    if (Number.isFinite(previousTotal)) {
+      const delta = totalSpend >= previousTotal ? totalSpend - previousTotal : 0;
+      if (delta > 0.000001) {
+        samples.push({
+          at: nowSeconds,
+          spend_usd: Number(delta.toFixed(6)),
+          total_spend_usd: totalSpend
+        });
+      }
+    }
+  }
+
+  const cutoff = nowSeconds - windowSeconds;
+  samples = samples.filter((sample) => sample.at >= cutoff);
+  const spend = samples.reduce((total, sample) => total + sample.spend_usd, 0);
+
+  return {
+    spend: Number(spend.toFixed(6)),
+    state: {
+      window_minutes: Math.floor(Number(windowMinutes)),
+      total_spend_usd: Number.isFinite(totalSpend) ? totalSpend : (Number.isFinite(previousTotal) ? previousTotal : null),
+      samples,
+      updated_at: nowSeconds
+    }
+  };
+}
+
+function apiSpendWindowMinutes(account, options = {}) {
+  const configured = Number(account?.api_spend_window_minutes);
+  if (Number.isFinite(configured) && configured > 0) return Math.floor(configured);
+  if (isVsllmApiAccount(account, options.endpoint)) return 300;
+  return null;
+}
+
+function applyApiSpendWindow(entry, costs) {
+  if (!costs) return costs;
+  const windowMinutes = apiSpendWindowMinutes(entry.account, { endpoint: entry.endpoint });
+  if (!Number.isFinite(windowMinutes)) return costs;
+
+  const totalSpend = firstFinite(costs.totalSpend, costs.monthly, costs.weekly, costs.daily, costs.spend);
+  if (!Number.isFinite(totalSpend)) return costs;
+
+  const rolling = rollingApiSpendFromTotal(entry.account, totalSpend, windowMinutes);
+  return {
+    ...costs,
+    daily: rolling.spend,
+    weekly: rolling.spend,
+    spend: rolling.spend,
+    totalSpend,
+    spendWindowMinutes: windowMinutes,
+    rollingState: rolling.state
+  };
+}
+
 async function fetchApiKeyCosts(entry) {
   const now = Math.floor(Date.now() / 1000);
+  let costs = null;
   if (shouldPreferProviderUsage(entry)) {
     const providerUsage = await fetchProviderUsage(entry, isoDateFromSeconds(now));
-    if (hasProviderUsageDetails(providerUsage)) return costsFromProviderUsage(providerUsage);
+    if (hasProviderUsageDetails(providerUsage)) return applyApiSpendWindow(entry, costsFromProviderUsage(providerUsage));
 
     const newApiBilling = await fetchNewApiBilling(entry);
-    if (newApiBilling) return newApiBilling;
+    if (newApiBilling) return applyApiSpendWindow(entry, newApiBilling);
   }
 
   const dayStart = utcStartOfTodaySeconds();
@@ -999,10 +1095,13 @@ async function fetchApiKeyCosts(entry) {
     fetchCostTotal(entry, weekStart, now),
     fetchCostTotal(entry, spendStart, now)
   ]);
-  if (daily != null || weekly != null || spend != null) return { daily, weekly, spend };
+  if (daily != null || weekly != null || spend != null) {
+    costs = { daily, weekly, spend, totalSpend: spend };
+    return applyApiSpendWindow(entry, costs);
+  }
 
   const providerDaily = await fetchProviderUsage(entry, isoDateFromSeconds(now));
-  return costsFromProviderUsage(providerDaily);
+  return applyApiSpendWindow(entry, costsFromProviderUsage(providerDaily));
 }
 
 function shouldPreferProviderUsage(entry) {
@@ -1070,15 +1169,20 @@ function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
 
   const now = Math.floor(Date.now() / 1000);
   const limitUsd = apiSpendLimitUsd(existing);
+  const windowMinutes = apiSpendWindowMinutes(existing);
   existing.api_spend = {
     spend_usd: Number.isFinite(Number(existing.api_spend?.spend_usd)) ? Number(existing.api_spend.spend_usd) : null,
+    total_spend_usd: Number.isFinite(Number(existing.api_spend?.total_spend_usd)) ? Number(existing.api_spend.total_spend_usd) : null,
     limit_usd: limitUsd,
     remaining_usd: 0,
+    window_minutes: Number.isFinite(windowMinutes) ? windowMinutes : null,
     status,
     exhausted: true,
     checked_at: now
   };
-  existing.last_usage = usageSnapshotForApiSpend(existing.api_spend.spend_usd, limitUsd, true);
+  existing.last_usage = usageSnapshotForApiSpend(existing.api_spend.spend_usd, limitUsd, true, {
+    windowMinutes
+  });
   existing.last_usage_at = now;
   existing.api_exhausted_reason = isInvalidApiKeyBody(body) ? "invalid_api_key" : "provider_limit";
   writeJsonFile(filePath, registry);
@@ -1498,19 +1602,12 @@ function ensureEncryptedContent(val) {
   if (!val || typeof val !== "object") {
     return;
   }
-  const hasTypeOrRole = typeof val.type === "string" || typeof val.role === "string";
-  if (hasTypeOrRole) {
+  const type = typeof val.type === "string" ? val.type : "";
+  const needsEncryptedContent = type === "response.compaction" || type === "message" || type === "reasoning";
+  if (needsEncryptedContent) {
     if (val.encrypted_content === undefined && val.encryptedContent === undefined) {
       val.encrypted_content = "";
     }
-  }
-  if (typeof val.content === "string") {
-    val.content = [
-      {
-        type: "text",
-        text: val.content
-      }
-    ];
   }
   for (const child of Object.values(val)) {
     ensureEncryptedContent(child);
@@ -1542,6 +1639,7 @@ function createSseResponseTransformStream(target, isEventStream) {
             if (jsonText && jsonText !== "[DONE]") {
               try {
                 const parsed = JSON.parse(jsonText);
+                normalizeCompactionResponse(parsed);
                 ensureEncryptedContent(parsed);
                 out += `data: ${JSON.stringify(parsed)}\n`;
                 continue;
@@ -1552,14 +1650,7 @@ function createSseResponseTransformStream(target, isEventStream) {
           } else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
             try {
               const parsed = JSON.parse(trimmed);
-              if (parsed.type === "response.compaction") {
-                if (parsed.messages && !parsed.output) {
-                  parsed.output = parsed.messages;
-                }
-                if (parsed.output && !parsed.messages) {
-                  parsed.messages = parsed.output;
-                }
-              }
+              normalizeCompactionResponse(parsed);
               ensureEncryptedContent(parsed);
               out += JSON.stringify(parsed) + "\n";
               continue;
@@ -1588,6 +1679,7 @@ function createSseResponseTransformStream(target, isEventStream) {
             if (jsonText && jsonText !== "[DONE]") {
               try {
                 const parsed = JSON.parse(jsonText);
+                normalizeCompactionResponse(parsed);
                 ensureEncryptedContent(parsed);
                 out = `data: ${JSON.stringify(parsed)}`;
               } catch {
@@ -1597,14 +1689,7 @@ function createSseResponseTransformStream(target, isEventStream) {
           } else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
             try {
               const parsed = JSON.parse(trimmed);
-              if (parsed.type === "response.compaction") {
-                if (parsed.messages && !parsed.output) {
-                  parsed.output = parsed.messages;
-                }
-                if (parsed.output && !parsed.messages) {
-                  parsed.messages = parsed.output;
-                }
-              }
+              normalizeCompactionResponse(parsed);
               ensureEncryptedContent(parsed);
               out = JSON.stringify(parsed);
             } catch {
@@ -1619,14 +1704,7 @@ function createSseResponseTransformStream(target, isEventStream) {
           let out = buffer;
           try {
             const parsed = JSON.parse(buffer);
-            if (parsed.type === "response.compaction") {
-              if (parsed.messages && !parsed.output) {
-                parsed.output = parsed.messages;
-              }
-              if (parsed.output && !parsed.messages) {
-                parsed.messages = parsed.output;
-              }
-            }
+            normalizeCompactionResponse(parsed);
             ensureEncryptedContent(parsed);
             out = JSON.stringify(parsed);
           } catch (e) {
@@ -1641,13 +1719,18 @@ function createSseResponseTransformStream(target, isEventStream) {
 }
 
 async function fetchProviderTarget(req, target, body, options = {}) {
+  const timeoutMs = Number(options.timeout);
+  const signal = Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+    ? AbortSignal.timeout(timeoutMs)
+    : undefined;
   return fetch(target.url, {
     method: req.method,
     headers: sanitizeProxyRequestHeaders(req.headers, target, {
       omitContentEncoding: options.omitContentEncoding === true
     }),
     body,
-    duplex: body == null ? undefined : "half"
+    duplex: body == null ? undefined : "half",
+    signal
   });
 }
 
@@ -1810,6 +1893,147 @@ async function handleProviderProxyUpgrade(req, socket, head) {
   }
 }
 
+function textFromCompletionContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.content === "string") return part.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("");
+}
+
+function summaryFromChatCompletionJson(value) {
+  if (!value || typeof value !== "object") return "";
+  if (typeof value.output_text === "string") return value.output_text;
+
+  const firstChoice = Array.isArray(value.choices) ? value.choices[0] : null;
+  const choiceText = textFromCompletionContent(firstChoice?.message?.content)
+    || textFromCompletionContent(firstChoice?.delta?.content)
+    || (typeof firstChoice?.text === "string" ? firstChoice.text : "");
+  if (choiceText) return choiceText;
+
+  if (Array.isArray(value.output)) {
+    return value.output
+      .map((item) => textFromCompletionContent(item?.content))
+      .filter(Boolean)
+      .join("");
+  }
+
+  return "";
+}
+
+function summaryFromChatCompletionSse(text) {
+  let summary = "";
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data: ")) continue;
+    const jsonText = trimmed.slice(6).trim();
+    if (!jsonText || jsonText === "[DONE]") continue;
+    try {
+      summary += summaryFromChatCompletionJson(JSON.parse(jsonText));
+    } catch {
+      // Ignore malformed SSE data lines.
+    }
+  }
+  return summary;
+}
+
+async function readChatCompletionSummary(response) {
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  const text = await response.text();
+  if (contentType.includes("event-stream")) {
+    return summaryFromChatCompletionSse(text);
+  }
+  try {
+    return summaryFromChatCompletionJson(JSON.parse(text));
+  } catch {
+    return summaryFromChatCompletionSse(text);
+  }
+}
+
+function compactTextContent(text, role = "assistant") {
+  return [
+    {
+      type: role === "user" ? "input_text" : "output_text",
+      text
+    }
+  ];
+}
+
+function compactTextMessage(text) {
+  return {
+    type: "message",
+    role: "assistant",
+    content: compactTextContent(text, "assistant"),
+    encrypted_content: ""
+  };
+}
+
+function normalizeCompactionContentPart(part, role = "assistant") {
+  const defaultType = role === "user" ? "input_text" : "output_text";
+  if (typeof part === "string") {
+    return { type: defaultType, text: part };
+  }
+  if (!part || typeof part !== "object") return part;
+  const text = typeof part.text === "string"
+    ? part.text
+    : typeof part.content === "string"
+      ? part.content
+      : null;
+  const type = typeof part.type === "string" ? part.type : "";
+  if (type === "text") {
+    return text == null ? { ...part, type: defaultType } : { type: defaultType, text };
+  }
+  if (role !== "user" && type === "input_text" && text != null) {
+    return { type: "output_text", text };
+  }
+  if (role === "user" && type === "output_text" && text != null) {
+    return { type: "input_text", text };
+  }
+  if (!type && text != null) {
+    return { type: defaultType, text };
+  }
+  return part;
+}
+
+function normalizeCompactionMessageContent(item) {
+  if (!item || typeof item !== "object" || item.type !== "message") return;
+  const role = typeof item.role === "string" ? item.role : "assistant";
+  if (typeof item.content === "string") {
+    item.content = compactTextContent(item.content, role);
+    return;
+  }
+  if (Array.isArray(item.content)) {
+    item.content = item.content.map((part) => normalizeCompactionContentPart(part, role));
+  }
+}
+
+function normalizeCompactionResponse(value) {
+  if (!value || typeof value !== "object") return;
+  if (value.type !== "response.compaction" && value.object !== "response.compaction") return;
+  if (value.type !== "response.compaction") {
+    value.type = "response.compaction";
+  }
+  if (value.messages && !value.output) {
+    value.output = value.messages;
+  }
+  if (value.output && !value.messages) {
+    value.messages = value.output;
+  }
+  for (const items of [value.messages, value.output]) {
+    if (!Array.isArray(items)) continue;
+    for (const item of items) {
+      normalizeCompactionMessageContent(item);
+    }
+  }
+}
+
 async function runLocalCompactionFallback(target, body, headers, alreadyDecoded) {
   const startTime = Date.now();
   const completionsUrl = target.url.replace(/\/responses\/compact\/?$/, "/chat/completions");
@@ -1888,8 +2112,7 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
-    ],
-    stream: true
+    ]
   };
 
   try {
@@ -1908,65 +2131,20 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
       return null;
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder("utf8");
-    let summaryText = "";
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data: ")) {
-          const jsonText = trimmed.slice(6).trim();
-          if (jsonText && jsonText !== "[DONE]") {
-            try {
-              const parsedText = JSON.parse(jsonText);
-              const content = parsedText.choices?.[0]?.delta?.content || "";
-              summaryText += content;
-            } catch {
-              // Ignore
-            }
-          }
-        }
-      }
+    const summaryText = await readChatCompletionSummary(res);
+    if (!summaryText.trim()) {
+      console.error(`[Proxy Local Compaction] completions endpoint returned an empty summary.`);
+      return null;
     }
 
     console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
 
+    const compactedMessage = compactTextMessage(summaryText);
     const compactionResponse = {
       type: "response.compaction",
       encrypted_content: "",
-      messages: [
-        {
-          type: "message",
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: summaryText
-            }
-          ],
-          encrypted_content: ""
-        }
-      ],
-      output: [
-        {
-          type: "message",
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: summaryText
-            }
-          ],
-          encrypted_content: ""
-        }
-      ]
+      messages: [compactedMessage],
+      output: [compactedMessage]
     };
 
     return new Response(JSON.stringify(compactionResponse), {
@@ -1983,35 +2161,12 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
 
 function dummyCompactionResponse(errorMsg) {
   const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a dummy placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
+  const compactedMessage = compactTextMessage(summaryText);
   const compactionResponse = {
     type: "response.compaction",
     encrypted_content: "",
-    messages: [
-      {
-        type: "message",
-        role: "assistant",
-        content: [
-          {
-            type: "text",
-            text: summaryText
-          }
-        ],
-        encrypted_content: ""
-      }
-    ],
-    output: [
-      {
-        type: "message",
-        role: "assistant",
-        content: [
-          {
-            type: "text",
-            text: summaryText
-          }
-        ],
-        encrypted_content: ""
-      }
-    ]
+    messages: [compactedMessage],
+    output: [compactedMessage]
   };
   return new Response(JSON.stringify(compactionResponse), {
     status: 200,
@@ -2053,8 +2208,6 @@ async function handleProviderProxyRequest(req, res) {
     console.log(`[Proxy Request] ${req.method} ${req.url} -> target: ${target.url}`);
     let body = await readProxyRequestBody(req);
     if (isCompactProxyTarget(target)) {
-      console.log(`[Proxy Compact Request] headers:`, JSON.stringify(req.headers));
-      console.log(`[Proxy Compact Request] body:`, Buffer.isBuffer(body) ? body.toString("utf8") : String(body));
       try {
         const parsedBody = JSON.parse(body.toString("utf8"));
         if (parsedBody && parsedBody.client_metadata !== undefined) {
@@ -2064,28 +2217,6 @@ async function handleProviderProxyRequest(req, res) {
         }
       } catch (e) {
         // Ignore
-      }
-    }
-    const isVsllm = target.account?.email === "vsllm" || target.account?.alias === "vsllm" || (target.url && target.url.includes("vsllm.com"));
-    const isTcdmx = target.account?.email === "tcdmx" || target.account?.alias === "tcdmx" || (target.url && target.url.includes("tcdmx.com"));
-    const shouldDirectCompact = isTcdmx;
-    if (isCompactProxyTarget(target) && shouldDirectCompact) {
-      console.log(`[Proxy] Compaction requested for custom provider. Running local compaction fallback directly...`);
-      let localCompacted = await runLocalCompactionFallback(target, body, req.headers, false);
-      if (!localCompacted) {
-        console.warn(`[Proxy] Local compaction fallback failed. Generating dummy placeholder compaction response to avoid client crash...`);
-        localCompacted = dummyCompactionResponse("Fallback failed due to timeout or completions API error");
-      }
-      if (localCompacted) {
-        console.log(`[Proxy Response] ${req.url} -> status: 200 (Direct Local Compaction)`);
-        res.writeHead(200, stripProxyResponseHeaders(localCompacted.headers));
-        if (localCompacted.body) {
-          const responseStream = Readable.fromWeb(localCompacted.body).on("error", () => res.destroy());
-          responseStream.pipe(res);
-        } else {
-          res.end();
-        }
-        return;
       }
     }
     let upstream = null;
@@ -2289,6 +2420,7 @@ function costsFromProviderUsage(providerUsage) {
     daily: providerUsage?.daily ?? null,
     weekly: providerUsage?.weekly ?? providerUsage?.monthly ?? providerUsage?.daily ?? null,
     spend: providerUsage?.spend ?? providerUsage?.monthly ?? providerUsage?.daily ?? null,
+    totalSpend: providerUsage?.totalSpend ?? providerUsage?.monthly ?? providerUsage?.spend ?? null,
     limitUsd: providerUsage?.limitUsd ?? null,
     remaining: providerUsage?.remaining ?? null,
     exhausted: providerUsage?.exhausted === true
@@ -2306,9 +2438,11 @@ function moneyLimitStatus(spend, limitUsd) {
   return `$${spend.toFixed(2)}/$${limitUsd.toFixed(2)}`;
 }
 
-function apiSpendLimitUsd(account) {
+function apiSpendLimitUsd(account, options = {}) {
   const value = Number(account?.api_spend_limit_usd);
-  return Number.isFinite(value) && value > 0 ? value : null;
+  if (Number.isFinite(value) && value > 0) return value;
+  if (isVsllmApiAccount(account, options.endpoint)) return 5;
+  return null;
 }
 
 function isApiKeyLimitExhausted(status, spend, limitUsd, options = {}) {
@@ -2318,21 +2452,29 @@ function isApiKeyLimitExhausted(status, spend, limitUsd, options = {}) {
   return Number.isFinite(limitUsd) && Number.isFinite(spend) && spend >= limitUsd;
 }
 
-function usageSnapshotForApiSpend(spend, limitUsd, exhausted) {
+function apiSpendRemainingLabel(spend, limitUsd, exhausted, options = {}) {
+  if (exhausted) return "0%";
+  if (!Number.isFinite(options.windowMinutes) || !Number.isFinite(spend) || !Number.isFinite(limitUsd) || limitUsd <= 0) return "-";
+  const usedPercent = Math.max(0, Math.min(100, Math.floor((spend / limitUsd) * 100)));
+  return `${Math.max(0, 100 - usedPercent)}%`;
+}
+
+function usageSnapshotForApiSpend(spend, limitUsd, exhausted, options = {}) {
   const usedPercent = exhausted
     ? 100
     : Number.isFinite(spend) && Number.isFinite(limitUsd) && limitUsd > 0
       ? Math.max(0, Math.min(99, Math.floor((spend / limitUsd) * 100)))
       : 0;
+  const windowMinutes = Number.isFinite(options.windowMinutes) ? options.windowMinutes : 44640;
   return {
     primary: {
       used_percent: usedPercent,
-      window_minutes: 44640,
+      window_minutes: windowMinutes,
       resets_at: null
     },
     secondary: {
       used_percent: usedPercent,
-      window_minutes: 44640,
+      window_minutes: windowMinutes,
       resets_at: null
     },
     credits: {
@@ -3380,7 +3522,7 @@ async function syncApiKeySpendLimits() {
     const costs = health.status == null
       ? { spend: null, limitUsd: null, remaining: null, exhausted: false }
       : await fetchApiKeyCosts(entry);
-    const limitUsd = apiSpendLimitUsd(entry.account) ?? costs.limitUsd;
+    const limitUsd = apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }) ?? costs.limitUsd;
     const exhausted = isApiKeyLimitExhausted(health.status, costs.spend, limitUsd, {
       providerExhausted: health.exhausted || costs.exhausted,
       remaining: costs.remaining
@@ -3388,7 +3530,17 @@ async function syncApiKeySpendLimits() {
     if (!Number.isFinite(limitUsd) && !exhausted && !Number.isFinite(costs.spend)) continue;
     const key = registryPath(entry.codexHome);
     if (!byRegistry.has(key)) byRegistry.set(key, []);
-    byRegistry.get(key).push({ accountKey: entry.account.account_key, status: health.status, spend: costs.spend, limitUsd, exhausted, remaining: costs.remaining });
+    byRegistry.get(key).push({
+      accountKey: entry.account.account_key,
+      status: health.status,
+      spend: costs.spend,
+      totalSpend: costs.totalSpend,
+      limitUsd,
+      exhausted,
+      remaining: costs.remaining,
+      windowMinutes: costs.spendWindowMinutes,
+      rollingState: costs.rollingState
+    });
   }
 
   for (const [filePath, updates] of byRegistry) {
@@ -3398,18 +3550,23 @@ async function syncApiKeySpendLimits() {
     for (const update of updates) {
       const account = registry.accounts.find((item) => item?.account_key === update.accountKey);
       if (!account) continue;
-      if (!Number.isFinite(account.api_spend_limit_usd) && Number.isFinite(update.limitUsd)) {
+      if (!Number.isFinite(account.api_spend_limit_usd) && Number.isFinite(update.limitUsd) && !Number.isFinite(update.windowMinutes)) {
         account.api_spend_limit_usd = update.limitUsd;
       }
       account.api_spend = {
         spend_usd: Number.isFinite(update.spend) ? update.spend : null,
+        total_spend_usd: Number.isFinite(update.totalSpend) ? update.totalSpend : null,
         limit_usd: update.limitUsd,
         remaining_usd: Number.isFinite(update.remaining) ? update.remaining : null,
+        window_minutes: Number.isFinite(update.windowMinutes) ? update.windowMinutes : null,
         status: update.status,
         exhausted: update.exhausted,
         checked_at: Math.floor(Date.now() / 1000)
       };
-      account.last_usage = usageSnapshotForApiSpend(update.spend, update.limitUsd, update.exhausted);
+      if (update.rollingState) account.api_spend_window = update.rollingState;
+      account.last_usage = usageSnapshotForApiSpend(update.spend, update.limitUsd, update.exhausted, {
+        windowMinutes: update.windowMinutes
+      });
       account.last_usage_at = Math.floor(Date.now() / 1000);
     }
     if (before !== JSON.stringify(registry.accounts)) {
