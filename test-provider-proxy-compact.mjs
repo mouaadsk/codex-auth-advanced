@@ -445,6 +445,14 @@ try {
   }
   accounts.splice(0, accounts.length, ...syncedRegistry.accounts);
 
+  const switchResult = await runWrapper(["switch", "--live"]);
+  if (!switchResult.stdout.includes("PRIMARY LEFT") || !switchResult.stdout.includes("EXHAUSTED")) {
+    throw new Error(`expected switch output to include shared account table columns, got:\n${switchResult.stdout}`);
+  }
+  if (!switchResult.stdout.includes("vsllm") || !switchResult.stdout.includes("vsllm-2")) {
+    throw new Error(`expected switch output to include vsllm accounts, got:\n${switchResult.stdout}`);
+  }
+
   await waitForHealth(proxyPort);
   const body = {
     input: [

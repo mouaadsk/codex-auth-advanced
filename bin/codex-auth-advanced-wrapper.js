@@ -738,52 +738,52 @@ async function checkApiKeyAccount(entry) {
   }
 }
 
-function isInsufficientBalanceBody(body) {
-  if (!body) return false;
-  if (typeof body === "string") return /insufficient[_ -]?(balance|quota|credits?)/i.test(body);
+function responseBodySearchText(body, { includeParams = false } = {}) {
+  if (!body) return "";
+  if (typeof body === "string") return body;
   const code = typeof body?.code === "string" ? body.code : "";
   const message = typeof body?.message === "string" ? body.message : "";
   const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
   const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
-  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
-  return /insufficient[_ -]?(balance|quota|credits?)/i.test(text);
+  const parts = [code, message, errorCode, errorMessage];
+  if (includeParams) {
+    if (typeof body?.param === "string") parts.push(body.param);
+    if (typeof body?.error?.param === "string") parts.push(body.error.param);
+  }
+  return parts.filter(Boolean).join(" ");
+}
+
+function responseBodyMatches(body, pattern, options = {}) {
+  const text = responseBodySearchText(body, options);
+  return text.length > 0 && pattern.test(text);
+}
+
+function isInsufficientBalanceBody(body) {
+  return responseBodyMatches(body, /insufficient[_ -]?(balance|quota|credits?)/i);
 }
 
 function isNoActiveSubscriptionBody(body) {
-  if (!body) return false;
-  if (typeof body === "string") return /no active (subscription|package|plan)|activate (your )?subscription|暂无生效套餐|激活订阅/i.test(body);
-  const code = typeof body?.code === "string" ? body.code : "";
-  const message = typeof body?.message === "string" ? body.message : "";
-  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
-  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
-  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
-  return /no active (subscription|package|plan)|activate (your )?subscription|暂无生效套餐|激活订阅/i.test(text);
+  return responseBodyMatches(body, /no active (subscription|package|plan)|activate (your )?subscription|暂无生效套餐|激活订阅/i);
 }
 
 function isInvalidApiKeyBody(body) {
-  if (!body) return false;
-  if (typeof body === "string") return /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i.test(body);
-  const code = typeof body?.code === "string" ? body.code : "";
-  const message = typeof body?.message === "string" ? body.message : "";
-  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
-  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
-  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
-  return /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i.test(text);
+  return responseBodyMatches(body, /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i);
 }
 
 function isInvalidEncryptedContentBody(body) {
-  if (!body) return false;
-  if (typeof body === "string") {
-    return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)|missing required parameter.*encrypted[_ -]?content/i.test(body);
-  }
-  const code = typeof body?.code === "string" ? body.code : "";
-  const message = typeof body?.message === "string" ? body.message : "";
-  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
-  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
-  const param = typeof body?.param === "string" ? body.param : "";
-  const errorParam = typeof body?.error?.param === "string" ? body.error.param : "";
-  const text = `${code} ${message} ${errorCode} ${errorMessage} ${param} ${errorParam}`;
-  return /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)|missing[_ -]?required[_ -]?parameter.*encrypted[_ -]?content|missing required parameter.*encrypted[_ -]?content/i.test(text);
+  return responseBodyMatches(
+    body,
+    /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)|missing[_ -]?required[_ -]?parameter.*encrypted[_ -]?content|missing required parameter.*encrypted[_ -]?content/i,
+    { includeParams: true }
+  );
+}
+
+function apiProviderExhaustionReason(status, body, account = null) {
+  if (isInvalidApiKeyBody(body)) return "invalid_api_key";
+  if (isInsufficientBalanceBody(body)) return "provider_limit";
+  if (hasConfiguredApiSpendLimit(account) && isNoActiveSubscriptionBody(body)) return "no_active_subscription";
+  if (status === 429) return "rate_limit";
+  return null;
 }
 
 async function readResponseBody(response) {
@@ -817,12 +817,10 @@ async function fetchApiKeyHealth(entry) {
       signal: controller.signal
     });
     const body = response.status === 200 ? null : await readResponseBody(response);
+    const exhaustionReason = apiProviderExhaustionReason(response.status, body, entry.account);
     return {
       status: response.status,
-      exhausted: response.status === 429 ||
-        isInsufficientBalanceBody(body) ||
-        isInvalidApiKeyBody(body) ||
-        (hasConfiguredApiSpendLimit(entry.account) && isNoActiveSubscriptionBody(body))
+      exhausted: exhaustionReason != null
     };
   } catch (error) {
     return {
@@ -1202,13 +1200,7 @@ function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
     windowMinutes
   });
   existing.last_usage_at = now;
-  existing.api_exhausted_reason = isInvalidApiKeyBody(body)
-    ? "invalid_api_key"
-    : isNoActiveSubscriptionBody(body)
-      ? "no_active_subscription"
-      : status === 429
-        ? "rate_limit"
-        : "provider_limit";
+  existing.api_exhausted_reason = apiProviderExhaustionReason(status, body, existing) || "provider_limit";
   writeJsonFile(filePath, registry);
   return registry;
 }
@@ -1764,12 +1756,11 @@ async function exhaustedApiResponse(upstream, account = null) {
   }
 
   const body = await readClonedResponseBody(upstream);
-  const providerExhausted = isInsufficientBalanceBody(body) ||
-    isInvalidApiKeyBody(body) ||
-    (hasConfiguredApiSpendLimit(account) && isNoActiveSubscriptionBody(body));
+  const exhaustionReason = apiProviderExhaustionReason(upstream.status, body, account);
   return {
-    exhausted: upstream.status === 429 || providerExhausted,
-    body
+    exhausted: exhaustionReason != null,
+    body,
+    reason: exhaustionReason
   };
 }
 
@@ -2821,17 +2812,12 @@ function renderSwitchRows(accounts, activeAccountKey, { includeExhausted = true 
     process.stdout.write("No usable accounts found.\n");
     return;
   }
-  const widths = {
-    account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
-    plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
-    fiveHour: Math.max("PRIMARY LEFT".length, ...rows.map((row) => row.fiveHour.length)),
-    weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
-    exhausted: Math.max("EXHAUSTED".length, ...rows.map((row) => row.exhausted.length))
-  };
-  const header = `     ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("EXHAUSTED", widths.exhausted)}`;
+  const keys = accountTableKeys(false, ["account", "plan", "fiveHour", "weekly", "exhausted"]);
+  const widths = accountTableWidths(rows, keys);
+  const header = renderAccountTableHeader(keys, widths, 5);
   process.stdout.write(`${header}\n${"-".repeat(header.length)}\n`);
   for (const row of rows) {
-    process.stdout.write(`${row.marker} ${row.index} ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.exhausted, widths.exhausted)}\n`);
+    process.stdout.write(`${renderAccountTableRow(row, keys, widths)}\n`);
   }
 }
 
@@ -2859,6 +2845,40 @@ function accountLastLabel(account) {
   return `${Math.floor(seconds / 86400)}d ago`;
 }
 
+const accountTableColumnLabels = {
+  group: "GROUP",
+  account: "ACCOUNT",
+  plan: "PLAN",
+  fiveHour: "PRIMARY LEFT",
+  daily: "DAILY",
+  weekly: "WEEKLY LEFT",
+  last: "LAST ACTIVITY",
+  exhausted: "EXHAUSTED"
+};
+
+function accountTableKeys(grouped, keys) {
+  return grouped ? ["group", ...keys] : keys;
+}
+
+function accountTableWidths(rows, keys) {
+  const widths = {};
+  for (const key of keys) {
+    const label = accountTableColumnLabels[key] || key.toUpperCase();
+    widths[key] = Math.max(label.length, ...rows.map((row) => String(row[key] ?? "").length));
+  }
+  return widths;
+}
+
+function renderAccountTableHeader(keys, widths, prefixWidth) {
+  return `${" ".repeat(prefixWidth)}${keys.map((key) => pad(accountTableColumnLabels[key] || key.toUpperCase(), widths[key])).join("  ")}`;
+}
+
+function renderAccountTableRow(row, keys, widths, indexWidth = null) {
+  const index = Number.isFinite(indexWidth) ? String(row.index).padStart(indexWidth, "0") : row.index;
+  const prefix = `${row.marker} ${index} `;
+  return `${prefix}${keys.map((key) => pad(row[key], widths[key])).join("  ")}`;
+}
+
 function renderLocalList(groups) {
   const rows = [];
   const grouped = groups.length > 1;
@@ -2884,27 +2904,13 @@ function renderLocalList(groups) {
     return;
   }
 
-  const widths = {
-    group: grouped ? Math.max("GROUP".length, ...rows.map((row) => row.group.length)) : 0,
-    account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
-    plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
-    fiveHour: Math.max("PRIMARY LEFT".length, ...rows.map((row) => row.fiveHour.length)),
-    daily: Math.max("DAILY".length, ...rows.map((row) => row.daily.length)),
-    weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
-    last: Math.max("LAST ACTIVITY".length, ...rows.map((row) => row.last.length))
-  };
+  const keys = accountTableKeys(grouped, ["account", "plan", "fiveHour", "daily", "weekly", "last"]);
+  const widths = accountTableWidths(rows, keys);
   const prefixWidth = 5;
-  const header = grouped
-    ? `${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`
-    : `${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`;
+  const header = renderAccountTableHeader(keys, widths, prefixWidth);
   process.stdout.write(`${header}\n${"-".repeat(header.length)}\n`);
   for (const row of rows) {
-    const prefix = `${row.marker} ${row.index} `;
-    if (grouped) {
-      process.stdout.write(`${prefix}${pad(row.group, widths.group)}  ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.daily, widths.daily)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.last, widths.last)}\n`);
-    } else {
-      process.stdout.write(`${prefix}${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.daily, widths.daily)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.last, widths.last)}\n`);
-    }
+    process.stdout.write(`${renderAccountTableRow(row, keys, widths)}\n`);
   }
 }
 
@@ -3759,24 +3765,13 @@ function renderListTableWithDailyColumn(output, checks) {
 
   const rows = items.filter((item) => item.type === "row").map((item) => item.row);
   if (!rows.length) return null;
-  const widths = {
-    index: Math.max(2, ...rows.map((row) => row.index.length)),
-    group: grouped ? Math.max("GROUP".length, ...rows.map((row) => row.group.length)) : 0,
-    account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
-    plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
-    fiveHour: Math.max("PRIMARY LEFT".length, ...rows.map((row) => row.fiveHour.length)),
-    daily: Math.max("DAILY".length, ...rows.map((row) => row.daily.length)),
-    weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
-    last: Math.max("LAST ACTIVITY".length, ...rows.map((row) => row.last.length))
-  };
+  const keys = accountTableKeys(grouped, ["account", "plan", "fiveHour", "daily", "weekly", "last"]);
+  const widths = accountTableWidths(rows, keys);
+  const indexWidth = Math.max(2, ...rows.map((row) => row.index.length));
 
-  const prefixWidth = 2 + widths.index + 1;
+  const prefixWidth = 2 + indexWidth + 1;
   const out = [];
-  if (grouped) {
-    out.push(`${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`);
-  } else {
-    out.push(`${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`);
-  }
+  out.push(renderAccountTableHeader(keys, widths, prefixWidth));
   const totalWidth = out[0].length;
   out.push(renderSeparator(totalWidth));
 
@@ -3786,11 +3781,7 @@ function renderListTableWithDailyColumn(output, checks) {
       continue;
     }
     const row = item.row;
-    if (grouped) {
-      out.push(`${row.marker} ${row.index.padStart(widths.index, "0")} ${pad(row.group, widths.group)}  ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.daily, widths.daily)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.last, widths.last)}`);
-    } else {
-      out.push(`${row.marker} ${row.index.padStart(widths.index, "0")} ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.daily, widths.daily)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.last, widths.last)}`);
-    }
+    out.push(renderAccountTableRow(row, keys, widths, indexWidth));
   }
 
   return `${out.join("\n")}\n`;
