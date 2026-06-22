@@ -6,3 +6,4 @@ node_modules/
 .zig-global-cache/
 .zig-local-cache/
 npm-debug.log*
+debug-*.js
