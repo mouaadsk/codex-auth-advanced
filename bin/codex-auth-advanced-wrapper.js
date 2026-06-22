@@ -240,20 +240,46 @@ function readTextFile(filePath) {
   }
 }
 
+function tomlSectionName(line) {
+  const match = String(line || "").trim().match(/^\[([^\]]+)\]$/);
+  return match ? match[1] : null;
+}
+
+function isTomlSectionLine(line) {
+  return tomlSectionName(line) != null;
+}
+
+function firstTomlSectionIndex(lines) {
+  const index = lines.findIndex(isTomlSectionLine);
+  return index === -1 ? lines.length : index;
+}
+
+function tomlKeyValue(line, { requireValue = true } = {}) {
+  const pattern = requireValue
+    ? /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/
+    : /^([A-Za-z0-9_.-]+)\s*=/;
+  const match = String(line || "").trim().match(pattern);
+  if (!match) return null;
+  return {
+    key: match[1],
+    value: requireValue ? match[2].trim() : null
+  };
+}
+
 function topLevelTomlValues(toml, keys) {
   const wanted = new Set(keys);
   const values = new Map();
   let inTopLevel = true;
   for (const rawLine of String(toml || "").split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (line.startsWith("[") && line.endsWith("]")) {
+    if (isTomlSectionLine(line)) {
       inTopLevel = false;
       continue;
     }
     if (!inTopLevel) continue;
-    const match = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
-    if (!match || !wanted.has(match[1])) continue;
-    values.set(match[1], match[2].trim());
+    const item = tomlKeyValue(line);
+    if (!item || !wanted.has(item.key)) continue;
+    values.set(item.key, item.value);
   }
   return values;
 }
@@ -264,23 +290,19 @@ function applyTopLevelTomlValues(toml, values, insertKeys = [...values.keys()]) 
   const lines = String(toml || "").split(/\r?\n/);
   const found = new Set();
   let inTopLevel = true;
-  let firstSectionIndex = lines.findIndex((line) => {
-    const trimmed = line.trim();
-    return trimmed.startsWith("[") && trimmed.endsWith("]");
-  });
-  if (firstSectionIndex === -1) firstSectionIndex = lines.length;
+  const firstSectionIndex = firstTomlSectionIndex(lines);
 
   for (let i = 0; i < lines.length; i += 1) {
     const trimmed = lines[i].trim();
-    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    if (isTomlSectionLine(trimmed)) {
       inTopLevel = false;
       continue;
     }
     if (!inTopLevel) continue;
-    const match = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=/);
-    if (!match || !values.has(match[1])) continue;
-    lines[i] = `${match[1]} = ${values.get(match[1])}`;
-    found.add(match[1]);
+    const item = tomlKeyValue(trimmed, { requireValue: false });
+    if (!item || !values.has(item.key)) continue;
+    lines[i] = `${item.key} = ${values.get(item.key)}`;
+    found.add(item.key);
   }
 
   const missing = insertKeys
@@ -357,11 +379,7 @@ function upsertOpenAiProviderConfig(toml, baseUrl) {
     new Set(["model_providers.OpenAI"])
   ).trimEnd();
   const lines = withoutOpenAiProvider ? withoutOpenAiProvider.split(/\r?\n/) : [];
-  let firstSectionIndex = lines.findIndex((line) => {
-    const trimmed = line.trim();
-    return trimmed.startsWith("[") && trimmed.endsWith("]");
-  });
-  if (firstSectionIndex === -1) firstSectionIndex = lines.length;
+  const firstSectionIndex = firstTomlSectionIndex(lines);
 
   const prefix = [
     "model_provider = \"openai\"",
@@ -614,18 +632,17 @@ function readConfigBaseUrls(configPath) {
     const data = fs.readFileSync(configPath, "utf8");
     for (const rawLine of data.split(/\r?\n/)) {
       const line = rawLine.trim();
-      const sectionMatch = line.match(/^\[([^\]]+)\]$/);
-      if (sectionMatch) {
-        currentSection = sectionMatch[1];
+      const sectionName = tomlSectionName(line);
+      if (sectionName != null) {
+        currentSection = sectionName;
         continue;
       }
-      const eq = line.indexOf("=");
-      if (eq === -1) continue;
-      const key = line.slice(0, eq).trim();
-      const value = parseTomlString(line.slice(eq + 1));
+      const item = tomlKeyValue(line);
+      if (!item) continue;
+      const value = parseTomlString(item.value);
       if (!value) continue;
-      if (!currentSection && key === "openai_base_url") values.openaiBaseUrl = value;
-      if (key === "base_url") values.baseUrl = value;
+      if (!currentSection && item.key === "openai_base_url") values.openaiBaseUrl = value;
+      if (item.key === "base_url") values.baseUrl = value;
     }
   } catch {
     return values;
@@ -677,12 +694,30 @@ function loadManagedGroups() {
   return groups;
 }
 
+function loadRegistryRecordForGroup(group) {
+  const registry = readJsonFile(registryPath(group.codexHome));
+  if (!registry || !Array.isArray(registry.accounts)) return null;
+  return { ...group, registry };
+}
+
+function loadRegistryRecordsForGroups(groups) {
+  return groups.map(loadRegistryRecordForGroup).filter(Boolean);
+}
+
+function loadManagedRegistryRecords() {
+  return loadRegistryRecordsForGroups(loadManagedGroups());
+}
+
 function loadApiKeyAccountsForManagedList() {
-  return loadManagedGroups().flatMap((group) => loadApiKeyAccountsFromCodexHome(group.name, group.codexHome));
+  return loadManagedRegistryRecords().flatMap((group) => loadApiKeyAccountsFromRegistry(group.name, group.codexHome, group.registry));
 }
 
 function loadApiKeyAccountsFromCodexHome(groupName, codexHome) {
   const registry = readJsonFile(path.join(codexHome, "accounts", "registry.json"));
+  return loadApiKeyAccountsFromRegistry(groupName, codexHome, registry);
+}
+
+function loadApiKeyAccountsFromRegistry(groupName, codexHome, registry) {
   if (!registry || !Array.isArray(registry.accounts)) return [];
 
   return registry.accounts
@@ -804,18 +839,34 @@ async function readClonedResponseBody(response) {
   }
 }
 
-async function fetchApiKeyHealth(entry) {
+function apiKeyRequestHeaders(entry) {
+  return {
+    Authorization: `Bearer ${entry.apiKey}`,
+    "User-Agent": "codex-auth-advanced"
+  };
+}
+
+async function withAbortTimeout(timeoutMs, callback) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(entry.endpoint, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${entry.apiKey}`,
-        "User-Agent": "codex-auth-advanced"
-      },
-      signal: controller.signal
-    });
+    return await callback(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function fetchApiKeyEndpoint(entry, url, { signal, method = "GET" } = {}) {
+  return fetch(url, {
+    method,
+    headers: apiKeyRequestHeaders(entry),
+    signal
+  });
+}
+
+async function fetchApiKeyHealth(entry) {
+  try {
+    const response = await withAbortTimeout(5000, (signal) => fetchApiKeyEndpoint(entry, entry.endpoint, { signal }));
     const body = response.status === 200 ? null : await readResponseBody(response);
     const exhaustionReason = apiProviderExhaustionReason(response.status, body, entry.account);
     return {
@@ -828,8 +879,6 @@ async function fetchApiKeyHealth(entry) {
       exhausted: false,
       errorName: error?.name === "AbortError" ? "TimedOut" : "RequestFailed"
     };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -855,23 +904,16 @@ function parseCostsTotal(body) {
 }
 
 async function fetchCostTotal(entry, startTime, endTime) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    const response = await fetch(costsEndpointFromModelsEndpoint(entry.endpoint, startTime, endTime), {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${entry.apiKey}`,
-        "User-Agent": "codex-auth-advanced"
-      },
-      signal: controller.signal
-    });
+    const response = await withAbortTimeout(15000, (signal) => fetchApiKeyEndpoint(
+      entry,
+      costsEndpointFromModelsEndpoint(entry.endpoint, startTime, endTime),
+      { signal }
+    ));
     if (response.status !== 200) return null;
     return parseCostsTotal(await response.json());
   } catch {
     return null;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -942,41 +984,26 @@ function parseProviderUsageDetails(body) {
 }
 
 async function fetchProviderUsage(entry, date) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    const response = await fetch(usageEndpointFromModelsEndpoint(entry.endpoint, date), {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${entry.apiKey}`,
-        "User-Agent": "codex-auth-advanced"
-      },
-      signal: controller.signal
-    });
+    const response = await withAbortTimeout(15000, (signal) => fetchApiKeyEndpoint(
+      entry,
+      usageEndpointFromModelsEndpoint(entry.endpoint, date),
+      { signal }
+    ));
     if (response.status !== 200) return null;
     return parseProviderUsageDetails(await response.json());
   } catch {
     return null;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
 async function fetchNewApiBilling(entry) {
   const apiBase = apiBaseFromModelsEndpoint(entry.endpoint);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const [subRes, usageRes] = await Promise.all([
-      fetch(`${apiBase}/dashboard/billing/subscription`, {
-        headers: { Authorization: `Bearer ${entry.apiKey}`, "User-Agent": "codex-auth-advanced" },
-        signal: controller.signal
-      }),
-      fetch(`${apiBase}/dashboard/billing/usage`, {
-        headers: { Authorization: `Bearer ${entry.apiKey}`, "User-Agent": "codex-auth-advanced" },
-        signal: controller.signal
-      })
-    ]);
+    const [subRes, usageRes] = await withAbortTimeout(10000, (signal) => Promise.all([
+      fetchApiKeyEndpoint(entry, `${apiBase}/dashboard/billing/subscription`, { signal }),
+      fetchApiKeyEndpoint(entry, `${apiBase}/dashboard/billing/usage`, { signal })
+    ]));
 
     if (subRes.status !== 200 || usageRes.status !== 200) {
       return null;
@@ -1006,8 +1033,6 @@ async function fetchNewApiBilling(entry) {
     };
   } catch (err) {
     return null;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -2882,9 +2907,8 @@ function renderAccountTableRow(row, keys, widths, indexWidth = null) {
 function renderLocalList(groups) {
   const rows = [];
   const grouped = groups.length > 1;
-  for (const group of groups) {
-    const registry = readJsonFile(registryPath(group.codexHome));
-    if (!registry || !Array.isArray(registry.accounts)) continue;
+  for (const group of loadRegistryRecordsForGroups(groups)) {
+    const { registry } = group;
     for (const [index, account] of sortedRegistryAccounts(registry).entries()) {
       rows.push({
         marker: account.account_key === registry.active_account_key ? "*" : " ",
@@ -3007,7 +3031,7 @@ function clearScreen() {
 }
 
 function activeRegistryAccountFromRegistry(registry) {
-  if (!registry || typeof registry.active_account_key !== "string") return null;
+  if (!registry || !Array.isArray(registry.accounts) || typeof registry.active_account_key !== "string") return null;
   return registry.accounts.find((account) => account?.account_key === registry.active_account_key) ?? null;
 }
 
@@ -3452,11 +3476,7 @@ async function maybeHandleAddApiKey(argv) {
 }
 
 function activeRegistryAccount(codexHome) {
-  const registry = readJsonFile(registryPath(codexHome));
-  if (!registry || !Array.isArray(registry.accounts) || typeof registry.active_account_key !== "string") {
-    return null;
-  }
-  return registry.accounts.find((account) => account?.account_key === registry.active_account_key) ?? null;
+  return activeRegistryAccountFromRegistry(readJsonFile(registryPath(codexHome)));
 }
 
 function removeTomlTopLevelKeyAndSection(toml, topLevelKeys, sections) {
@@ -3467,17 +3487,17 @@ function removeTomlTopLevelKeyAndSection(toml, topLevelKeys, sections) {
 
   for (const line of lines) {
     const trimmed = line.trim();
-    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
-    if (sectionMatch) {
-      currentSection = sectionMatch[1];
+    const sectionName = tomlSectionName(trimmed);
+    if (sectionName != null) {
+      currentSection = sectionName;
       skipSection = sections.has(currentSection);
       if (skipSection) continue;
     }
     if (skipSection) continue;
 
     if (currentSection === null) {
-      const keyMatch = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=/);
-      if (keyMatch && topLevelKeys.has(keyMatch[1])) continue;
+      const item = tomlKeyValue(trimmed, { requireValue: false });
+      if (item && topLevelKeys.has(item.key)) continue;
     }
 
     out.push(line);
@@ -3486,8 +3506,7 @@ function removeTomlTopLevelKeyAndSection(toml, topLevelKeys, sections) {
   return `${out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
 
-function ensureActiveAccountConfig(codexHome) {
-  const registry = readJsonFile(registryPath(codexHome));
+function ensureActiveAccountConfig(codexHome, registry = readJsonFile(registryPath(codexHome))) {
   if (!registry?.active_account_key) return;
 
   const configPath = rootConfigPath(codexHome);
@@ -3505,15 +3524,14 @@ function ensureActiveAccountConfig(codexHome) {
 }
 
 function ensureAllActiveAccountConfigs() {
-  for (const group of loadManagedGroups()) {
-    ensureActiveAccountConfig(group.codexHome);
+  for (const group of loadManagedRegistryRecords()) {
+    ensureActiveAccountConfig(group.codexHome, group.registry);
   }
 }
 
 async function ensureProviderProxyForActiveApiAccounts() {
-  for (const group of loadManagedGroups()) {
-    const registry = readJsonFile(registryPath(group.codexHome));
-    if (registry?.active_account_key) {
+  for (const group of loadManagedRegistryRecords()) {
+    if (group.registry.active_account_key) {
       await ensureProviderProxyRunning({ quiet: true });
       return;
     }
@@ -3612,12 +3630,10 @@ async function syncApiKeySpendLimits() {
 }
 
 function syncMissingApiKeyConfigsAllGroups() {
-  const groups = loadManagedGroups();
+  const groups = loadManagedRegistryRecords();
   const configByAccountKey = new Map();
   for (const group of groups) {
-    const registry = readJsonFile(registryPath(group.codexHome));
-    if (!registry || !Array.isArray(registry.accounts)) continue;
-    for (const account of registry.accounts) {
+    for (const account of group.registry.accounts) {
       if (account?.auth_mode !== "apikey") continue;
       const configPath = accountConfigPath(group.codexHome, account.account_key);
       if (fs.existsSync(configPath) && !configByAccountKey.has(account.account_key)) {
@@ -3627,9 +3643,7 @@ function syncMissingApiKeyConfigsAllGroups() {
   }
 
   for (const group of groups) {
-    const registry = readJsonFile(registryPath(group.codexHome));
-    if (!registry || !Array.isArray(registry.accounts)) continue;
-    for (const account of registry.accounts) {
+    for (const account of group.registry.accounts) {
       if (account?.auth_mode !== "apikey") continue;
       const targetPath = accountConfigPath(group.codexHome, account.account_key);
       if (fs.existsSync(targetPath)) continue;
