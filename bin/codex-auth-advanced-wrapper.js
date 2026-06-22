@@ -22,6 +22,7 @@ const providerProxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 4
 const providerProxyPrefix = "/_codex-auth-advanced";
 const chatgptCodexBaseUrl = process.env.CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api/codex";
 const chatgptCloudflareCookies = new Map();
+const vsllmDefaultSpendWindowMinutes = 480;
 
 function ensureSupportedNodeVersion() {
   const major = Number(process.versions?.node?.split(".")[0] ?? 0);
@@ -708,6 +709,65 @@ function loadManagedRegistryRecords() {
   return loadRegistryRecordsForGroups(loadManagedGroups());
 }
 
+const apiAccountMetadataKeys = [
+  "api_template",
+  "api_spend_limit_usd",
+  "api_spend_window_minutes",
+  "api_spend",
+  "api_spend_window",
+  "api_exhausted_reason"
+];
+
+function cloneJsonValue(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function snapshotApiAccountMetadata() {
+  const snapshots = new Map();
+  for (const group of loadManagedRegistryRecords()) {
+    const accountSnapshots = new Map();
+    for (const account of group.registry.accounts) {
+      if (!account || account.auth_mode !== "apikey" || typeof account.account_key !== "string") continue;
+      const metadata = {};
+      for (const key of apiAccountMetadataKeys) {
+        if (Object.prototype.hasOwnProperty.call(account, key)) {
+          metadata[key] = cloneJsonValue(account[key]);
+        }
+      }
+      if (Object.keys(metadata).length > 0) {
+        accountSnapshots.set(account.account_key, metadata);
+      }
+    }
+    if (accountSnapshots.size > 0) {
+      snapshots.set(registryPath(group.codexHome), accountSnapshots);
+    }
+  }
+  return snapshots;
+}
+
+function restoreApiAccountMetadataSnapshot(snapshots) {
+  if (!snapshots || snapshots.size === 0) return;
+  for (const [filePath, accountSnapshots] of snapshots) {
+    const registry = readJsonFile(filePath);
+    if (!registry || !Array.isArray(registry.accounts)) continue;
+    let changed = false;
+    for (const account of registry.accounts) {
+      if (!account || typeof account.account_key !== "string") continue;
+      const metadata = accountSnapshots.get(account.account_key);
+      if (!metadata) continue;
+      for (const [key, value] of Object.entries(metadata)) {
+        if (account[key] !== undefined) continue;
+        account[key] = cloneJsonValue(value);
+        changed = true;
+      }
+    }
+    if (changed) {
+      writeJsonFile(filePath, registry);
+    }
+  }
+}
+
 function loadApiKeyAccountsForManagedList() {
   return loadManagedRegistryRecords().flatMap((group) => loadApiKeyAccountsFromRegistry(group.name, group.codexHome, group.registry));
 }
@@ -813,10 +873,29 @@ function isInvalidEncryptedContentBody(body) {
   );
 }
 
+function apiAccountRollingLimitReached(account) {
+  const limitUsd = apiSpendLimitUsd(account);
+  if (!Number.isFinite(limitUsd)) return false;
+  const spend = Number(account?.api_spend?.spend_usd);
+  if (Number.isFinite(spend)) return spend >= limitUsd;
+  const primary = Number(account?.last_usage?.primary?.used_percent);
+  const secondary = Number(account?.last_usage?.secondary?.used_percent);
+  return Number.isFinite(primary) && primary >= 100 || Number.isFinite(secondary) && secondary >= 100;
+}
+
+function shouldTrustProviderBalanceExhaustion(account) {
+  if (!isVsllmApiAccount(account)) return true;
+  return apiAccountRollingLimitReached(account);
+}
+
 function apiProviderExhaustionReason(status, body, account = null) {
   if (isInvalidApiKeyBody(body)) return "invalid_api_key";
-  if (isInsufficientBalanceBody(body)) return "provider_limit";
-  if (hasConfiguredApiSpendLimit(account) && isNoActiveSubscriptionBody(body)) return "no_active_subscription";
+  if (isInsufficientBalanceBody(body)) {
+    return shouldTrustProviderBalanceExhaustion(account) ? "provider_limit" : null;
+  }
+  if (hasConfiguredApiSpendLimit(account) && isNoActiveSubscriptionBody(body)) {
+    return shouldTrustProviderBalanceExhaustion(account) ? "no_active_subscription" : null;
+  }
   if (status === 429) return "rate_limit";
   return null;
 }
@@ -935,11 +1014,8 @@ function accountOrEndpointMatches(value, pattern) {
 }
 
 function isVsllmApiAccount(account, endpoint = "") {
-  const label = [account?.alias, account?.email, account?.account_name, account?.account_key, account?.api_template]
-    .filter((value) => typeof value === "string")
-    .join(" ")
-    .toLowerCase();
-  return label.includes("vsllm") || accountOrEndpointMatches(endpoint, "vsllm.com");
+  const isVsllm = String(account?.email || "").startsWith("vsllm") || String(account?.alias || "").startsWith("vsllm");
+  return isVsllm || accountOrEndpointMatches(endpoint, "vsllm.com");
 }
 
 function parseProviderUsageDetails(body) {
@@ -1086,10 +1162,29 @@ function rollingApiSpendFromTotal(account, totalSpend, windowMinutes, nowSeconds
   };
 }
 
+function rollingApiSpendResetAt(samples, limitUsd, windowMinutes, nowSeconds = Math.floor(Date.now() / 1000)) {
+  if (!Number.isFinite(limitUsd) || limitUsd <= 0 || !Number.isFinite(windowMinutes)) return null;
+  const windowSeconds = Math.max(60, Math.floor(Number(windowMinutes) * 60));
+  const cutoff = nowSeconds - windowSeconds;
+  const activeSamples = normalizeRollingSpendSamples(samples)
+    .filter((sample) => sample.at >= cutoff)
+    .sort((a, b) => a.at - b.at);
+  let spend = activeSamples.reduce((total, sample) => total + sample.spend_usd, 0);
+  if (!activeSamples.length) return null;
+  if (spend < limitUsd) return activeSamples[0].at + windowSeconds;
+
+  for (const sample of activeSamples) {
+    spend -= sample.spend_usd;
+    const resetAt = sample.at + windowSeconds;
+    if (spend < limitUsd) return resetAt;
+  }
+  return activeSamples[activeSamples.length - 1].at + windowSeconds;
+}
+
 function apiSpendWindowMinutes(account, options = {}) {
   const configured = Number(account?.api_spend_window_minutes);
   if (Number.isFinite(configured) && configured > 0) return Math.floor(configured);
-  if (isVsllmApiAccount(account, options.endpoint)) return 300;
+  if (isVsllmApiAccount(account, options.endpoint)) return vsllmDefaultSpendWindowMinutes;
   return null;
 }
 
@@ -1104,6 +1199,7 @@ function applyApiSpendWindow(entry, costs) {
   const rolling = rollingApiSpendFromTotal(entry.account, totalSpend, windowMinutes);
   const limitUsd = apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }) ?? costs.limitUsd;
   const remaining = Number.isFinite(limitUsd) ? Math.max(0, limitUsd - rolling.spend) : costs.remaining;
+  const resetsAt = rollingApiSpendResetAt(rolling.state.samples, limitUsd, windowMinutes);
   return {
     ...costs,
     daily: rolling.spend,
@@ -1112,6 +1208,7 @@ function applyApiSpendWindow(entry, costs) {
     totalSpend,
     limitUsd,
     remaining,
+    resetsAt,
     spendWindowMinutes: windowMinutes,
     rollingState: rolling.state
   };
@@ -1222,7 +1319,8 @@ function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
     checked_at: now
   };
   existing.last_usage = usageSnapshotForApiSpend(existing.api_spend.spend_usd, limitUsd, true, {
-    windowMinutes
+    windowMinutes,
+    resetsAt: rollingApiSpendResetAt(existing.api_spend_window?.samples, limitUsd, windowMinutes)
   });
   existing.last_usage_at = now;
   existing.api_exhausted_reason = apiProviderExhaustionReason(status, body, existing) || "provider_limit";
@@ -2506,6 +2604,8 @@ function apiSpendRemainingLabel(spend, limitUsd, exhausted, options = {}) {
 }
 
 function usageSnapshotForApiSpend(spend, limitUsd, exhausted, options = {}) {
+  const resetsAt = Number(options.resetsAt);
+  const resetValue = Number.isFinite(resetsAt) && resetsAt > 0 ? Math.floor(resetsAt) : null;
   const usedPercent = exhausted
     ? 100
     : Number.isFinite(spend) && Number.isFinite(limitUsd) && limitUsd > 0
@@ -2516,12 +2616,12 @@ function usageSnapshotForApiSpend(spend, limitUsd, exhausted, options = {}) {
     primary: {
       used_percent: usedPercent,
       window_minutes: windowMinutes,
-      resets_at: null
+      resets_at: resetValue
     },
     secondary: {
       used_percent: usedPercent,
       window_minutes: windowMinutes,
-      resets_at: null
+      resets_at: resetValue
     },
     credits: {
       has_credits: !exhausted,
@@ -3102,6 +3202,115 @@ function autoSwitchEnabled(registry) {
   return auto?.enabled === true;
 }
 
+function autoConfigCommand(argv) {
+  if (argv[0] === "config" && argv[1] === "auto") {
+    return { codexHome: defaultCodexHome(), args: argv.slice(2) };
+  }
+  if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "auto") {
+    return { codexHome: managedGroupCodexHome(argv[1]), args: argv.slice(3) };
+  }
+  return null;
+}
+
+function parseAutoThreshold(value, label) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
+    console.error(`${label} requires a percent from 0 to 100.`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function parseAutoConfigArgs(args) {
+  const options = {
+    action: "",
+    primaryThreshold: null,
+    secondaryThreshold: null
+  };
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "enable" || arg === "disable") {
+      if (options.action) {
+        console.error("auto config accepts only one action: enable or disable.");
+        process.exit(1);
+      }
+      options.action = arg;
+      continue;
+    }
+    if (arg === "--5h" || arg === "--primary") {
+      options.primaryThreshold = parseAutoThreshold(args[++i], arg);
+      continue;
+    }
+    if (arg.startsWith("--5h=")) {
+      options.primaryThreshold = parseAutoThreshold(arg.slice("--5h=".length), "--5h");
+      continue;
+    }
+    if (arg.startsWith("--primary=")) {
+      options.primaryThreshold = parseAutoThreshold(arg.slice("--primary=".length), "--primary");
+      continue;
+    }
+    if (arg === "--weekly" || arg === "--secondary") {
+      options.secondaryThreshold = parseAutoThreshold(args[++i], arg);
+      continue;
+    }
+    if (arg.startsWith("--weekly=")) {
+      options.secondaryThreshold = parseAutoThreshold(arg.slice("--weekly=".length), "--weekly");
+      continue;
+    }
+    if (arg.startsWith("--secondary=")) {
+      options.secondaryThreshold = parseAutoThreshold(arg.slice("--secondary=".length), "--secondary");
+      continue;
+    }
+
+    console.error("Usage: codex-auth-advanced config auto [enable|disable] [--5h <percent>] [--weekly <percent>]");
+    process.exit(1);
+  }
+
+  return options;
+}
+
+function anyManagedAutoSwitchEnabled() {
+  return loadManagedRegistryRecords().some((group) => autoSwitchEnabled(group.registry));
+}
+
+async function maybeHandleAutoConfig(argv) {
+  const command = autoConfigCommand(argv);
+  if (!command) return false;
+
+  const options = parseAutoConfigArgs(command.args);
+  const filePath = registryPath(command.codexHome);
+  const registry = loadOrCreateRegistry(command.codexHome);
+  registry.auto_switch = registry.auto_switch && typeof registry.auto_switch === "object" ? registry.auto_switch : {};
+
+  if (options.action === "enable") registry.auto_switch.enabled = true;
+  if (options.action === "disable") registry.auto_switch.enabled = false;
+  if (options.primaryThreshold != null) {
+    registry.auto_switch.threshold_5h_percent = options.primaryThreshold;
+    registry.auto_switch.primary_threshold_percent = options.primaryThreshold;
+  }
+  if (options.secondaryThreshold != null) {
+    registry.auto_switch.threshold_weekly_percent = options.secondaryThreshold;
+    registry.auto_switch.secondary_threshold_percent = options.secondaryThreshold;
+  }
+
+  ensureDir(path.dirname(filePath));
+  writeJsonFile(filePath, registry);
+  fs.chmodSync(filePath, 0o600);
+
+  if (options.action === "enable") {
+    ensureAutoSwitchManagerRunning();
+  } else if (options.action === "disable" && !anyManagedAutoSwitchEnabled()) {
+    stopAutoSwitchManager();
+  }
+
+  const enabled = registry.auto_switch.enabled === true;
+  const thresholds = registryAutoThresholds(registry);
+  process.stdout.write(`auto-switch: ${enabled ? "ON" : "OFF"}\n`);
+  process.stdout.write(`thresholds: 5h left<=${thresholds.primary}%, weekly left<=${thresholds.secondary}%\n`);
+  return true;
+}
+
 async function autoSwitchCycleForGroup(group) {
   const registry = readJsonFile(registryPath(group.codexHome));
   if (!registry || !Array.isArray(registry.accounts) || !autoSwitchEnabled(registry)) return;
@@ -3165,6 +3374,11 @@ function setApiSpendLimit(codexHome, query, limitUsd) {
   }
 
   matches[0].api_spend_limit_usd = limitUsd;
+  const endpoint = modelsEndpointFromBaseUrl(readBaseUrl(accountConfigPath(codexHome, matches[0].account_key)));
+  const windowMinutes = apiSpendWindowMinutes(matches[0], { endpoint });
+  if (Number.isFinite(windowMinutes)) {
+    matches[0].api_spend_window_minutes = windowMinutes;
+  }
   writeJsonFile(filePath, registry);
   process.stdout.write(`Set API spend limit for ${matches[0].alias || matches[0].email || matches[0].account_key} to $${limitUsd.toFixed(2)}.\n`);
 }
@@ -3592,6 +3806,7 @@ async function syncApiKeySpendLimits() {
       limitUsd,
       exhausted,
       remaining: costs.remaining,
+      resetsAt: costs.resetsAt,
       windowMinutes: costs.spendWindowMinutes,
       rollingState: costs.rollingState
     });
@@ -3619,7 +3834,8 @@ async function syncApiKeySpendLimits() {
       };
       if (update.rollingState) account.api_spend_window = update.rollingState;
       account.last_usage = usageSnapshotForApiSpend(update.spend, update.limitUsd, update.exhausted, {
-        windowMinutes: update.windowMinutes
+        windowMinutes: update.windowMinutes,
+        resetsAt: update.resetsAt
       });
       account.last_usage_at = Math.floor(Date.now() / 1000);
     }
@@ -4177,6 +4393,10 @@ if (await maybeHandleAddApiKey(argv)) {
   process.exit(0);
 }
 
+if (await maybeHandleAutoConfig(argv)) {
+  process.exit(0);
+}
+
 syncMissingApiKeyConfigsAllGroups();
 
 if (!apiSpendLimitImportInfo) {
@@ -4218,12 +4438,14 @@ if (!(await maybeRunApiKeyAwareGroupList(binaryPath, argv))) {
   if (argv.includes("launch")) {
     await ensureProviderProxyForActiveApiAccounts();
   }
+  const apiAccountMetadataBeforeChild = snapshotApiAccountMetadata();
   const child = spawnSync(binaryPath, argv, {
     stdio: "inherit",
     env: childEnvForArgv(argv)
   });
 
   if (!child.error && !child.signal && (child.status ?? 1) === 0) {
+    restoreApiAccountMetadataSnapshot(apiAccountMetadataBeforeChild);
     if (apiSpendLimitImportInfo) {
       applyApiSpendLimitToImportedAccounts(apiSpendLimitImportInfo.codexHome, apiSpendLimitImportInfo.args, parsedApiSpendLimitArgs.limitUsd);
     }
