@@ -749,6 +749,17 @@ function isInsufficientBalanceBody(body) {
   return /insufficient[_ -]?(balance|quota|credits?)/i.test(text);
 }
 
+function isNoActiveSubscriptionBody(body) {
+  if (!body) return false;
+  if (typeof body === "string") return /no active (subscription|package|plan)|activate (your )?subscription|暂无生效套餐|激活订阅/i.test(body);
+  const code = typeof body?.code === "string" ? body.code : "";
+  const message = typeof body?.message === "string" ? body.message : "";
+  const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
+  const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
+  const text = `${code} ${message} ${errorCode} ${errorMessage}`;
+  return /no active (subscription|package|plan)|activate (your )?subscription|暂无生效套餐|激活订阅/i.test(text);
+}
+
 function isInvalidApiKeyBody(body) {
   if (!body) return false;
   if (typeof body === "string") return /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i.test(body);
@@ -808,7 +819,10 @@ async function fetchApiKeyHealth(entry) {
     const body = response.status === 200 ? null : await readResponseBody(response);
     return {
       status: response.status,
-      exhausted: response.status === 429 || isInsufficientBalanceBody(body) || isInvalidApiKeyBody(body)
+      exhausted: response.status === 429 ||
+        isInsufficientBalanceBody(body) ||
+        isInvalidApiKeyBody(body) ||
+        (hasConfiguredApiSpendLimit(entry.account) && isNoActiveSubscriptionBody(body))
     };
   } catch (error) {
     return {
@@ -1065,12 +1079,16 @@ function applyApiSpendWindow(entry, costs) {
   if (!Number.isFinite(totalSpend)) return costs;
 
   const rolling = rollingApiSpendFromTotal(entry.account, totalSpend, windowMinutes);
+  const limitUsd = apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }) ?? costs.limitUsd;
+  const remaining = Number.isFinite(limitUsd) ? Math.max(0, limitUsd - rolling.spend) : costs.remaining;
   return {
     ...costs,
     daily: rolling.spend,
     weekly: rolling.spend,
     spend: rolling.spend,
     totalSpend,
+    limitUsd,
+    remaining,
     spendWindowMinutes: windowMinutes,
     rollingState: rolling.state
   };
@@ -1184,7 +1202,13 @@ function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
     windowMinutes
   });
   existing.last_usage_at = now;
-  existing.api_exhausted_reason = isInvalidApiKeyBody(body) ? "invalid_api_key" : "provider_limit";
+  existing.api_exhausted_reason = isInvalidApiKeyBody(body)
+    ? "invalid_api_key"
+    : isNoActiveSubscriptionBody(body)
+      ? "no_active_subscription"
+      : status === 429
+        ? "rate_limit"
+        : "provider_limit";
   writeJsonFile(filePath, registry);
   return registry;
 }
@@ -1734,13 +1758,15 @@ async function fetchProviderTarget(req, target, body, options = {}) {
   });
 }
 
-async function exhaustedApiResponse(upstream) {
+async function exhaustedApiResponse(upstream, account = null) {
   if (![401, 402, 403, 429].includes(upstream.status)) {
     return { exhausted: false, body: null };
   }
 
   const body = await readClonedResponseBody(upstream);
-  const providerExhausted = isInsufficientBalanceBody(body) || isInvalidApiKeyBody(body);
+  const providerExhausted = isInsufficientBalanceBody(body) ||
+    isInvalidApiKeyBody(body) ||
+    (hasConfiguredApiSpendLimit(account) && isNoActiveSubscriptionBody(body));
   return {
     exhausted: upstream.status === 429 || providerExhausted,
     body
@@ -2275,7 +2301,7 @@ async function handleProviderProxyRequest(req, res) {
         }
       }
 
-      const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream);
+      const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream, target.account);
       const shouldFailOver = exhausted || isTransientApiFailureStatus(upstream.status);
       if (!shouldFailOver) break;
 
@@ -2438,10 +2464,14 @@ function moneyLimitStatus(spend, limitUsd) {
   return `$${spend.toFixed(2)}/$${limitUsd.toFixed(2)}`;
 }
 
+function hasConfiguredApiSpendLimit(account) {
+  const value = Number(account?.api_spend_limit_usd);
+  return Number.isFinite(value) && value > 0;
+}
+
 function apiSpendLimitUsd(account, options = {}) {
   const value = Number(account?.api_spend_limit_usd);
   if (Number.isFinite(value) && value > 0) return value;
-  if (isVsllmApiAccount(account, options.endpoint)) return 5;
   return null;
 }
 
@@ -2794,11 +2824,11 @@ function renderSwitchRows(accounts, activeAccountKey, { includeExhausted = true 
   const widths = {
     account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
     plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
-    fiveHour: Math.max("5H LEFT".length, ...rows.map((row) => row.fiveHour.length)),
+    fiveHour: Math.max("PRIMARY LEFT".length, ...rows.map((row) => row.fiveHour.length)),
     weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
     exhausted: Math.max("EXHAUSTED".length, ...rows.map((row) => row.exhausted.length))
   };
-  const header = `     ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("EXHAUSTED", widths.exhausted)}`;
+  const header = `     ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("EXHAUSTED", widths.exhausted)}`;
   process.stdout.write(`${header}\n${"-".repeat(header.length)}\n`);
   for (const row of rows) {
     process.stdout.write(`${row.marker} ${row.index} ${pad(row.account, widths.account)}  ${pad(row.plan, widths.plan)}  ${pad(row.fiveHour, widths.fiveHour)}  ${pad(row.weekly, widths.weekly)}  ${pad(row.exhausted, widths.exhausted)}\n`);
@@ -2858,15 +2888,15 @@ function renderLocalList(groups) {
     group: grouped ? Math.max("GROUP".length, ...rows.map((row) => row.group.length)) : 0,
     account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
     plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
-    fiveHour: Math.max("5H LEFT".length, ...rows.map((row) => row.fiveHour.length)),
+    fiveHour: Math.max("PRIMARY LEFT".length, ...rows.map((row) => row.fiveHour.length)),
     daily: Math.max("DAILY".length, ...rows.map((row) => row.daily.length)),
     weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
     last: Math.max("LAST ACTIVITY".length, ...rows.map((row) => row.last.length))
   };
   const prefixWidth = 5;
   const header = grouped
-    ? `${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`
-    : `${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`;
+    ? `${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`
+    : `${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`;
   process.stdout.write(`${header}\n${"-".repeat(header.length)}\n`);
   for (const row of rows) {
     const prefix = `${row.marker} ${row.index} `;
@@ -3734,7 +3764,7 @@ function renderListTableWithDailyColumn(output, checks) {
     group: grouped ? Math.max("GROUP".length, ...rows.map((row) => row.group.length)) : 0,
     account: Math.max("ACCOUNT".length, ...rows.map((row) => row.account.length)),
     plan: Math.max("PLAN".length, ...rows.map((row) => row.plan.length)),
-    fiveHour: Math.max("5H LEFT".length, ...rows.map((row) => row.fiveHour.length)),
+    fiveHour: Math.max("PRIMARY LEFT".length, ...rows.map((row) => row.fiveHour.length)),
     daily: Math.max("DAILY".length, ...rows.map((row) => row.daily.length)),
     weekly: Math.max("WEEKLY LEFT".length, ...rows.map((row) => row.weekly.length)),
     last: Math.max("LAST ACTIVITY".length, ...rows.map((row) => row.last.length))
@@ -3743,9 +3773,9 @@ function renderListTableWithDailyColumn(output, checks) {
   const prefixWidth = 2 + widths.index + 1;
   const out = [];
   if (grouped) {
-    out.push(`${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`);
+    out.push(`${" ".repeat(prefixWidth)}${pad("GROUP", widths.group)}  ${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`);
   } else {
-    out.push(`${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("5H LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`);
+    out.push(`${" ".repeat(prefixWidth)}${pad("ACCOUNT", widths.account)}  ${pad("PLAN", widths.plan)}  ${pad("PRIMARY LEFT", widths.fiveHour)}  ${pad("DAILY", widths.daily)}  ${pad("WEEKLY LEFT", widths.weekly)}  ${pad("LAST ACTIVITY", widths.last)}`);
   }
   const totalWidth = out[0].length;
   out.push(renderSeparator(totalWidth));

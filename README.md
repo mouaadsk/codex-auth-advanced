@@ -270,7 +270,7 @@ codex-auth-advanced import /path/to/auth.json --alias personal
 codex-auth-advanced import /path/to/api-auth.json --alias codex-everywhere --api-spend-limit-usd 50
 ```
 
-For API-key imports, `--api-spend-limit-usd <amount>` stores a dollar cap on the imported API key. When the API reports HTTP 429 or the tracked spend reaches that cap, the wrapper marks that account as exhausted in local usage data so account switching can move to the next usable account. The `vsllm` provider is treated as a rolling 5-hour quota provider: its New API billing endpoint reports total usage, so `codex-auth-advanced` keeps that total as telemetry and tracks only increases during the last 5 hours against the local cap, defaulting to `$5`.
+For API-key imports, `--api-spend-limit-usd <amount>` stores a dollar cap on the imported API key. When the API reports HTTP 429 or the tracked spend reaches that configured cap, the wrapper marks that account as exhausted in local usage data so account switching can move to the next usable account. The `vsllm` provider is treated as a rolling 5-hour usage provider: its New API billing endpoint reports total usage, so `codex-auth-advanced` keeps that total as telemetry and tracks only increases during the last 5 hours. Set an explicit API spend limit if you want that rolling telemetry to drive exhaustion and auto-switching.
 For an API key that was already imported, set or update the cap with:
 
 ```shell

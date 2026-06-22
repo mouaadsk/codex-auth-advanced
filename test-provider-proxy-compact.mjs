@@ -15,6 +15,11 @@ fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
 
 const upstreamRequests = [];
 const compactFailures = [];
+const responseFailures = [];
+const usageTotalsByBearer = new Map([
+  ["Bearer vsllm-secret", 28.097534],
+  ["Bearer vsllm-2-secret", 96.242272]
+]);
 const upstream = http.createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -28,6 +33,23 @@ const upstream = http.createServer(async (req, res) => {
     bodyText
   });
   const compactFailure = req.url.endsWith("/compact") ? compactFailures.shift() : null;
+  if (req.method === "GET" && req.url.startsWith("/v1/usage?")) {
+    const total = usageTotalsByBearer.get(req.headers.authorization) ?? 0;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      usage: {
+        total: {
+          actual_cost: total
+        }
+      }
+    }));
+    return;
+  }
+  if (req.method === "GET" && req.url.endsWith("/v1/models")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [] }));
+    return;
+  }
   if (compactFailure) {
     if (compactFailure === "not_found") {
       res.writeHead(404, { "content-type": "application/json" });
@@ -79,6 +101,27 @@ const upstream = http.createServer(async (req, res) => {
       ]
     }));
   } else {
+    const responseFailure = req.url.endsWith("/responses") ? responseFailures.shift() : null;
+    if (responseFailure === "no_active_subscription") {
+      res.writeHead(402, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "当前账户暂无生效套餐，请前往钱包页面激活订阅",
+          code: "payment_required"
+        }
+      }));
+      return;
+    }
+    if (responseFailure === "insufficient_balance") {
+      res.writeHead(402, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "insufficient balance",
+          code: "insufficient_balance"
+        }
+      }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ type: "response.completed" }));
   }
@@ -109,7 +152,17 @@ function proxyGroupId(home) {
   return Buffer.from(path.resolve(home), "utf8").toString("base64url");
 }
 
-function writeAccount({ key, alias, template, baseUrl, authMode = "apikey" }) {
+function writeAccount({
+  key,
+  alias,
+  template,
+  baseUrl,
+  authMode = "apikey",
+  createdAt = 0,
+  spendLimitUsd = null,
+  spendWindowMinutes = null,
+  apiSpendWindow = null
+}) {
   const authJson = authMode === "apikey"
     ? { OPENAI_API_KEY: `${alias}-secret` }
     : { tokens: { access_token: `${alias}-token` } };
@@ -135,21 +188,30 @@ function writeAccount({ key, alias, template, baseUrl, authMode = "apikey" }) {
       { mode: 0o600 }
     );
   }
-  return {
+  const account = {
     account_key: key,
     alias,
     email: alias,
     auth_mode: authMode,
-    api_template: template
+    api_template: template,
+    created_at: createdAt
   };
+  if (Number.isFinite(spendLimitUsd)) account.api_spend_limit_usd = spendLimitUsd;
+  if (Number.isFinite(spendWindowMinutes)) account.api_spend_window_minutes = spendWindowMinutes;
+  if (apiSpendWindow) account.api_spend_window = apiSpendWindow;
+  return account;
 }
 
-async function proxyRequest(port, suffix, body) {
-  const response = await fetch(`http://127.0.0.1:${port}/_codex-auth-advanced/${proxyGroupId(codexHome)}${suffix}`, {
+async function proxyRawRequest(port, suffix, body) {
+  return fetch(`http://127.0.0.1:${port}/_codex-auth-advanced/${proxyGroupId(codexHome)}${suffix}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
+}
+
+async function proxyRequest(port, suffix, body) {
+  const response = await proxyRawRequest(port, suffix, body);
   if (response.status !== 200) {
     throw new Error(`proxy returned ${response.status}: ${await response.text()}`);
   }
@@ -270,20 +332,81 @@ function assertCompactResponseTextContent(label, compactResponse, expectedText =
 
 const upstreamPort = await listen(upstream);
 const upstreamBaseUrl = `http://127.0.0.1:${upstreamPort}`;
+const nowSeconds = Math.floor(Date.now() / 1000);
 const accounts = [
   writeAccount({ key: "apikey-codex-everywhere", alias: "codex-everywhere", template: null, baseUrl: upstreamBaseUrl }),
   writeAccount({ key: "apikey-tcdmx", alias: "tcdmx", template: null, baseUrl: upstreamBaseUrl }),
-  writeAccount({ key: "apikey-vsllm", alias: "vsllm", template: null, baseUrl: upstreamBaseUrl }),
+  writeAccount({
+    key: "apikey-vsllm",
+    alias: "vsllm",
+    template: null,
+    baseUrl: upstreamBaseUrl,
+    apiSpendWindow: {
+      window_minutes: 300,
+      total_spend_usd: 28.097534,
+      samples: [{ at: nowSeconds, spend_usd: 5.262316, total_spend_usd: 28.097534 }],
+      updated_at: nowSeconds
+    }
+  }),
+  writeAccount({
+    key: "apikey-vsllm-2",
+    alias: "vsllm-2",
+    template: null,
+    baseUrl: upstreamBaseUrl,
+    createdAt: 10,
+    spendLimitUsd: 55,
+    spendWindowMinutes: 480,
+    apiSpendWindow: {
+      window_minutes: 480,
+      total_spend_usd: 96.242272,
+      samples: [{ at: nowSeconds, spend_usd: 55.370052, total_spend_usd: 96.242272 }],
+      updated_at: nowSeconds
+    }
+  }),
   writeAccount({ key: "apikey-openai", alias: "openai", template: "openai", baseUrl: upstreamBaseUrl }),
   writeAccount({ key: "chatgpt-business", alias: "business", template: null, baseUrl: upstreamBaseUrl, authMode: "chatgpt" })
 ];
 
-function setActive(accountKey) {
+function setActive(accountKey, autoSwitch = false) {
   fs.writeFileSync(
     path.join(accountsDir, "registry.json"),
-    JSON.stringify({ active_account_key: accountKey, auto_switch: { enabled: false }, accounts }, null, 2),
+    JSON.stringify({ active_account_key: accountKey, auto_switch: { enabled: autoSwitch }, accounts }, null, 2),
     { mode: 0o600 }
   );
+}
+
+function runWrapper(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [wrapper, ...args], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        HOME: tempRoot,
+        CODEX_HOME: codexHome
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if ((code ?? 1) !== 0 || signal) {
+        reject(new Error(`wrapper ${args.join(" ")} failed with ${signal || code}:\n${stdout}\n${stderr}`));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+function readRegistry() {
+  return JSON.parse(fs.readFileSync(path.join(accountsDir, "registry.json"), "utf8"));
 }
 
 const proxyServer = http.createServer();
@@ -303,6 +426,25 @@ const proxy = spawn(process.execPath, [wrapper, "proxy", "serve"], {
 });
 
 try {
+  setActive("apikey-vsllm");
+  await runWrapper(["config", "api-spend-limit", "vsllm-2", "55"]);
+  const syncedRegistry = readRegistry();
+  const syncedVsllm = syncedRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  const syncedVsllm2 = syncedRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (syncedVsllm?.api_spend?.exhausted === true) {
+    throw new Error(`expected vsllm without an explicit cap to remain usable, got ${JSON.stringify(syncedVsllm)}`);
+  }
+  if (syncedVsllm?.api_spend?.limit_usd != null) {
+    throw new Error(`expected vsllm without an explicit cap to have no enforced limit, got ${JSON.stringify(syncedVsllm.api_spend)}`);
+  }
+  if (syncedVsllm2?.api_spend?.exhausted !== true) {
+    throw new Error(`expected explicitly capped vsllm-2 to be marked exhausted, got ${JSON.stringify(syncedVsllm2)}`);
+  }
+  if (syncedVsllm2?.api_spend?.limit_usd !== 55) {
+    throw new Error(`expected vsllm-2 to keep its explicit $55 limit, got ${JSON.stringify(syncedVsllm2?.api_spend)}`);
+  }
+  accounts.splice(0, accounts.length, ...syncedRegistry.accounts);
+
   await waitForHealth(proxyPort);
   const body = {
     input: [
@@ -386,6 +528,52 @@ try {
   }
   assertLatestRequest({ label: "vsllm compact fallback", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false });
   assertCompactResponseTextContent("vsllm compact fallback response", compactRes1Fallback);
+
+  setActive("apikey-vsllm", true);
+  responseFailures.push("no_active_subscription");
+  const beforeVsllmNoActive = upstreamRequests.length;
+  const noActiveResponse = await proxyRawRequest(proxyPort, "/responses", body);
+  if (noActiveResponse.status !== 402) {
+    throw new Error(`expected no-active-subscription response to pass through as 402, got ${noActiveResponse.status}: ${await noActiveResponse.text()}`);
+  }
+  await noActiveResponse.text();
+  if (upstreamRequests.length !== beforeVsllmNoActive + 1) {
+    throw new Error(`expected no-active-subscription response not to retry, got ${upstreamRequests.length - beforeVsllmNoActive} upstream requests`);
+  }
+  assertRequestAt(beforeVsllmNoActive, { label: "vsllm no active subscription passthrough", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const noActiveRegistry = readRegistry();
+  if (noActiveRegistry.active_account_key !== "apikey-vsllm") {
+    throw new Error(`expected active account to remain vsllm, got ${noActiveRegistry.active_account_key}`);
+  }
+  const notExhaustedVsllm = noActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  if (notExhaustedVsllm?.api_spend?.exhausted === true) {
+    throw new Error(`expected vsllm not to be marked exhausted by no-active-subscription text, got ${JSON.stringify(notExhaustedVsllm)}`);
+  }
+  const stillExhaustedVsllm2 = noActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (stillExhaustedVsllm2?.api_spend?.exhausted !== true) {
+    throw new Error(`expected vsllm-2 to remain exhausted, got ${JSON.stringify(stillExhaustedVsllm2)}`);
+  }
+
+  setActive("apikey-vsllm-2", true);
+  responseFailures.push("no_active_subscription");
+  const beforeVsllm2NoActive = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforeVsllm2NoActive + 2) {
+    throw new Error(`expected explicitly capped vsllm-2 no-active-subscription response to retry, got ${upstreamRequests.length - beforeVsllm2NoActive} upstream requests`);
+  }
+  assertRequestAt(beforeVsllm2NoActive, { label: "vsllm-2 no active subscription first attempt", bearer: "vsllm-2-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const vsllm2Retry = upstreamRequests[beforeVsllm2NoActive + 1];
+  if (vsllm2Retry?.authorization === "Bearer vsllm-2-secret") {
+    throw new Error("expected vsllm-2 no-active-subscription retry to switch away from vsllm-2");
+  }
+  const vsllm2NoActiveRegistry = readRegistry();
+  if (vsllm2NoActiveRegistry.active_account_key === "apikey-vsllm-2") {
+    throw new Error("expected active account to switch away from exhausted vsllm-2");
+  }
+  const noActiveExhaustedVsllm2 = vsllm2NoActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (noActiveExhaustedVsllm2?.api_spend?.exhausted !== true || noActiveExhaustedVsllm2?.api_exhausted_reason !== "no_active_subscription") {
+    throw new Error(`expected vsllm-2 to be marked exhausted by no-active-subscription text, got ${JSON.stringify(noActiveExhaustedVsllm2)}`);
+  }
 
   setActive("apikey-tcdmx");
   const compactRes2 = await proxyRequest(proxyPort, "/responses/compact", body);
