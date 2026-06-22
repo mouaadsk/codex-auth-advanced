@@ -437,13 +437,29 @@ try {
   if (syncedVsllm?.api_spend?.limit_usd != null) {
     throw new Error(`expected vsllm without an explicit cap to have no enforced limit, got ${JSON.stringify(syncedVsllm.api_spend)}`);
   }
+  if (syncedVsllm?.api_spend?.window_minutes !== 480) {
+    throw new Error(`expected vsllm to default to an 8-hour rolling window, got ${JSON.stringify(syncedVsllm?.api_spend)}`);
+  }
   if (syncedVsllm2?.api_spend?.exhausted !== true) {
     throw new Error(`expected explicitly capped vsllm-2 to be marked exhausted, got ${JSON.stringify(syncedVsllm2)}`);
   }
   if (syncedVsllm2?.api_spend?.limit_usd !== 55) {
     throw new Error(`expected vsllm-2 to keep its explicit $55 limit, got ${JSON.stringify(syncedVsllm2?.api_spend)}`);
   }
-  accounts.splice(0, accounts.length, ...syncedRegistry.accounts);
+  if (syncedVsllm2?.api_spend_window_minutes !== 480 || syncedVsllm2?.api_spend?.window_minutes !== 480) {
+    throw new Error(`expected vsllm-2 $55 cap to use an 8-hour rolling window, got ${JSON.stringify(syncedVsllm2)}`);
+  }
+  const syncedVsllm2ResetAt = Number(syncedVsllm2?.last_usage?.primary?.resets_at);
+  if (!Number.isFinite(syncedVsllm2ResetAt) || syncedVsllm2ResetAt <= nowSeconds || syncedVsllm2ResetAt > nowSeconds + 480 * 60 + 30) {
+    throw new Error(`expected exhausted vsllm-2 to store a reset time from its 8-hour rolling window, got ${JSON.stringify(syncedVsllm2?.last_usage)}`);
+  }
+  await runWrapper(["config", "auto", "disable"]);
+  const autoConfigRegistry = readRegistry();
+  const preservedVsllm2 = autoConfigRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (preservedVsllm2?.api_spend_limit_usd !== 55 || preservedVsllm2?.api_spend_window_minutes !== 480) {
+    throw new Error(`expected auto config rewrite to preserve vsllm-2 cap metadata, got ${JSON.stringify(preservedVsllm2)}`);
+  }
+  accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
 
   const switchResult = await runWrapper(["switch", "--live"]);
   if (!switchResult.stdout.includes("PRIMARY LEFT") || !switchResult.stdout.includes("EXHAUSTED")) {
@@ -561,6 +577,54 @@ try {
   if (stillExhaustedVsllm2?.api_spend?.exhausted !== true) {
     throw new Error(`expected vsllm-2 to remain exhausted, got ${JSON.stringify(stillExhaustedVsllm2)}`);
   }
+
+  const usableVsllm2Registry = JSON.parse(JSON.stringify(autoConfigRegistry));
+  const usableVsllm2 = usableVsllm2Registry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  usableVsllm2.api_spend_limit_usd = 55;
+  usableVsllm2.api_spend_window_minutes = 480;
+  usableVsllm2.api_spend = {
+    spend_usd: 10,
+    total_spend_usd: 106.242272,
+    limit_usd: 55,
+    remaining_usd: 45,
+    window_minutes: 480,
+    status: 200,
+    exhausted: false,
+    checked_at: nowSeconds
+  };
+  usableVsllm2.api_spend_window = {
+    window_minutes: 480,
+    total_spend_usd: 106.242272,
+    samples: [{ at: nowSeconds, spend_usd: 10, total_spend_usd: 106.242272 }],
+    updated_at: nowSeconds
+  };
+  usableVsllm2.last_usage = {
+    primary: { used_percent: 18, window_minutes: 480, resets_at: nowSeconds + 480 * 60 },
+    secondary: { used_percent: 18, window_minutes: 480, resets_at: nowSeconds + 480 * 60 },
+    credits: { has_credits: true, unlimited: false, balance: "45" },
+    plan_type: "apikey"
+  };
+  accounts.splice(0, accounts.length, ...usableVsllm2Registry.accounts);
+  setActive("apikey-vsllm-2", true);
+  responseFailures.push("no_active_subscription");
+  const beforeUsableVsllm2NoActive = upstreamRequests.length;
+  const usableNoActiveResponse = await proxyRawRequest(proxyPort, "/responses", body);
+  if (usableNoActiveResponse.status !== 402) {
+    throw new Error(`expected usable vsllm-2 no-active-subscription response to pass through as 402, got ${usableNoActiveResponse.status}: ${await usableNoActiveResponse.text()}`);
+  }
+  await usableNoActiveResponse.text();
+  if (upstreamRequests.length !== beforeUsableVsllm2NoActive + 1) {
+    throw new Error(`expected usable vsllm-2 no-active-subscription response not to retry, got ${upstreamRequests.length - beforeUsableVsllm2NoActive} upstream requests`);
+  }
+  const usableNoActiveRegistry = readRegistry();
+  if (usableNoActiveRegistry.active_account_key !== "apikey-vsllm-2") {
+    throw new Error(`expected active account to remain usable vsllm-2, got ${usableNoActiveRegistry.active_account_key}`);
+  }
+  const stillUsableVsllm2 = usableNoActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (stillUsableVsllm2?.api_spend?.exhausted === true || stillUsableVsllm2?.api_exhausted_reason) {
+    throw new Error(`expected usable vsllm-2 not to be exhausted by no-active-subscription text, got ${JSON.stringify(stillUsableVsllm2)}`);
+  }
+  accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
 
   setActive("apikey-vsllm-2", true);
   responseFailures.push("no_active_subscription");
