@@ -278,6 +278,11 @@ function assertRequestAt(index, expected) {
   if (expected.skipBodyAssertions) return;
 
   const parsed = JSON.parse(latest.bodyText);
+  if (Object.prototype.hasOwnProperty.call(expected, "expectedModel")) {
+    if (parsed.model !== expected.expectedModel) {
+      throw new Error(`unexpected model for ${expected.label}: expected ${expected.expectedModel}, got ${parsed.model}`);
+    }
+  }
   const serialized = JSON.stringify(parsed);
   if (expected.expectEncryptedContent === true && !serialized.includes("encrypted")) {
     throw new Error(`${expected.label} should have preserved encrypted content`);
@@ -522,8 +527,20 @@ try {
       }
     ]
   };
+  const aliasedModelBody = {
+    ...body,
+    model: "gpt-5.2"
+  };
 
   setActive("apikey-vsllm");
+  await proxyRequest(proxyPort, "/responses", aliasedModelBody);
+  assertLatestRequest({
+    label: "vsllm responses model alias",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true,
+    expectedModel: "gpt-5.5-pro20x"
+  });
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestReq = upstreamRequests.at(-1);
   if (!latestReq || !latestReq.url.endsWith("/responses/compact")) {
@@ -552,6 +569,37 @@ try {
   }
   assertLatestRequest({ label: "vsllm compact fallback", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false });
   assertCompactResponseTextContent("vsllm compact fallback response", compactRes1Fallback);
+
+  const aliasedCompactRes = await proxyRequest(proxyPort, "/responses/compact", aliasedModelBody);
+  assertLatestRequest({
+    label: "vsllm compact model alias",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true,
+    expectedModel: "gpt-5.5-pro20x-openai-compact"
+  });
+  assertCompactResponseTextContent("vsllm compact aliased response", aliasedCompactRes);
+
+  compactFailures.push("not_found");
+  const beforeAliasedVsllmFallback = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses/compact", aliasedModelBody);
+  if (upstreamRequests.length !== beforeAliasedVsllmFallback + 2) {
+    throw new Error(`expected aliased vsllm compact fallback to make 2 upstream requests, got ${upstreamRequests.length - beforeAliasedVsllmFallback}`);
+  }
+  assertRequestAt(beforeAliasedVsllmFallback, {
+    label: "vsllm compact alias first attempt",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true,
+    expectedModel: "gpt-5.5-pro20x-openai-compact"
+  });
+  assertRequestAt(beforeAliasedVsllmFallback + 1, {
+    label: "vsllm compact alias fallback",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: false,
+    expectedModel: "gpt-5.5-pro20x-openai-compact"
+  });
 
   setActive("apikey-vsllm", true);
   responseFailures.push("no_active_subscription");
@@ -648,6 +696,14 @@ try {
   }
 
   setActive("apikey-tcdmx");
+  await proxyRequest(proxyPort, "/responses", aliasedModelBody);
+  assertLatestRequest({
+    label: "tcdmx responses model untouched",
+    bearer: "tcdmx-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true,
+    expectedModel: "gpt-5.2"
+  });
   const compactRes2 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestTcdmxReq = upstreamRequests.at(-1);
   if (!latestTcdmxReq || !latestTcdmxReq.url.endsWith("/responses/compact")) {

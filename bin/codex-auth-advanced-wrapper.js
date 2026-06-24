@@ -1018,6 +1018,24 @@ function isVsllmApiAccount(account, endpoint = "") {
   return isVsllm || accountOrEndpointMatches(endpoint, "vsllm.com");
 }
 
+function normalizeProxyModelAlias(model) {
+  return String(model || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
+function remappedVsllmModel(model, { compact = false } = {}) {
+  const normalized = normalizeProxyModelAlias(model);
+  if (normalized !== "gpt-5.2") return null;
+  return compact ? "gpt-5.5-pro20x-openai-compact" : "gpt-5.5-pro20x";
+}
+
+function remappedProxyRequestModel(model, target, { compact = false } = {}) {
+  if (!isVsllmApiAccount(target?.account, target?.upstreamBaseUrl || target?.url || "")) return null;
+  return remappedVsllmModel(model, { compact });
+}
+
 function parseProviderUsageDetails(body) {
   const subscription = body?.subscription;
   const usage = body?.usage;
@@ -1705,6 +1723,50 @@ function decodeProxyJsonBody(body, headers, { alreadyDecoded = false } = {}) {
   return { body, decoded: false, decodeFailed: true };
 }
 
+function rewriteProviderProxyRequestBody(target, body, headers = {}, options = {}) {
+  if (!body || !Buffer.isBuffer(body) || body.length === 0) {
+    return { body, rewritten: false, decoded: false, decodeFailed: false };
+  }
+
+  const decoded = decodeProxyJsonBody(body, headers, options);
+  let parsed = null;
+  try {
+    parsed = JSON.parse(decoded.body.toString("utf8"));
+  } catch {
+    return { body, rewritten: false, decoded: decoded.decoded, decodeFailed: decoded.decodeFailed };
+  }
+
+  let rewritten = false;
+  if (isCompactProxyTarget(target) && parsed && parsed.client_metadata !== undefined) {
+    delete parsed.client_metadata;
+    rewritten = true;
+  }
+
+  const mappedModel = remappedProxyRequestModel(parsed?.model, target, {
+    compact: isCompactProxyTarget(target)
+  });
+  if (mappedModel && parsed.model !== mappedModel) {
+    parsed.model = mappedModel;
+    rewritten = true;
+  }
+
+  if (!rewritten) {
+    return {
+      body: decoded.decoded ? decoded.body : body,
+      rewritten: false,
+      decoded: decoded.decoded,
+      decodeFailed: decoded.decodeFailed
+    };
+  }
+
+  return {
+    body: Buffer.from(JSON.stringify(parsed), "utf8"),
+    rewritten: true,
+    decoded: true,
+    decodeFailed: decoded.decodeFailed
+  };
+}
+
 function stripEncryptedContentFromProxyBody(body, headers = {}, options = {}) {
   if (!body || !Buffer.isBuffer(body) || body.length === 0) return { body, removed: false };
   const decoded = decodeProxyJsonBody(body, headers, options);
@@ -1762,7 +1824,30 @@ function isResponsesProxyTarget(target) {
   }
 }
 
-function createSseResponseTransformStream(target, isEventStream) {
+function createStreamDiagnostics(target, reqUrl) {
+  const startMs = Date.now();
+  return {
+    responsesTarget: isResponsesProxyTarget(target),
+    completed: false,
+    mark(value) {
+      if (value?.type === "response.completed") this.completed = true;
+    },
+    finish(reason) {
+      if (!this.responsesTarget) return;
+      const elapsedMs = Date.now() - startMs;
+      const host = (() => {
+        try {
+          return new URL(target.url).host;
+        } catch {
+          return "unknown";
+        }
+      })();
+      console.log(`[Proxy Stream] ${reqUrl} host=${host} completed=${this.completed} reason=${reason} elapsed_ms=${elapsedMs}`);
+    }
+  };
+}
+
+function createSseResponseTransformStream(target, isEventStream, diagnostics = null) {
   let buffer = "";
   return new Transform({
     transform(chunk, encoding, callback) {
@@ -1778,6 +1863,7 @@ function createSseResponseTransformStream(target, isEventStream) {
             if (jsonText && jsonText !== "[DONE]") {
               try {
                 const parsed = JSON.parse(jsonText);
+                diagnostics?.mark(parsed);
                 normalizeCompactionResponse(parsed);
                 ensureEncryptedContent(parsed);
                 out += `data: ${JSON.stringify(parsed)}\n`;
@@ -1789,6 +1875,7 @@ function createSseResponseTransformStream(target, isEventStream) {
           } else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
             try {
               const parsed = JSON.parse(trimmed);
+              diagnostics?.mark(parsed);
               normalizeCompactionResponse(parsed);
               ensureEncryptedContent(parsed);
               out += JSON.stringify(parsed) + "\n";
@@ -1818,6 +1905,7 @@ function createSseResponseTransformStream(target, isEventStream) {
             if (jsonText && jsonText !== "[DONE]") {
               try {
                 const parsed = JSON.parse(jsonText);
+                diagnostics?.mark(parsed);
                 normalizeCompactionResponse(parsed);
                 ensureEncryptedContent(parsed);
                 out = `data: ${JSON.stringify(parsed)}`;
@@ -1828,6 +1916,7 @@ function createSseResponseTransformStream(target, isEventStream) {
           } else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
             try {
               const parsed = JSON.parse(trimmed);
+              diagnostics?.mark(parsed);
               normalizeCompactionResponse(parsed);
               ensureEncryptedContent(parsed);
               out = JSON.stringify(parsed);
@@ -1843,6 +1932,7 @@ function createSseResponseTransformStream(target, isEventStream) {
           let out = buffer;
           try {
             const parsed = JSON.parse(buffer);
+            diagnostics?.mark(parsed);
             normalizeCompactionResponse(parsed);
             ensureEncryptedContent(parsed);
             out = JSON.stringify(parsed);
@@ -2246,9 +2336,12 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
   const authHeaders = sanitizeProxyRequestHeaders(headers, target, {
     omitContentEncoding: true
   });
-  
+  const fallbackModel = remappedProxyRequestModel(parsed.model || "gpt-5.5", target, {
+    compact: true
+  }) || parsed.model || "gpt-5.5";
+
   const completionBody = {
-    model: parsed.model || "gpt-5.5",
+    model: fallbackModel,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
@@ -2347,22 +2440,21 @@ async function handleProviderProxyRequest(req, res) {
   try {
     console.log(`[Proxy Request] ${req.method} ${req.url} -> target: ${target.url}`);
     let body = await readProxyRequestBody(req);
-    if (isCompactProxyTarget(target)) {
-      try {
-        const parsedBody = JSON.parse(body.toString("utf8"));
-        if (parsedBody && parsedBody.client_metadata !== undefined) {
-          delete parsedBody.client_metadata;
-          body = Buffer.from(JSON.stringify(parsedBody), "utf8");
-          console.log(`[Proxy] Stripped client_metadata from compaction request body for compatibility.`);
-        }
-      } catch (e) {
-        // Ignore
-      }
-    }
     let upstream = null;
     const attemptedAccountKeys = new Set();
     let bodyAlreadyDecoded = false;
     let triedPlaintextCompactRepair = false;
+    const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
+    if (rewrittenBody.rewritten) {
+      body = rewrittenBody.body;
+      bodyAlreadyDecoded = rewrittenBody.decoded === true;
+      if (isCompactProxyTarget(target)) {
+        console.log("[Proxy] Rewrote compact request body for provider compatibility.");
+      }
+    } else if (rewrittenBody.decoded) {
+      body = rewrittenBody.body;
+      bodyAlreadyDecoded = true;
+    }
     while (true) {
       if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
       
@@ -2453,9 +2545,23 @@ async function handleProviderProxyRequest(req, res) {
     }
     const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
     const isStream = contentType.includes("event-stream") || isCompactProxyTarget(target) || isResponsesProxyTarget(target);
+    const diagnostics = isStream ? createStreamDiagnostics(target, req.url) : null;
+    let diagnosticsFinished = false;
+    const finishDiagnostics = (reason) => {
+      if (!diagnostics || diagnosticsFinished) return;
+      diagnosticsFinished = true;
+      diagnostics.finish(reason);
+    };
+    responseStream.on("error", () => finishDiagnostics("source_error"));
     if (!target.chatgpt && isStream) {
-      responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream")));
+      responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream"), diagnostics));
     }
+    responseStream.on("end", () => finishDiagnostics("end"));
+    responseStream.on("close", () => finishDiagnostics("close"));
+    res.on("close", () => {
+      if (!res.writableEnded) finishDiagnostics("client_close");
+    });
+    res.on("error", () => finishDiagnostics("response_error"));
     responseStream.pipe(res);
   } catch (error) {
     console.error(`[Proxy Error] ${req.url} failed:`, error);
