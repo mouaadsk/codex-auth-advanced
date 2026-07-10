@@ -7,3 +7,4 @@ node_modules/
 .zig-local-cache/
 npm-debug.log*
 debug-*.js
+scratch/

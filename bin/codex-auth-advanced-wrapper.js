@@ -344,6 +344,12 @@ function providerProxyBaseUrl(codexHome) {
   return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
 }
 
+function providerProxyAccountBaseUrl(codexHome, account) {
+  const accountKey = typeof account?.account_key === "string" ? account.account_key.trim() : "";
+  if (!accountKey) return null;
+  return `${providerProxyBaseUrl(codexHome)}/accounts/${encodeURIComponent(accountKey)}/v1`;
+}
+
 function providerProxyHealthUrl() {
   return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/health`;
 }
@@ -1027,6 +1033,12 @@ function normalizeProxyModelAlias(model) {
 
 function remappedVsllmModel(model, { compact = false } = {}) {
   const normalized = normalizeProxyModelAlias(model);
+  const aliases = {
+    "gpt-5.6-sol": "gpt-5.6-sol-pro20x",
+    "gpt-5.6-terra": "gpt-5.6-terra-pro20x",
+    "gpt-5.6-luna": "gpt-5.6-luna-pro20x"
+  };
+  if (aliases[normalized]) return aliases[normalized];
   if (normalized !== "gpt-5.2") return null;
   return compact ? "gpt-5.5-pro20x-openai-compact" : "gpt-5.5-pro20x";
 }
@@ -1315,6 +1327,38 @@ function activeApiProxyTarget(codexHome) {
   return apiProxyTargetForAccount(codexHome, activeRegistryAccountFromRegistry(registry));
 }
 
+function apiProxyAccountForSelector(codexHome, selector) {
+  const registry = readJsonFile(registryPath(codexHome));
+  if (!registry || !Array.isArray(registry.accounts)) {
+    return { error: "No account registry found for this proxy route.", status: 404 };
+  }
+
+  const normalized = String(selector || "").trim().toLowerCase();
+  if (!normalized) {
+    return { error: "A pinned proxy account selector is required.", status: 400 };
+  }
+
+  const matches = registry.accounts.filter((account) => {
+    if (!account || account.auth_mode !== "apikey") return false;
+    return [account.account_key, account.alias]
+      .filter((value) => typeof value === "string" && value.length > 0)
+      .some((value) => value.toLowerCase() === normalized);
+  });
+  if (matches.length === 0) {
+    return { error: `No API-key account matched pinned proxy selector ${JSON.stringify(selector)}.`, status: 404 };
+  }
+  if (matches.length > 1) {
+    return { error: `Pinned proxy selector ${JSON.stringify(selector)} is ambiguous. Use the account key from \`proxy url\`.`, status: 409 };
+  }
+  return { account: matches[0] };
+}
+
+function pinnedApiProxyTarget(codexHome, selector) {
+  const selected = apiProxyAccountForSelector(codexHome, selector);
+  if (selected.error) return selected;
+  return apiProxyTargetForAccount(codexHome, selected.account);
+}
+
 function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
   const filePath = registryPath(codexHome);
   const registry = readJsonFile(filePath);
@@ -1377,16 +1421,20 @@ function isTransientApiFailureStatus(status) {
   return status === 502 || status === 503 || status === 504;
 }
 
-function proxyRequestTargetUrl(req, codexHome, target) {
-  const groupPath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
+function proxyRequestTargetUrl(req, codexHome, target, routePath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`) {
   const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
-  let rest = incoming.pathname.startsWith(groupPath)
-    ? incoming.pathname.slice(groupPath.length)
+  let rest = incoming.pathname.startsWith(routePath)
+    ? incoming.pathname.slice(routePath.length)
     : incoming.pathname;
   if (!rest.startsWith("/")) rest = `/${rest}`;
   if (rest === "/") rest = "";
 
-  const isTargetNeedV1 = rest === "/responses" || rest.startsWith("/responses/") || rest === "/chat/completions" || rest.startsWith("/chat/completions/");
+  const requestedV1 = rest === "/v1" || rest.startsWith("/v1/");
+  if (requestedV1) {
+    rest = rest === "/v1" ? "" : rest.slice(3);
+  }
+
+  const isTargetNeedV1 = requestedV1 || rest === "/responses" || rest.startsWith("/responses/") || rest === "/chat/completions" || rest.startsWith("/chat/completions/");
   if (isTargetNeedV1 && target.upstreamBaseUrl && !target.upstreamBaseUrl.includes("/v1")) {
     rest = `/v1${rest}`;
   }
@@ -1397,10 +1445,54 @@ function proxyRequestTargetUrl(req, codexHome, target) {
   };
 }
 
-function targetUrlForProxyRequest(req, codexHome) {
-  const target = activeApiProxyTarget(codexHome);
+function targetUrlForProxyRequest(req, route) {
+  const target = route.accountSelector
+    ? pinnedApiProxyTarget(route.codexHome, route.accountSelector)
+    : activeApiProxyTarget(route.codexHome);
   if (target.error) return target;
-  return proxyRequestTargetUrl(req, codexHome, target);
+  return proxyRequestTargetUrl(req, route.codexHome, target, route.pathPrefix);
+}
+
+function providerProxyRouteFromIncoming(incoming) {
+  const pathMatch = incoming.pathname.match(new RegExp(`^${providerProxyPrefix.replaceAll("/", "\\/")}\\/([^/]+)(?:\\/|$)`));
+  if (!pathMatch) {
+    return { error: "Unknown codex-auth-advanced proxy route.", status: 404 };
+  }
+
+  const groupId = pathMatch[1];
+  let codexHome = "";
+  try {
+    codexHome = codexHomeFromProviderProxyGroupId(groupId);
+  } catch {
+    return { error: "Invalid codex-auth-advanced proxy group id.", status: 400 };
+  }
+
+  const groupPath = `${providerProxyPrefix}/${groupId}`;
+  const remainder = incoming.pathname.slice(groupPath.length);
+  if (remainder === "/accounts" || remainder.startsWith("/accounts/")) {
+    const accountMatch = remainder.match(/^\/accounts\/([^/]+)(?:\/|$)/);
+    if (!accountMatch) {
+      return { error: "Pinned proxy routes require an account key or alias after /accounts/.", status: 400 };
+    }
+
+    let accountSelector = "";
+    try {
+      accountSelector = decodeURIComponent(accountMatch[1]).trim();
+    } catch {
+      return { error: "Invalid encoded account selector in pinned proxy route.", status: 400 };
+    }
+    if (!accountSelector || accountSelector.includes("/")) {
+      return { error: "Invalid pinned proxy account selector.", status: 400 };
+    }
+
+    return {
+      codexHome,
+      accountSelector,
+      pathPrefix: `${groupPath}/accounts/${accountMatch[1]}`
+    };
+  }
+
+  return { codexHome, accountSelector: null, pathPrefix: groupPath };
 }
 
 function stripHopByHopHeaders(headers) {
@@ -2051,21 +2143,13 @@ async function handleProviderProxyUpgrade(req, socket, head) {
     return;
   }
 
-  const pathMatch = incoming.pathname.match(new RegExp(`^${providerProxyPrefix.replaceAll("/", "\\/")}\\/([^/]+)(?:\\/|$)`));
-  if (!pathMatch) {
-    writeProxySocketError(socket, 404, "Unknown codex-auth-advanced proxy route.");
+  const route = providerProxyRouteFromIncoming(incoming);
+  if (route.error) {
+    writeProxySocketError(socket, route.status || 400, route.error);
     return;
   }
 
-  let codexHome = "";
-  try {
-    codexHome = codexHomeFromProviderProxyGroupId(pathMatch[1]);
-  } catch {
-    writeProxySocketError(socket, 400, "Invalid codex-auth-advanced proxy group id.");
-    return;
-  }
-
-  const target = targetUrlForProxyRequest(req, codexHome);
+  const target = targetUrlForProxyRequest(req, route);
   if (target.error) {
     writeProxySocketError(socket, target.status || 500, target.error);
     return;
@@ -2347,6 +2431,10 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
       { role: "user", content: userPrompt }
     ]
   };
+  const reasoningEffort = parsed?.reasoning?.effort ?? parsed?.reasoning_effort;
+  if (isVsllmApiAccount(target?.account, target?.upstreamBaseUrl || target?.url || "") && typeof reasoningEffort === "string" && reasoningEffort.trim()) {
+    completionBody.reasoning_effort = reasoningEffort.trim();
+  }
 
   try {
     const res = await fetch(completionsUrl, {
@@ -2417,21 +2505,13 @@ async function handleProviderProxyRequest(req, res) {
     return;
   }
 
-  const pathMatch = incoming.pathname.match(new RegExp(`^${providerProxyPrefix.replaceAll("/", "\\/")}\\/([^/]+)(?:\\/|$)`));
-  if (!pathMatch) {
-    writeProxyError(res, 404, "Unknown codex-auth-advanced proxy route.");
+  const route = providerProxyRouteFromIncoming(incoming);
+  if (route.error) {
+    writeProxyError(res, route.status || 400, route.error);
     return;
   }
 
-  let codexHome = "";
-  try {
-    codexHome = codexHomeFromProviderProxyGroupId(pathMatch[1]);
-  } catch {
-    writeProxyError(res, 400, "Invalid codex-auth-advanced proxy group id.");
-    return;
-  }
-
-  let target = targetUrlForProxyRequest(req, codexHome);
+  let target = targetUrlForProxyRequest(req, route);
   if (target.error) {
     writeProxyError(res, target.status || 500, target.error);
     return;
@@ -2508,17 +2588,22 @@ async function handleProviderProxyRequest(req, res) {
       }
 
       const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream, target.account);
-      const shouldFailOver = exhausted || isTransientApiFailureStatus(upstream.status);
+      if (route.accountSelector && exhausted) {
+        markApiAccountExhaustedFromProxy(route.codexHome, target.account, upstream.status, responseBody);
+      }
+      const shouldFailOver = !route.accountSelector && (exhausted || isTransientApiFailureStatus(upstream.status));
       if (!shouldFailOver) break;
 
       const retryTarget = exhausted
         ? await (async () => {
-          const switched = await switchFromExhaustedApiAccount(codexHome, target.account, upstream.status, responseBody, {
+          const switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, responseBody, {
             excludeAccountKeys: attemptedAccountKeys
           });
-          return switched ? targetUrlForProxyRequest(req, codexHome) : null;
+          return switched
+            ? targetUrlForProxyRequest(req, { ...route, accountSelector: null, pathPrefix: `${providerProxyPrefix}/${providerProxyGroupId(route.codexHome)}` })
+            : null;
         })()
-        : await targetFromTransientApiFailure(codexHome, req, {
+        : await targetFromTransientApiFailure(route.codexHome, req, {
           excludeAccountKeys: attemptedAccountKeys
         });
       if (!retryTarget) break;
@@ -2635,8 +2720,14 @@ async function ensureProviderProxyRunning({ quiet = false } = {}) {
 }
 
 async function maybeHandleProviderProxy(argv) {
-  if (argv[0] !== "proxy") return false;
-  const subcommand = argv[1] || "status";
+  const command = argv[0] === "proxy"
+    ? { codexHome: defaultCodexHome(), args: argv.slice(1) }
+    : argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "proxy"
+      ? { codexHome: managedGroupCodexHome(argv[1]), args: argv.slice(3) }
+      : null;
+  if (!command) return false;
+
+  const subcommand = command.args[0] || "status";
   if (subcommand === "serve") {
     startProviderProxyServer();
     await new Promise(() => {});
@@ -2651,7 +2742,48 @@ async function maybeHandleProviderProxy(argv) {
     process.stdout.write(`provider proxy: ${ok ? "running" : "stopped"} (${providerProxyHealthUrl()})\n`);
     process.exit(ok ? 0 : 1);
   }
-  console.error("Usage: codex-auth-advanced proxy status|start|serve");
+  if (subcommand === "url") {
+    const selector = command.args[1];
+    if (command.args.length > 2) {
+      console.error("Usage: codex-auth-advanced [group <name>] proxy url [account-key-or-alias]");
+      process.exit(1);
+    }
+
+    const codexHome = command.codexHome;
+    if (!selector) {
+      process.stdout.write(`${providerProxyBaseUrl(codexHome)}\n`);
+      return true;
+    }
+
+    const selected = apiProxyAccountForSelector(codexHome, selector);
+    if (selected.error) {
+      console.error(selected.error);
+      process.exit(selected.status === 404 ? 2 : 1);
+    }
+    const url = providerProxyAccountBaseUrl(codexHome, selected.account);
+    if (!url) {
+      console.error(`Could not build a proxy URL for ${accountLabel(selected.account)}.`);
+      process.exit(1);
+    }
+    process.stdout.write(`${url}\n`);
+    return true;
+  }
+  if (subcommand === "urls") {
+    const codexHome = command.codexHome;
+    const registry = readJsonFile(registryPath(codexHome));
+    const accounts = Array.isArray(registry?.accounts)
+      ? registry.accounts.filter((account) => account?.auth_mode === "apikey")
+      : [];
+    if (accounts.length === 0) {
+      console.error("No API-key accounts are available for pinned proxy URLs.");
+      process.exit(2);
+    }
+    for (const account of sortedRegistryAccounts({ accounts })) {
+      process.stdout.write(`${accountLabel(account)}\t${providerProxyAccountBaseUrl(codexHome, account)}\n`);
+    }
+    return true;
+  }
+  console.error("Usage: codex-auth-advanced [group <name>] proxy status|start|serve|url [account-key-or-alias]|urls");
   process.exit(1);
 }
 

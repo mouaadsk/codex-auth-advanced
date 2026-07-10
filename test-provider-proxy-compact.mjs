@@ -210,6 +210,25 @@ async function proxyRawRequest(port, suffix, body) {
   });
 }
 
+async function proxyAccountRawRequest(port, accountSelector, suffix, body, headers = {}) {
+  return fetch(`http://127.0.0.1:${port}/_codex-auth-advanced/${proxyGroupId(codexHome)}/accounts/${encodeURIComponent(accountSelector)}/v1${suffix}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...headers
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+async function proxyAccountRequest(port, accountSelector, suffix, body, headers = {}) {
+  const response = await proxyAccountRawRequest(port, accountSelector, suffix, body, headers);
+  if (response.status !== 200) {
+    throw new Error(`pinned proxy returned ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
 async function proxyRequest(port, suffix, body) {
   const response = await proxyRawRequest(port, suffix, body);
   if (response.status !== 200) {
@@ -281,6 +300,12 @@ function assertRequestAt(index, expected) {
   if (Object.prototype.hasOwnProperty.call(expected, "expectedModel")) {
     if (parsed.model !== expected.expectedModel) {
       throw new Error(`unexpected model for ${expected.label}: expected ${expected.expectedModel}, got ${parsed.model}`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(expected, "expectedReasoningEffort")) {
+    const reasoningEffort = parsed.reasoning?.effort ?? parsed.reasoning_effort;
+    if (reasoningEffort !== expected.expectedReasoningEffort) {
+      throw new Error(`unexpected reasoning effort for ${expected.label}: expected ${expected.expectedReasoningEffort}, got ${reasoningEffort}`);
     }
   }
   const serialized = JSON.stringify(parsed);
@@ -387,7 +412,8 @@ function runWrapper(args) {
       env: {
         ...process.env,
         HOME: tempRoot,
-        CODEX_HOME: codexHome
+        CODEX_HOME: codexHome,
+        CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort)
       },
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -476,6 +502,10 @@ try {
 
   await waitForHealth(proxyPort);
   const body = {
+    reasoning: {
+      effort: "xhigh",
+      summary: "auto"
+    },
     input: [
       {
         type: "reasoning",
@@ -531,6 +561,11 @@ try {
     ...body,
     model: "gpt-5.2"
   };
+  const vsllmPro20xModelAliases = [
+    ["gpt-5.6-sol", "gpt-5.6-sol-pro20x", "ultra"],
+    ["gpt-5.6-terra", "gpt-5.6-terra-pro20x", "ultra"],
+    ["gpt-5.6-luna", "gpt-5.6-luna-pro20x", "max"]
+  ];
 
   setActive("apikey-vsllm");
   await proxyRequest(proxyPort, "/responses", aliasedModelBody);
@@ -539,14 +574,15 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.5-pro20x"
+    expectedModel: "gpt-5.5-pro20x",
+    expectedReasoningEffort: "xhigh"
   });
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestReq = upstreamRequests.at(-1);
   if (!latestReq || !latestReq.url.endsWith("/responses/compact")) {
     throw new Error(`expected vsllm to use native compact endpoint, got url: ${latestReq?.url}`);
   }
-  assertLatestRequest({ label: "vsllm native compact", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertLatestRequest({ label: "vsllm native compact", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true, expectedReasoningEffort: "xhigh" });
   assertCompactResponseTextContent("vsllm native compact response", compactRes1);
 
   compactFailures.push("not_found");
@@ -555,7 +591,7 @@ try {
   if (upstreamRequests.length !== beforeVsllmFallback + 2) {
     throw new Error(`expected vsllm compact fallback to make 2 upstream requests, got ${upstreamRequests.length - beforeVsllmFallback}`);
   }
-  assertRequestAt(beforeVsllmFallback, { label: "vsllm compact first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertRequestAt(beforeVsllmFallback, { label: "vsllm compact first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true, expectedReasoningEffort: "xhigh" });
   const vsllmFallbackReq = upstreamRequests.at(-1);
   if (!vsllmFallbackReq || !vsllmFallbackReq.url.endsWith("/chat/completions")) {
     throw new Error(`expected vsllm compact fallback to use chat completions, got url: ${vsllmFallbackReq?.url}`);
@@ -567,7 +603,7 @@ try {
   if (!Array.isArray(vsllmFallbackReqBody.messages) || vsllmFallbackReqBody.messages.length !== 2) {
     throw new Error(`expected vsllm compact fallback to send chat messages, got: ${vsllmFallbackReq.bodyText}`);
   }
-  assertLatestRequest({ label: "vsllm compact fallback", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false });
+  assertLatestRequest({ label: "vsllm compact fallback", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false, expectedReasoningEffort: "xhigh" });
   assertCompactResponseTextContent("vsllm compact fallback response", compactRes1Fallback);
 
   const aliasedCompactRes = await proxyRequest(proxyPort, "/responses/compact", aliasedModelBody);
@@ -600,6 +636,130 @@ try {
     expectEncryptedContent: false,
     expectedModel: "gpt-5.5-pro20x-openai-compact"
   });
+
+  for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmPro20xModelAliases) {
+    const aliasBody = {
+      ...body,
+      model: inputModel,
+      reasoning: {
+        ...body.reasoning,
+        effort: expectedReasoningEffort
+      }
+    };
+    await proxyRequest(proxyPort, "/responses", aliasBody);
+    assertLatestRequest({
+      label: `vsllm ${inputModel} responses model alias`,
+      bearer: "vsllm-secret",
+      acceptEncoding: "identity",
+      expectEncryptedContent: true,
+      expectedModel,
+      expectedReasoningEffort
+    });
+
+    const compactAliasResponse = await proxyRequest(proxyPort, "/responses/compact", aliasBody);
+    assertLatestRequest({
+      label: `vsllm ${inputModel} compact model alias`,
+      bearer: "vsllm-secret",
+      acceptEncoding: "identity",
+      expectEncryptedContent: true,
+      expectedModel,
+      expectedReasoningEffort
+    });
+    assertCompactResponseTextContent(`vsllm ${inputModel} compact aliased response`, compactAliasResponse);
+
+    compactFailures.push("not_found");
+    const beforeCompactAliasFallback = upstreamRequests.length;
+    await proxyRequest(proxyPort, "/responses/compact", aliasBody);
+    if (upstreamRequests.length !== beforeCompactAliasFallback + 2) {
+      throw new Error(`expected ${inputModel} compact fallback to make 2 upstream requests, got ${upstreamRequests.length - beforeCompactAliasFallback}`);
+    }
+    assertRequestAt(beforeCompactAliasFallback, {
+      label: `vsllm ${inputModel} compact alias first attempt`,
+      bearer: "vsllm-secret",
+      acceptEncoding: "identity",
+      expectEncryptedContent: true,
+      expectedModel,
+      expectedReasoningEffort
+    });
+    assertRequestAt(beforeCompactAliasFallback + 1, {
+      label: `vsllm ${inputModel} compact alias fallback`,
+      bearer: "vsllm-secret",
+      acceptEncoding: "identity",
+      expectEncryptedContent: false,
+      expectedModel,
+      expectedReasoningEffort
+    });
+  }
+
+  const expectedDefaultProxyUrl = `http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}`;
+  const expectedVsllm2ProxyUrl = `${expectedDefaultProxyUrl}/accounts/apikey-vsllm-2/v1`;
+  const defaultProxyUrl = await runWrapper(["proxy", "url"]);
+  if (defaultProxyUrl.stdout.trim() !== expectedDefaultProxyUrl) {
+    throw new Error(`expected default proxy URL ${expectedDefaultProxyUrl}, got ${defaultProxyUrl.stdout}`);
+  }
+  const vsllm2ProxyUrl = await runWrapper(["proxy", "url", "vsllm-2"]);
+  if (vsllm2ProxyUrl.stdout.trim() !== expectedVsllm2ProxyUrl) {
+    throw new Error(`expected pinned vsllm-2 proxy URL ${expectedVsllm2ProxyUrl}, got ${vsllm2ProxyUrl.stdout}`);
+  }
+  const groupedVsllm2ProxyUrl = await runWrapper(["group", "default", "proxy", "url", "vsllm-2"]);
+  if (groupedVsllm2ProxyUrl.stdout.trim() !== expectedVsllm2ProxyUrl) {
+    throw new Error(`expected group-scoped pinned vsllm-2 proxy URL ${expectedVsllm2ProxyUrl}, got ${groupedVsllm2ProxyUrl.stdout}`);
+  }
+  const listedProxyUrls = await runWrapper(["proxy", "urls"]);
+  if (!listedProxyUrls.stdout.includes(`vsllm-2\t${expectedVsllm2ProxyUrl}`)) {
+    throw new Error(`expected proxy URL list to include vsllm-2 endpoint, got ${listedProxyUrls.stdout}`);
+  }
+
+  const openClawBody = {
+    model: "gpt-5.6-terra",
+    messages: [{ role: "user", content: "Hello from OpenClaw" }],
+    stream: false,
+    reasoning_effort: "ultra"
+  };
+  const openClawResponse = await proxyAccountRequest(proxyPort, "vsllm-2", "/chat/completions", openClawBody, {
+    authorization: "Bearer local-openclaw-placeholder"
+  });
+  if (openClawResponse?.choices?.[0]?.message?.content !== "compacted message text") {
+    throw new Error(`expected pinned OpenClaw chat-completions response, got ${JSON.stringify(openClawResponse)}`);
+  }
+  const pinnedOpenClawRequest = upstreamRequests.at(-1);
+  if (!pinnedOpenClawRequest?.url.endsWith("/v1/chat/completions")) {
+    throw new Error(`expected pinned OpenClaw request to target /v1/chat/completions, got ${pinnedOpenClawRequest?.url}`);
+  }
+  assertLatestRequest({
+    label: "pinned vsllm-2 OpenClaw chat completion",
+    bearer: "vsllm-2-secret",
+    acceptEncoding: "identity",
+    expectedModel: "gpt-5.6-terra-pro20x",
+    expectedReasoningEffort: "ultra"
+  });
+
+  const beforeUnknownPinnedAccount = upstreamRequests.length;
+  const unknownPinnedAccount = await proxyAccountRawRequest(proxyPort, "missing-account", "/chat/completions", openClawBody);
+  if (unknownPinnedAccount.status !== 404) {
+    throw new Error(`expected unknown pinned account to return 404, got ${unknownPinnedAccount.status}: ${await unknownPinnedAccount.text()}`);
+  }
+  await unknownPinnedAccount.text();
+  if (upstreamRequests.length !== beforeUnknownPinnedAccount) {
+    throw new Error("unknown pinned account should not make an upstream request");
+  }
+
+  setActive("apikey-vsllm", true);
+  responseFailures.push("no_active_subscription");
+  const beforePinnedNoActive = upstreamRequests.length;
+  const pinnedNoActiveResponse = await proxyAccountRawRequest(proxyPort, "vsllm-2", "/responses", body);
+  if (pinnedNoActiveResponse.status !== 402) {
+    throw new Error(`expected pinned no-active-subscription response to pass through as 402, got ${pinnedNoActiveResponse.status}: ${await pinnedNoActiveResponse.text()}`);
+  }
+  await pinnedNoActiveResponse.text();
+  if (upstreamRequests.length !== beforePinnedNoActive + 1) {
+    throw new Error(`expected pinned no-active-subscription response not to retry, got ${upstreamRequests.length - beforePinnedNoActive} upstream requests`);
+  }
+  assertRequestAt(beforePinnedNoActive, { label: "pinned vsllm-2 no active subscription", bearer: "vsllm-2-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const pinnedNoActiveRegistry = readRegistry();
+  if (pinnedNoActiveRegistry.active_account_key !== "apikey-vsllm") {
+    throw new Error(`pinned account failure should not switch the active Codex account, got ${pinnedNoActiveRegistry.active_account_key}`);
+  }
 
   setActive("apikey-vsllm", true);
   responseFailures.push("no_active_subscription");
@@ -703,6 +863,17 @@ try {
     acceptEncoding: "identity",
     expectEncryptedContent: true,
     expectedModel: "gpt-5.2"
+  });
+  await proxyRequest(proxyPort, "/responses", {
+    ...body,
+    model: "gpt-5.6-terra"
+  });
+  assertLatestRequest({
+    label: "tcdmx gpt-5.6 responses model untouched",
+    bearer: "tcdmx-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true,
+    expectedModel: "gpt-5.6-terra"
   });
   const compactRes2 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestTcdmxReq = upstreamRequests.at(-1);

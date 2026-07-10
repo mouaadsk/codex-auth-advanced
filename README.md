@@ -115,6 +115,8 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced-auto.
 | `codex-auth-advanced import --purge [<path>]` | Rebuild `registry.json` from existing auth files |
 | `codex-auth-advanced add-api-key --template openai\|codex-everywhere\|tcdmx --alias <alias> --stdin` | Add an API key directly without creating a JSON file |
 | `codex-auth-advanced proxy status\|start\|serve` | Inspect or run the local provider proxy used for hot API-provider switching |
+| `codex-auth-advanced [group <name>] proxy url [account-key-or-alias]` | Print the default proxy URL, or a pinned OpenAI-compatible `/v1` URL for one stored API-key account |
+| `codex-auth-advanced [group <name>] proxy urls` | List pinned OpenAI-compatible proxy URLs for all stored API-key accounts |
 
 ### Configuration
 
@@ -287,6 +289,61 @@ Stored API-key configs use a custom `model_providers.OpenAI` section with `wire_
 When an API-key account is active, the root `config.toml` keeps `model_provider = "openai"` and points `openai_base_url` at the local `codex-auth-advanced` provider proxy. The per-account config still stores the real upstream URL, and the proxy forwards each request to the currently active upstream with the currently active API key. Keeping the provider id as lowercase `openai` preserves `codext` resume visibility for older sessions. After the first switch that enables the proxy URL, restart any already-running `codext` session once so it picks up the localhost base URL; later API-to-API switches can happen without changing `codext`'s in-memory provider config.
 The codex-everywhere and tcdmx templates, plus ChatGPT account compact requests, sanitize compact payloads before forwarding them: the proxy removes encrypted reasoning blobs that the next provider/account cannot decrypt after a switch. Normal chat requests stay pass-through. The codex-everywhere and tcdmx templates also force `accept-encoding: identity` through the proxy to avoid compressed SSE stream disconnects.
 For `vsllm` API-key accounts, the proxy forwards Codex compact requests to the provider's native `/v1/responses/compact` endpoint first. If that endpoint is unavailable or times out, the proxy falls back to a local `/v1/chat/completions` summary and returns it in Codex compact response format.
+
+#### Pinned API-Key Proxy Routes
+
+The regular provider-proxy URL follows the active account for its Codex group. For a second local client such as OpenClaw, use a pinned URL instead:
+
+```shell
+codex-auth-advanced proxy url vsllm-2
+```
+
+The command prints an OpenAI-compatible base URL ending in `/v1`, such as:
+
+```text
+http://127.0.0.1:47778/_codex-auth-advanced/<group-id>/accounts/<account-key>/v1
+```
+
+The generated URL uses the stable account key. The route also accepts the account alias if written manually. A pinned route always uses that account's stored upstream API key, preserves VSLLM model remapping, and does not trigger proxy account failover or change Codex's active account when the upstream returns an exhaustion error. The proxy remains loopback-only by default; do not expose these routes on a network interface without adding inbound authentication.
+
+OpenClaw can use the URL as a custom OpenAI-compatible Chat Completions provider. The `apiKey` below is only a non-secret local marker: the proxy replaces its `Authorization` header with the stored VSLLM key.
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "codex-auth-vsllm-2/gpt-5.6-terra" },
+      models: {
+        "codex-auth-vsllm-2/gpt-5.6-terra": { alias: "Terra" },
+      },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      "codex-auth-vsllm-2": {
+        baseUrl: "<output of: codex-auth-advanced proxy url vsllm-2>",
+        apiKey: "local-codex-auth-advanced",
+        api: "openai-completions",
+        timeoutSeconds: 300,
+        models: [
+          {
+            id: "gpt-5.6-terra",
+            name: "GPT-5.6 Terra",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 512000,
+            maxTokens: 32768,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Adjust `contextWindow` and `maxTokens` to the values advertised by VSLLM for the selected model. Do not append another `/v1`: the generated URL already includes it. Pinned routing isolates OpenClaw requests from proxy-driven account switching. If Codex auto-switch remains enabled in the same account group, it can still select the OpenClaw account as a Codex fallback; use a separate group or disable that auto-switch if the account must remain exclusively assigned to OpenClaw. For an account in another group, print its route with `codex-auth-advanced group <name> proxy url <account>`.
 
 ```shell
 printf '%s' "$OPENAI_API_KEY" | codex-auth-advanced group default add-api-key --template openai --alias openai-main --stdin
