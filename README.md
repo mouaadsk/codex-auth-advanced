@@ -1,328 +1,483 @@
-# Codex Auth Advanced [![latest release](https://img.shields.io/github/v/release/mouaadsk/codex-auth-advanced?sort=semver&label=latest)](https://github.com/mouaadsk/codex-auth-advanced/releases/latest) [![latest pre-release](https://img.shields.io/github/v/release/mouaadsk/codex-auth-advanced?include_prereleases&sort=semver&filter=*-*&label=pre-release)](https://github.com/mouaadsk/codex-auth-advanced/releases)
+# Codex Auth Advanced
 
-![command list](https://github.com/user-attachments/assets/6c13a2d6-f9da-47ea-8ec8-0394fc072d40)
+[![latest release](https://img.shields.io/github/v/release/mouaadsk/codex-auth-advanced?sort=semver&label=latest)](https://github.com/mouaadsk/codex-auth-advanced/releases/latest)
+[![latest pre-release](https://img.shields.io/github/v/release/mouaadsk/codex-auth-advanced?include_prereleases&sort=semver&filter=*-*&label=pre-release)](https://github.com/mouaadsk/codex-auth-advanced/releases)
 
-`codex-auth-advanced` is a command-line tool for switching Codex accounts.
+`codex-auth-advanced` manages multiple Codex and OpenAI-compatible API accounts from one local installation. This fork adds a stable loopback provider proxy, managed account groups, API-key switching, pinned routes for secondary clients, VSLLM model routing, exact New API subscription-window tracking, resilient compact requests, and graceful proxy restarts.
 
-> [!IMPORTANT]
-> For **Codex CLI** and **Codex App** users, switch accounts, then restart the client for the new account to take effect.
->
-> If you use the CLI and want seamless automatic account switching without restarting, use `codext`, an enhanced Codex CLI.
+This repository is maintained as a local macOS checkout. It is not currently published as a general npm release.
 
-## Supported Platforms
+## Contents
 
-`codex-auth-advanced` works with these Codex clients:
+- [Capabilities](#capabilities)
+- [How It Works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Command Reference](#command-reference)
+- [Account Storage](#account-storage)
+- [Provider Proxy](#provider-proxy)
+- [VSLLM Integration](#vsllm-integration)
+- [Automatic Switching](#automatic-switching)
+- [OpenClaw and Pinned Routes](#openclaw-and-pinned-routes)
+- [Operations](#operations)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
+- [Current Limitations](#current-limitations)
 
-- Codex CLI
-- VS Code extension
-- Codex App
+## Capabilities
 
-For the best experience, install the Codex CLI even if you mainly use the VS Code extension or the App, because it makes adding accounts easier:
+- Store and switch between ChatGPT/Codex authentication snapshots.
+- Store OpenAI-compatible API-key accounts with independent provider URLs.
+- Keep Codex pointed at one stable localhost URL while the active upstream account changes.
+- Organize accounts into independent `CODEX_HOME` groups.
+- Launch `codext` with the model and reasoning settings from the selected group.
+- Give OpenClaw or another client a route pinned to one API account.
+- Preserve requested models and reasoning effort through the proxy.
+- Route selected Codex model names to VSLLM `pro20x` models.
+- Send compact requests to the provider-native compact endpoint with a local fallback.
+- Read authoritative VSLLM/New API subscription usage and exact reset timestamps.
+- Retry transient VSLLM usage-limit responses without immediately exhausting an available account.
+- Drain active HTTP streams before restarting the proxy.
+
+## How It Works
+
+The project has four main layers:
+
+1. **Vendored account manager**
+
+   The native `codex-auth-advanced` binary handles the original account registry, login, import, grouping, and ChatGPT usage workflows.
+
+2. **JavaScript wrapper**
+
+   [`bin/codex-auth-advanced-wrapper.js`](bin/codex-auth-advanced-wrapper.js) adds API-key accounts, provider usage tracking, local proxy routing, VSLLM behavior, pinned endpoints, and background switching support.
+
+3. **Provider proxy**
+
+   The proxy listens on `127.0.0.1:47778` by default. Codex uses a stable local base URL while the proxy reads the active account from its registry for each request.
+
+4. **Background manager**
+
+   When auto-switching is enabled, one manager refreshes usage for all enabled groups every 30 seconds and switches away from exhausted active accounts.
+
+ChatGPT account switches normally require restarting the Codex client so it reloads credentials. API-to-API switches can remain hot after Codex has been configured to use the local proxy. `codext` can launch against a selected group and carry its current model configuration into resumed sessions.
+
+## Requirements
+
+- Node.js 22 or newer.
+- The OpenAI Codex CLI for login and normal Codex workflows.
+- macOS arm64 for the vendored binary currently included in this checkout.
+
+Install Codex if needed:
 
 ```shell
 npm install -g @openai/codex
 ```
 
-After that, you can use `codex login`, `codex login --device-auth`, `codex-auth-advanced login`, `codex-auth-advanced login --device-auth`, or `codex-auth-advanced login --group <name>` to sign in and add accounts more easily.
+The wrapper can support another platform when a matching native binary is added under:
 
-## Local Setup
+```text
+vendor/<platform>-<arch>/bin/
+```
 
-This project is maintained as a local laptop checkout. The npm package name is `codex-auth-advanced`, but this repository is not set up for registry publishing. The macOS arm64 binary is vendored under `vendor/darwin-arm64/bin/`, and the JavaScript wrapper runs that local binary directly.
+## Installation
 
-Link this checkout into your active Node install:
+From this checkout:
 
 ```shell
+cd /path/to/codex-auth-advanced
 npm link
 ```
 
-Confirm the global command resolves to this repository:
+Confirm that the global command points to this repository:
 
 ```shell
 which codex-auth-advanced
 realpath "$(which codex-auth-advanced)"
+codex-auth-advanced --version
 ```
 
-The current vendored binary supports macOS arm64. Other platforms need matching binaries added under `vendor/<platform>-<arch>/bin/`.
-
-### Uninstall
-
-#### npm
-
-Remove the local npm link:
+Remove the local link with:
 
 ```shell
 npm uninstall -g codex-auth-advanced
 ```
 
-#### Legacy Bash Installer
+## Quick Start
 
-> [!NOTE]
-> If you only installed `codex-auth-advanced` with npm, you do not need any legacy cleanup steps.
-> Older Bash/PowerShell GitHub-release installs could leave a standalone `codex-auth-advanced` binary outside npm's install path.
-> If you previously used those legacy installers, remove the leftover binaries and profile changes during migration.
-> API-backed usage refresh and team-name refresh use Node.js `fetch`.
-> npm installs already satisfy that requirement.
-
-For non-npm installs on Linux/macOS/WSL2 only:
+### Add A Codex Account
 
 ```shell
-rm -f ~/.local/bin/codex-auth-advanced
-rm -f ~/.local/bin/codex-auth-advanced-auto
-sed -i '/# Added by codex-auth-advanced installer/,+1d' ~/.bashrc ~/.bash_profile ~/.profile ~/.zshrc ~/.zprofile 2>/dev/null || true
+codex-auth-advanced login
 ```
 
-If you used fish, also remove the old profile entry:
+Device authentication is also supported:
 
 ```shell
-sed -i '/# Added by codex-auth-advanced installer/,+3d' ~/.config/fish/config.fish 2>/dev/null || true
+codex-auth-advanced login --device-auth
 ```
 
-#### Legacy PowerShell Installer
+### Add An API-Key Account
 
-For non-npm installs on Windows only:
+Use stdin so the key is not included in the command arguments:
 
-```powershell
-Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced.exe" -Force -ErrorAction SilentlyContinue
-Remove-Item "$env:LOCALAPPDATA\codex-auth-advanced\bin\codex-auth-advanced-auto.exe" -Force -ErrorAction SilentlyContinue
-[Environment]::SetEnvironmentVariable(
-  "Path",
-  (($env:Path -split ';' | Where-Object { $_ -and $_ -ne "$env:LOCALAPPDATA\codex-auth-advanced\bin" }) -join ';'),
-  "User"
-)
+```shell
+printf '%s' "$OPENAI_API_KEY" | \
+  codex-auth-advanced add-api-key \
+    --template openai \
+    --alias openai-main \
+    --stdin
 ```
 
-## Commands
+For VSLLM, provide its OpenAI-compatible base URL and optional local display cap:
 
-### Account Management
+```shell
+printf '%s' "$VSLLM_API_KEY" | \
+  codex-auth-advanced add-api-key \
+    --template openai \
+    --base-url https://vsllm.com/v1 \
+    --alias vsllm-main \
+    --api-spend-limit-usd 55 \
+    --stdin
+```
 
-| Command | Description |
-|---------|-------------|
-| `codex-auth-advanced list [--live] [--api\|--skip-api]` | List all accounts. `--live` keeps refreshing the terminal view; `--api` forces remote refresh, while `--skip-api` forbids remote API use for this command. |
-| `codex-auth-advanced login [--device-auth] [--group <name>]` | Run `codex login` (optionally with `--device-auth`), then add the current account |
-| `codex-auth-advanced switch [--live] [--auto] [--api\|--skip-api]` | Switch the active account interactively. Without `--live` it exits after one switch; with `--live` it stays open and keeps refreshing. `--auto` requires `--live` and auto-switches away from the current account when the live view shows it as exhausted or returns a non-200 usage API status. |
-| `codex-auth-advanced switch <query>` | Switch the active account directly by row number, alias, or fuzzy match using stored local data only. |
-| `codex-auth-advanced remove [--live] [--api\|--skip-api]` | Interactive remove. `--live` keeps the picker open after each deletion; `--api` forces remote refresh and `--skip-api` forbids remote API use for this command. |
-| `codex-auth-advanced remove <query> [<query>...]` | Remove one or more accounts by row number, alias, email, account name, or `account_key` match using stored local data. |
-| `codex-auth-advanced remove --all` | Remove all stored accounts. |
-| `codex-auth-advanced status` | Show auto-switch, service, and usage status |
+### Start The Proxy
 
-### Import
+```shell
+./scripts/start-proxy.zsh
+```
 
-| Command | Description |
-|---------|-------------|
-| `codex-auth-advanced import <path> [--alias <alias>] [--api-spend-limit-usd <amount>]` | Import a single file or batch import from a folder |
-| `codex-auth-advanced import --cpa [<path>] [--api-spend-limit-usd <amount>]` | Import [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) token JSON |
-| `codex-auth-advanced import --purge [<path>]` | Rebuild `registry.json` from existing auth files |
-| `codex-auth-advanced add-api-key --template openai\|codex-everywhere\|tcdmx --alias <alias> --stdin` | Add an API key directly without creating a JSON file |
-| `codex-auth-advanced proxy status\|start\|serve` | Inspect or run the local provider proxy used for hot API-provider switching |
-| `codex-auth-advanced [group <name>] proxy url [account-key-or-alias]` | Print the default proxy URL, or a pinned OpenAI-compatible `/v1` URL for one stored API-key account |
-| `codex-auth-advanced [group <name>] proxy urls` | List pinned OpenAI-compatible proxy URLs for all stored API-key accounts |
-
-### Configuration
-
-| Command | Description |
-|---------|-------------|
-| `codex-auth-advanced config auto enable\|disable` | Enable or disable experimental background auto-switching |
-| `codex-auth-advanced config api-spend-limit <api-account> <amount>` | Set or update the dollar spend limit for an imported API-key account |
-| `codex-auth-advanced config api enable\|disable` | Enable or disable both usage refresh and team name refresh API calls |
-
-### Managed Account Groups
-
-| Command | Description |
-|---------|-------------|
-| `codex-auth-advanced list` | List accounts across managed groups with group sections and a `GROUP` column |
-| `codex-auth-advanced group list` | List managed account groups and their `CODEX_HOME` folders |
-| `codex-auth-advanced group create <name> [<account>...]` | Create a group under `~/codex-auth-advanced/groups/` and optionally add accounts |
-| `codex-auth-advanced group <name> login [--device-auth]` | Log in and add the new account directly to that group |
-| `codex-auth-advanced group <name> add-api-key --template openai\|codex-everywhere\|tcdmx --alias <alias> --stdin` | Add an API key directly to that group |
-| `codex-auth-advanced group <name> add <account>...` | Copy existing accounts from any known group into the target group |
-| `codex-auth-advanced group <name> copy [<account>...]` | Copy accounts into the target group. With no account selector, choose interactively. |
-| `codex-auth-advanced group <name> move [<account>...]` | Move accounts into the target group by copying them, then removing them from their source group. With no account selector, choose interactively. |
-| `codex-auth-advanced group <name> switch [--live] [--auto] [--api\|--skip-api]` | Switch the active account interactively inside that group |
-| `codex-auth-advanced group <name> switch <query>` | Switch directly inside that group by row number, alias, or fuzzy match |
-| `codex-auth-advanced group <name> auto enable\|disable` | Enable or disable auto-switching for that group |
-| `codex-auth-advanced group <name> config api-spend-limit <api-account> <amount>` | Set or update an API-key dollar spend limit inside that group |
-| `codex-auth-advanced group <name> config api enable\|disable` | Enable or disable usage and account API calls for that group |
-| `codex-auth-advanced group <name> launch [resume [session]] [-- <codext-arg>...]` | Launch `codext` with that group as `CODEX_HOME` and pass the group's current model settings |
-| `codex-auth-advanced project set-group <name>` | Remember a group for the current project directory |
-| `codex-auth-advanced launch [resume [session]] [-- <codext-arg>...]` | Launch `codext` using the remembered project group, or `default`, and pass the group's current model settings |
-
-`default` maps to the normal `~/.codex`. Other managed groups live under `~/codex-auth-advanced/groups/`, each gets its own display color for the grouped list dashboard, and the single advanced auto-switch manager can watch all enabled groups at once.
-
-Launch commands read the selected group's `config.toml` and forward its top-level `model` and `model_reasoning_effort` to `codext` unless you already pass `--model` or a matching `-c` override yourself. This keeps resumed sessions aligned with the current group config instead of letting stale saved thread metadata silently restore an older model.
-
----
-
-## Examples
-
-### List Accounts
-
-> [!IMPORTANT]
-> Built-in Node proxy support for API refresh requires Node.js `22.21.0+` or `24.0.0+`.
+### List And Switch
 
 ```shell
 codex-auth-advanced list
 codex-auth-advanced list --live
-codex-auth-advanced list --api        # force usage/team-name API refresh, even if config api is disabled
-codex-auth-advanced list --skip-api   # forbid usage/team-name API refresh for this command
-```
-
-`--live` keeps the list refreshing inside the terminal UI.
-`--api` forces the foreground usage and team-name refresh path for this command only.
-`--skip-api` forbids remote refresh for this command only. Usage can still refresh locally for the active account when local rollout data exists.
-
-### Switch Account
-
-```shell
 codex-auth-advanced switch
-codex-auth-advanced switch --live
-codex-auth-advanced switch --live --auto
-codex-auth-advanced switch --api
-codex-auth-advanced switch --skip-api
+codex-auth-advanced switch <alias-or-account-key>
 ```
 
-`codex-auth-advanced switch`
-Opens the interactive picker. It shows email, 5h, weekly, and last activity, then exits after one successful switch.
+## Command Reference
 
-`codex-auth-advanced switch --live`
-Keeps the picker open after Enter, keeps refreshing the terminal view, and updates the footer with the latest switch result.
-
-`codex-auth-advanced switch --live --auto`
-Keeps watching the current live display and auto-switches only when the active account reaches `0%` on 5h or weekly, or when the usage API returns a non-200 status for the active account.
-
-`codex-auth-advanced switch --api`
-Forces a foreground remote refresh before opening the picker.
-
-`codex-auth-advanced switch --skip-api`
-Forbids remote API use for this command and relies on local-only usage refresh where available.
-
-`codex-auth-advanced switch <query>`
-Switches directly by displayed row number, alias, or fuzzy email/alias match using stored local data only. The row number follows the interactive `switch` list, and the same number from `codex-auth-advanced list` also works because both commands use the same ordering. `switch <query>` does not accept `--live`, `--auto`, `--api`, or `--skip-api`.
-
-When `--live --auto` is active, auto-switch candidates still follow the live picker rules and skip accounts whose current 5h or weekly value is already `0%`.
-
-![command switch](https://github.com/user-attachments/assets/48a86acf-2a6e-4206-a8c4-591989fdc0df)
+Run the built-in help for the complete upstream command set:
 
 ```shell
-codex-auth-advanced switch 02                 # switch by displayed row number
-codex-auth-advanced switch john               # fuzzy match by email or alias
-codex-auth-advanced switch work               # match by alias set during import
+codex-auth-advanced --help
+codex-auth-advanced <command> --help
 ```
 
-If `<query>` matches multiple accounts, the command falls back to interactive selection. Press `q` to quit without switching.
+The wrapper adds or extends the commands below.
 
-### Remove Accounts
+### Accounts
 
-```shell
-codex-auth-advanced remove
-codex-auth-advanced remove --live
-codex-auth-advanced remove --api
-codex-auth-advanced remove --skip-api
+| Command | Purpose |
+| --- | --- |
+| `list [--live] [--api\|--skip-api]` | List accounts; live mode refreshes continuously. |
+| `status` | Show auto-switch, service, API mode, and active-account status. |
+| `login [--device-auth] [--group <name>]` | Run Codex login and save the resulting account. |
+| `switch [--live] [--auto]` | Open the account picker; optional live monitoring. |
+| `switch <query>` | Switch by row, alias, email, or account-key match. |
+| `remove <query>...` | Remove selected stored accounts. |
+| `remove --all` | Remove all accounts in the selected registry. |
+
+### Import And API Keys
+
+| Command | Purpose |
+| --- | --- |
+| `import <path> [--alias <name>]` | Import one auth file or a directory. |
+| `import --cpa [<path>]` | Import CLIProxyAPI token JSON. |
+| `import --purge [<path>]` | Rebuild `registry.json` from auth files. |
+| `add-api-key --template <name> --alias <name> --stdin` | Add or update an API-key account. |
+| `config api-spend-limit <account> <amount>` | Set a local dollar cap for an API-key account. |
+
+Supported direct-add templates are `openai`, `codex-everywhere`, and `tcdmx`. A custom `--base-url` can be supplied with the `openai` template.
+
+Generated API-provider configs currently default to:
+
+```toml
+model_context_window = 320000
+model_auto_compact_token_limit = 250000
 ```
 
-`codex-auth-advanced remove`
-Opens the interactive remove picker. It stays local-only by default so deletion is not blocked by API refresh work.
+The current top-level `model`, `review_model`, and `model_reasoning_effort` values are preserved when an API account is created or switched.
 
-`codex-auth-advanced remove --live`
-Keeps the picker open after each deletion so you can continue cleaning up accounts in one session.
+### Groups And Projects
 
-`codex-auth-advanced remove --api`
-Attempts a best-effort foreground refresh for picker display. Successful rows show live API data when it is available; rows that cannot refresh may show live error overlays such as `403`, `TimedOut`, or `MissingAuth` instead.
+| Command | Purpose |
+| --- | --- |
+| `group list` | List managed groups and their `CODEX_HOME` paths. |
+| `group create <name> [<account>...]` | Create a group and optionally copy accounts into it. |
+| `group <name> login [--device-auth]` | Add a Codex account directly to a group. |
+| `group <name> add-api-key ...` | Add an API-key account directly to a group. |
+| `group <name> add\|copy\|move <account>...` | Copy or move accounts between groups. |
+| `group <name> switch ...` | Switch inside one group. |
+| `group <name> config ...` | Configure one group. |
+| `group <name> launch [resume [session]]` | Launch `codext` with that group. |
+| `project set-group <name>` | Remember the group for the current project. |
+| `launch [resume [session]]` | Launch with the remembered group or `default`. |
 
-`codex-auth-advanced remove --skip-api`
-Keeps the picker local-only explicitly and forbids remote API use for this command.
+The `default` group maps to `~/.codex`. Additional groups normally live under:
 
-`codex-auth-advanced remove <query> [<query>...]`
-Removes one or more accounts by row number, alias, email, account name, or `account_key` match using stored local data only.
-
-`codex-auth-advanced remove --all`
-Removes all stored accounts.
-
-Each selector supports the same query forms as `switch`: row number, alias, or fuzzy email/alias match.
-The row number follows the interactive `switch` list, and the same number from `codex-auth-advanced list` also works because both commands use the same ordering.
-You can pass multiple selectors in one command.
-Selector-based `remove` and `remove --all` do not accept `--live`, `--api`, or `--skip-api`.
-
-```shell
-codex-auth-advanced remove 01 03
-codex-auth-advanced remove work personal
-codex-auth-advanced remove 01 jane@example.com
-codex-auth-advanced remove --all
+```text
+~/codex-auth-advanced/groups/<name>/
 ```
 
-If any selector matches multiple accounts, `remove` asks for confirmation in interactive terminals before deleting.
+### Proxy
 
-### Login (Add Account)
+| Command | Purpose |
+| --- | --- |
+| `proxy status` | Check the local proxy. |
+| `proxy start` | Start the proxy when it is stopped. |
+| `proxy serve` | Run the proxy in the foreground. |
+| `proxy url [account]` | Print the default route or a route pinned to one account. |
+| `proxy urls` | List pinned URLs for every API-key account. |
 
-Add the currently logged-in Codex account:
+For normal operations, prefer the lifecycle scripts described in [Operations](#operations).
 
-```shell
-codex-auth-advanced login
-codex-auth-advanced login --device-auth
-codex-auth-advanced login --group work --device-auth
-codex-auth-advanced group work login --device-auth
+## Account Storage
+
+The default account files are stored under:
+
+```text
+~/.codex/accounts/
 ```
 
-### Import
+Important files include:
 
-#### Single File
+| Path | Contents |
+| --- | --- |
+| `registry.json` | Non-secret account metadata, active account, usage state, groups, and auto-switch settings. |
+| `<account-key>.auth.json` | ChatGPT tokens or an API provider key. |
+| `<account-key>.config.toml` | Per-account Codex/provider configuration. |
+| `provider-dashboard/<hash>.json` | Private dashboard credentials linked by provider origin and numeric user ID. |
 
-```shell
-codex-auth-advanced import /path/to/auth.json --alias personal
-codex-auth-advanced import /path/to/api-auth.json --alias codex-everywhere --api-spend-limit-usd 50
+Credential files and the registry are written with mode `0600`; credential directories use mode `0700`.
+
+API account keys are identified internally by a stable SHA-256-derived `account_key`. Editable aliases are used for display and command selection, not as credential identities.
+
+## Provider Proxy
+
+### Default Route
+
+The default proxy route follows the active account in a group:
+
+```text
+http://127.0.0.1:47778/_codex-auth-advanced/<group-id>/v1
 ```
 
-For API-key imports, `--api-spend-limit-usd <amount>` stores a dollar cap on the imported API key. When the API reports HTTP 429 or the tracked spend reaches that configured cap, the wrapper marks that account as exhausted in local usage data so account switching can move to the next usable account. The `vsllm` provider is treated as a rolling 8-hour usage provider: its New API billing endpoint reports total usage, so `codex-auth-advanced` keeps that total as telemetry and tracks only increases during the last 8 hours. Set an explicit API spend limit if you want that rolling telemetry to drive exhaustion and auto-switching.
-For an API key that was already imported, set or update the cap with:
+When an API account is activated, the root Codex config points its OpenAI base URL at this local route. The real upstream URL remains in the per-account config.
 
-```shell
-codex-auth-advanced config api-spend-limit codex-everywhere 50
-codex-auth-advanced group default config api-spend-limit codex-everywhere 50
-```
+### Pinned Route
 
-#### Direct API-Key Add
-
-Add a token without creating a JSON file by piping it on stdin. The supported templates are `openai`, `codex-everywhere`, and `tcdmx`; the codex-everywhere template uses `https://codex-everywhere.com/` and defaults the spend limit to `$50`, while the tcdmx template uses `https://tcdmx.com` and defaults the spend limit to `$300`.
-API-key configs inherit the current top-level `model`, `review_model`, and `model_reasoning_effort` settings when they are created or switched, so changing providers does not downgrade the selected session model. Switching to an API-key account refreshes that account's API runtime fields, including context and auto-compact limits, while preserving unrelated root config such as MCP and feature settings.
-Generated API-key configs default `model_context_window` to `512000`; the codex-everywhere template uses `model_auto_compact_token_limit = 300000`, while the tcdmx template uses `model_auto_compact_token_limit = 400000`.
-Stored API-key configs use a custom `model_providers.OpenAI` section with `wire_api = "responses"` and the provider-specific `base_url`, so codex-everywhere and tcdmx keep the same Responses-provider structure while pointing at their own domains.
-When an API-key account is active, the root `config.toml` keeps `model_provider = "openai"` and points `openai_base_url` at the local `codex-auth-advanced` provider proxy. The per-account config still stores the real upstream URL, and the proxy forwards each request to the currently active upstream with the currently active API key. Keeping the provider id as lowercase `openai` preserves `codext` resume visibility for older sessions. After the first switch that enables the proxy URL, restart any already-running `codext` session once so it picks up the localhost base URL; later API-to-API switches can happen without changing `codext`'s in-memory provider config.
-The codex-everywhere and tcdmx templates, plus ChatGPT account compact requests, sanitize compact payloads before forwarding them: the proxy removes encrypted reasoning blobs that the next provider/account cannot decrypt after a switch. Normal chat requests stay pass-through. The codex-everywhere and tcdmx templates also force `accept-encoding: identity` through the proxy to avoid compressed SSE stream disconnects.
-For `vsllm` API-key accounts, the proxy forwards Codex compact requests to the provider's native `/v1/responses/compact` endpoint first. If that endpoint is unavailable or times out, the proxy falls back to a local `/v1/chat/completions` summary and returns it in Codex compact response format.
-
-#### Pinned API-Key Proxy Routes
-
-The regular provider-proxy URL follows the active account for its Codex group. For a second local client such as OpenClaw, use a pinned URL instead:
-
-```shell
-codex-auth-advanced proxy url vsllm-2
-```
-
-The command prints an OpenAI-compatible base URL ending in `/v1`, such as:
+A pinned route always uses one stored API account:
 
 ```text
 http://127.0.0.1:47778/_codex-auth-advanced/<group-id>/accounts/<account-key>/v1
 ```
 
-The generated URL uses the stable account key. The route also accepts the account alias if written manually. A pinned route always uses that account's stored upstream API key, preserves VSLLM model remapping, and does not trigger proxy account failover or change Codex's active account when the upstream returns an exhaustion error. The proxy remains loopback-only by default; do not expose these routes on a network interface without adding inbound authentication.
+Generate it instead of constructing it manually:
 
-OpenClaw can use the URL as a custom OpenAI-compatible Chat Completions provider. The `apiKey` below is only a non-secret local marker: the proxy replaces its `Authorization` header with the stored VSLLM key.
+```shell
+codex-auth-advanced proxy url <account-key-or-alias>
+```
+
+Pinned routes:
+
+- Preserve provider-specific model remapping.
+- Replace the caller's placeholder authorization with the stored API key.
+- Never change the group's active Codex account.
+- Never fail over to another account.
+
+### Control Endpoints
+
+The proxy exposes loopback-only operational endpoints:
+
+```text
+GET  /_codex-auth-advanced/health
+POST /_codex-auth-advanced/restart
+```
+
+The health response includes the proxy start time, restart state, active request count, and active upgrade count.
+
+### Configuration
+
+| Environment variable | Default |
+| --- | --- |
+| `CODEX_AUTH_ADVANCED_PROXY_HOST` | `127.0.0.1` |
+| `CODEX_AUTH_ADVANCED_PROXY_PORT` | `47778` |
+| `CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL` | `https://chatgpt.com/backend-api/codex` |
+
+Keep the proxy on loopback unless inbound authentication is added. The proxy route itself is not designed to be exposed directly to a LAN or the internet.
+
+## VSLLM Integration
+
+### Model Routing
+
+For VSLLM accounts, these Codex model names are rewritten before forwarding:
+
+| Codex request | VSLLM normal request | VSLLM compact request |
+| --- | --- | --- |
+| `gpt-5.2` | `gpt-5.5-pro20x` | `gpt-5.5-pro20x-openai-compact` |
+| `gpt-5.6-sol` | `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` |
+| `gpt-5.6-terra` | `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` |
+| `gpt-5.6-luna` | `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
+
+Other model names pass through unchanged.
+
+The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
+
+Per-account `normal` versus `pro20x` tier selection is intentionally postponed. The current default always uses the mappings above; see [`task.md`](task.md).
+
+### Compact Requests
+
+Codex compact requests are sent to:
+
+```text
+/v1/responses/compact
+```
+
+The proxy first uses the provider-native endpoint. If it is missing, unavailable, or times out, the proxy creates a summary through `/v1/chat/completions` and returns it in Codex compact-response format.
+
+For provider/account transitions that cannot decrypt earlier reasoning state, the compatibility path can remove encrypted reasoning content and retry with plaintext conversation content. Normal response requests remain pass-through apart from model rewriting and required header normalization.
+
+### Exact Subscription Windows
+
+VSLLM is based on New API. A model API key can report cumulative billing totals, but it cannot query the authenticated subscription reset state. Configure a dashboard system access token for each VSLLM user so the wrapper can use:
+
+```text
+GET https://vsllm.com/api/subscription/self
+```
+
+The response supplies authoritative fields such as:
+
+- `used_percent`
+- `last_reset_time`
+- `next_reset_time`
+- `end_time`
+- active subscription count
+- billing preference
+
+This avoids treating a cumulative provider total as spending from the latest 5-hour or 8-hour reset window.
+
+### Obtain Dashboard Credentials
+
+1. Sign in to the VSLLM dashboard account.
+2. Open `https://vsllm.com/console/personal`.
+3. Under account security, generate or regenerate the **System Access Token**.
+4. In the browser console, read the numeric user ID:
+
+```javascript
+JSON.parse(localStorage.getItem('user') || '{}').id
+```
+
+5. Configure the account locally:
+
+```shell
+codex-auth-advanced config vsllm-dashboard \
+  --user-id <numeric-user-id> \
+  --alias <dashboard-alias>
+```
+
+The terminal asks for the dashboard token with hidden input. Do not put it in the command line or in this repository.
+
+The setup command:
+
+- Authenticates `/api/subscription/self`.
+- Fetches the dashboard's masked API-token list.
+- Compares masked values against local keys without sending local model keys to the dashboard.
+- Links the dashboard identity to the matching stable API account key.
+- Stores the access token only in a private credential file.
+
+Use `--account <selector>` only if masked-key matching finds multiple local candidates. Use `--origin <url>` for another New API deployment. `--stdin` and `CODEX_AUTH_ADVANCED_VSLLM_ACCESS_TOKEN` are available for non-interactive automation, but the hidden prompt is preferred.
+
+### Subscription Availability Rules
+
+For `billing_preference = "subscription_only"`, an account is considered exhausted when:
+
+- There are no active subscriptions, or
+- Every active, non-unlimited subscription reports `used_percent >= 100`.
+
+If any active subscription is unlimited or below 100%, the account remains usable. When a reset makes a subscription available again, the next refresh clears the exhausted state and returns the account to the candidate pool.
+
+The manager does not proactively switch back to a newly reset account while the current account remains usable. It becomes available for the next required switch.
+
+When dashboard credentials have never been configured, VSLLM usage falls back to the older local rolling estimate based on cumulative billing changes. That fallback is less authoritative and should not be preferred for fixed New API subscription windows.
+
+After a dashboard identity has been configured successfully, a temporary dashboard outage does not reactivate the rolling estimate. The wrapper preserves the last authoritative subscription state until a later dashboard refresh succeeds.
+
+## Automatic Switching
+
+Auto-switching is disabled by default.
+
+```shell
+codex-auth-advanced config auto enable
+codex-auth-advanced config auto disable
+```
+
+For a managed group:
+
+```shell
+codex-auth-advanced group <name> auto enable
+codex-auth-advanced group <name> auto disable
+```
+
+### Scheduled Manager Behavior
+
+The manager refreshes all enabled groups every 30 seconds.
+
+- ChatGPT accounts use their configured 5-hour and weekly thresholds.
+- API-key accounts switch only when their tracked provider state is exhausted.
+- VSLLM dashboard-linked accounts use exact active-subscription availability.
+- Exhausted candidates are skipped.
+- A newly reset account becomes eligible but does not force failback.
+
+Configure ChatGPT thresholds with:
+
+```shell
+codex-auth-advanced config auto --5h <percent> --weekly <percent>
+```
+
+On macOS, the manager uses LaunchAgent label:
+
+```text
+com.mouaadsk.codex-auth-advanced.manager
+```
+
+### Request-Time Behavior
+
+For VSLLM, the proxy distinguishes hard exhaustion from transient responses:
+
+- `You've hit your usage limit. Try again later.` and equivalent HTTP 429 responses are retried once on the same account while subscription quota remains available.
+- The Chinese temporary subscription-unavailable response is treated the same way when provider subscription data says the account remains usable.
+- After the same-account retry, a normal non-pinned route can try another usable account when auto-switching is enabled.
+- A direct no-active-subscription rejection is treated as authoritative hard exhaustion and can trigger immediate failover on the default route.
+- Pinned routes never fail over.
+
+## OpenClaw And Pinned Routes
+
+Use a pinned route when OpenClaw must stay on one VSLLM account while Codex uses another:
+
+```shell
+codex-auth-advanced proxy url <openclaw-account>
+```
+
+Example OpenClaw provider configuration:
 
 ```json5
 {
   agents: {
     defaults: {
-      model: { primary: "codex-auth-vsllm-2/gpt-5.6-terra" },
+      model: { primary: "codex-auth-vsllm/gpt-5.6-terra" },
       models: {
-        "codex-auth-vsllm-2/gpt-5.6-terra": { alias: "Terra" },
+        "codex-auth-vsllm/gpt-5.6-terra": { alias: "Terra" },
       },
     },
   },
   models: {
     mode: "merge",
     providers: {
-      "codex-auth-vsllm-2": {
-        baseUrl: "<output of: codex-auth-advanced proxy url vsllm-2>",
+      "codex-auth-vsllm": {
+        baseUrl: "<output of: codex-auth-advanced proxy url <account>>",
         apiKey: "local-codex-auth-advanced",
         api: "openai-completions",
         timeoutSeconds: 300,
@@ -333,7 +488,7 @@ OpenClaw can use the URL as a custom OpenAI-compatible Chat Completions provider
             reasoning: true,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 512000,
+            contextWindow: 320000,
             maxTokens: 32768,
           },
         ],
@@ -343,153 +498,181 @@ OpenClaw can use the URL as a custom OpenAI-compatible Chat Completions provider
 }
 ```
 
-Adjust `contextWindow` and `maxTokens` to the values advertised by VSLLM for the selected model. Do not append another `/v1`: the generated URL already includes it. Pinned routing isolates OpenClaw requests from proxy-driven account switching. If Codex auto-switch remains enabled in the same account group, it can still select the OpenClaw account as a Codex fallback; use a separate group or disable that auto-switch if the account must remain exclusively assigned to OpenClaw. For an account in another group, print its route with `codex-auth-advanced group <name> proxy url <account>`.
+The marker `apiKey` is not sent upstream; the local proxy replaces it with the stored account key. Do not append another `/v1` because the generated URL already includes it.
+
+A pinned route prevents OpenClaw requests from changing Codex's active account. It does not reserve that account from the scheduled Codex candidate pool. Put exclusive clients in separate groups or keep auto-switch disabled for a shared group when strict ownership is required.
+
+## Operations
+
+### Start A Stopped Proxy
 
 ```shell
-printf '%s' "$OPENAI_API_KEY" | codex-auth-advanced group default add-api-key --template openai --alias openai-main --stdin
-printf '%s' "$CODEX_EVERYWHERE_API_KEY" | codex-auth-advanced group default add-api-key --template codex-everywhere --alias codex-everywhere-2 --stdin
-printf '%s' "$TCDMX_API_KEY" | codex-auth-advanced group default add-api-key --template tcdmx --alias tcdmx --stdin
+./scripts/start-proxy.zsh
 ```
 
-#### Batch Import from a Folder
+The script is idempotent. If the proxy is already healthy, it reports the existing process instead of starting another one.
 
-Scans all `.json` files in the directory:
+### Restart A Running Proxy
 
 ```shell
-codex-auth-advanced import /path/to/auth-exports
+./scripts/restart-proxy.zsh
 ```
 
-Typical output:
+The restart script:
+
+1. Requests a loopback graceful restart.
+2. Stops accepting new work.
+3. Waits for active requests and upgraded connections to drain.
+4. Starts a detached replacement.
+5. Verifies the replacement health endpoint.
+
+Never use `kill`, `pkill`, or direct process termination to restart the provider proxy. Doing so can cut an in-flight Codex stream and leave the current session blocked.
+
+If the running proxy predates graceful restart support, the restart script refuses to terminate it. Wait until the session is idle before replacing that legacy process.
+
+### Logs
+
+Detached proxy output is written to:
 
 ```text
-Scanning /path/to/auth-exports...
-  ✓ imported  token_ryan.taylor.alpha@email.com
-  ✓ updated   token_jane.smith.alpha@email.com
-  ✗ skipped   token_invalid: MalformedJson
-Import Summary: 1 imported, 1 updated, 1 skipped (total 3 files)
+scratch/proxy.log
 ```
 
-`stdout` carries scanning, success, and summary lines. Skipped files and warnings stay on `stderr`.
+Authorization headers and dashboard tokens are not intentionally logged. Treat the log as local operational data and do not commit `scratch/`.
 
-#### Import CLIProxyAPI (CPA) Tokens
-
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) stores tokens as flat JSON under `~/.cli-proxy-api/`. Import them directly without conversion:
+### Health Check
 
 ```shell
-codex-auth-advanced import --cpa                                  # scan default ~/.cli-proxy-api/*.json
-codex-auth-advanced import --cpa /path/to/cpa-dir                 # scan a specific directory
-codex-auth-advanced import --cpa /path/to/token.json --alias bob  # import a single CPA file
-codex-auth-advanced import --cpa /path/to/token.json --alias bob --api-spend-limit-usd 50
+curl -sS http://127.0.0.1:47778/_codex-auth-advanced/health
 ```
 
-#### Fix Broken Account Data (Rebuild Registry)
-
-If `codex-auth-advanced list` shows missing accounts or wrong usage data, the internal registry file may be out of sync with the actual auth files on disk. This command re-reads all auth files and rebuilds the registry from scratch:
+### Rebuild Account Metadata
 
 ```shell
-codex-auth-advanced import --purge                                # rebuild from ~/.codex/accounts/*.auth.json
-codex-auth-advanced import --purge /path/to/auth-exports          # rebuild from a specific folder
+codex-auth-advanced import --purge
 ```
 
-This does not import new files. It repairs the registry index for auth snapshots that already exist on disk.
+This rebuilds `registry.json` from existing account auth files. API metadata maintained by the wrapper is preserved when possible.
 
-### Show Status
+## Testing
+
+Run the complete syntax and integration suite:
 
 ```shell
-codex-auth-advanced status
+npm test
 ```
 
-### Config
+The test suite covers:
 
-#### Auto-Switch
+- Proxy model remapping and reasoning-effort forwarding.
+- Native and fallback compaction.
+- Encrypted-content compatibility repair.
+- Pinned account routing.
+- Transient usage-limit retry and failover behavior.
+- Hard subscription exhaustion behavior.
+- Graceful restart draining.
+- Dashboard-token storage and masked-key account discovery.
+- Exact subscription reset and multi-window usage persistence.
 
-> [!WARNING]
-> Auto-switch is experimental. Behavior, defaults, and platform integration may change in future releases while the feature matures.
+## Troubleshooting
 
-Enable or disable:
+### The Proxy Is Stopped
 
 ```shell
-codex-auth-advanced config auto enable
-codex-auth-advanced config auto disable
+./scripts/start-proxy.zsh
 ```
 
-`config auto enable` prints the current usage mode after installing the watcher, so you can immediately see whether auto-switch is running with default API-backed usage or local-only fallback semantics.
+Do not use the restart script as a process killer. It intentionally protects active streams.
 
-When auto-switching is enabled, a long-running background manager refreshes each enabled group's active account usage and silently switches accounts when:
+### Code Changed But Runtime Behavior Did Not
 
-- 5h remaining reaches or drops below the configured 5h threshold, or
-- weekly remaining reaches or drops below the configured weekly threshold
-
-Auto-switch evaluates both 5h and weekly by default. Configure thresholds with `config auto --5h <percent> [--weekly <percent>]` for the default group, or `group <name> auto --5h <percent> [--weekly <percent>]` for a managed group.
-Candidates whose current 5h or weekly value is already `0` are skipped.
-When choosing the next account, `codex-auth-advanced` prefers a usable account whose remaining quota resets sooner, so a reset at `05:11` wins over `05:30`.
-
-The managed background worker is one long-running manager service on all supported platforms:
-
-- Linux/WSL: persistent `systemd --user` service
-- macOS: `LaunchAgent` named `com.mouaadsk.codex-auth-advanced.manager`
-- Windows: scheduled task that launches the long-running helper at logon, restarts it after failures, has no 72-hour execution cap, and also starts it immediately on enable
-
-In this local fork, API-key account switching is handled by the JavaScript wrapper for direct switch, live switch, live auto-switch, `list --live`, and the background daemon. API-key accounts are considered usable when their spend cap is not exhausted, group copy/move/add flows repair missing API-key config files when needed, and the local provider proxy keeps `codext` on a stable localhost endpoint while routing requests to the selected API provider.
-
-#### Usage Refresh Source
-
-API-backed fallback:
+Reload a running proxy gracefully:
 
 ```shell
-codex-auth-advanced config api enable
+./scripts/restart-proxy.zsh
 ```
 
-Local-only, no usage API calls:
+### `Stream disconnected before completion`
+
+Check proxy health and the proxy log. Common causes include upstream SSE termination, a provider timeout, compressed stream handling, or a proxy process being terminated while a request is active.
 
 ```shell
-codex-auth-advanced config api disable
+curl -sS http://127.0.0.1:47778/_codex-auth-advanced/health
+tail -n 100 scratch/proxy.log
 ```
 
-Changing `config api` updates `registry.json` immediately. `api enable` is shown as API mode and `api disable` is shown as local mode.
+Always use the graceful restart script when reloading proxy code.
 
-## Q&A
+### VSLLM Shows The Wrong Exhaustion State
 
-### Why is my usage limit not refreshing?
-
-If `codex-auth-advanced` is using local-only usage refresh, it reads the newest `~/.codex/sessions/**/rollout-*.jsonl` file. Recent Codex builds often write `token_count` events with `rate_limits: null`. The local files may still contain older usable usage limit data, but in practice they can lag by several hours, so local-only refresh may show a usage limit snapshot from hours ago instead of your latest state.
-
-- Upstream Codex issue: [openai/codex#14880](https://github.com/openai/codex/issues/14880)
-
-You can switch usage limit refresh to the usage API with:
+Confirm that the account has dashboard metadata and that usage source is `provider_subscription`:
 
 ```shell
-codex-auth-advanced config api enable
+codex-auth-advanced list --live
 ```
 
-Then confirm the current mode with:
+If setup is missing or the dashboard token was regenerated, configure it again:
+
+```shell
+codex-auth-advanced config vsllm-dashboard \
+  --user-id <numeric-user-id> \
+  --alias <dashboard-alias>
+```
+
+The provider can take up to roughly one reset-task interval plus the 30-second local polling interval to report a newly reset subscription.
+
+### The Correct Account Does Not Switch Automatically
+
+Check both the feature flag and manager status:
 
 ```shell
 codex-auth-advanced status
 ```
 
-`status` should show `usage: api`.
+Auto-switch must be enabled. A usable current account is not replaced merely because another account reset.
 
-Upgrade notes:
+### The Wrong Account Receives OpenClaw Requests
 
-- If you are upgrading from `v0.1.x` to the latest `v0.2.x`, API usage refresh is enabled by default.
-- If you previously used an early `v0.2` prerelease/test build and `status` still shows `usage: local`, run `codex-auth-advanced config api enable` once to switch back to API mode.
+Use the output of `proxy url <account>` as OpenClaw's base URL. The default proxy URL follows Codex's active account and is not appropriate for a client that must remain pinned.
 
-Verify with:
+### Local ChatGPT Usage Is Stale
+
+Local rollout files can contain `rate_limits: null` or old snapshots. Enable API-backed ChatGPT usage when acceptable:
 
 ```shell
-codex exec "say hello"
+codex-auth-advanced config api enable
 ```
+
+This setting is separate from VSLLM dashboard subscription access.
+
+## Security
+
+- Do not paste model API keys, dashboard access tokens, browser cookies, or session headers into issues or chat transcripts.
+- Prefer hidden prompts or stdin over command-line secret arguments.
+- Regenerating a New API system access token invalidates the previous management token but does not replace model API keys.
+- Dashboard access tokens have broader account-management privileges than model keys. Store them only in the generated private credential files.
+- Keep the proxy bound to loopback.
+- Pinned proxy URLs are local routing identifiers, not authentication boundaries.
+- Review `config api enable` before using it with ChatGPT accounts. It sends the stored ChatGPT access token to OpenAI account and usage endpoints.
+
+When ChatGPT API refresh is enabled, the tool may contact endpoints including:
+
+```text
+https://chatgpt.com/backend-api/wham/usage
+https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27
+```
+
+Use of automated account or usage APIs can carry provider policy and account-restriction risk. You are responsible for deciding whether that behavior is acceptable for your accounts.
+
+## Current Limitations
+
+- This checkout currently vendors only the macOS arm64 native binary.
+- Auto-switching is still considered experimental.
+- The VSLLM model-tier policy is hardcoded to `pro20x`; account-level normal/pro20x selection is postponed.
+- A newly reset fallback account becomes eligible but does not trigger automatic failback while the active account remains usable.
+- Without dashboard credentials, fixed VSLLM subscription windows can only use the less accurate rolling billing fallback.
+- Pinned routes isolate routing but do not reserve an account from other group workflows.
 
 ## Disclaimer
 
-This project is provided as-is and use is at your own risk.
-
-**Usage Data Refresh Source:**
-`codex-auth-advanced` supports two sources for refreshing account usage/usage limit information:
-
-1. **API (default):** When `config api enable` is on, the tool makes direct HTTPS requests to OpenAI's endpoints using your account's access token. This enables both usage refresh and team name refresh. npm installs already satisfy the runtime requirement; legacy standalone binary installs need Node.js 22+ on `PATH`.
-2. **Local-only:** When `config api disable` is on, the tool scans local `~/.codex/sessions/*/rollout-*.jsonl` files for usage data and skips team name refresh API calls. This mode is safer, but it can be less accurate because recent Codex rollout files often contain `rate_limits: null`, so the latest local usage limit data may lag by several hours.
-
-**API Call Declaration:**
-By enabling API(`codex-auth-advanced config api enable`), this tool will send your ChatGPT access token to OpenAI's servers, including `https://chatgpt.com/backend-api/wham/usage` for usage limit and `https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27` for team name. This behavior may be detected by OpenAI and could violate their terms of service, potentially leading to account suspension or other risks. The decision to use this feature and any resulting consequences are entirely yours.
+This project is provided as-is. Account switching, direct provider APIs, dashboard automation, and proxy behavior can interact with provider policies and subscription rules. Use it at your own risk.

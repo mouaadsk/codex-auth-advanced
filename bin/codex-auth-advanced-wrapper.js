@@ -20,9 +20,17 @@ const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
 const providerProxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
 const providerProxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
 const providerProxyPrefix = "/_codex-auth-advanced";
+const vsllmTransientUsageLimitMaxRetries = 1;
+const vsllmTransientUsageLimitRetryDelayMs = 500;
 const chatgptCodexBaseUrl = process.env.CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api/codex";
 const chatgptCloudflareCookies = new Map();
 const vsllmDefaultSpendWindowMinutes = 480;
+let providerProxyServer = null;
+let providerProxyStartedAtMs = null;
+let providerProxyRestartRequested = false;
+let providerProxyRestartClosing = false;
+let providerProxyActiveRequests = 0;
+let providerProxyActiveUpgrades = 0;
 
 function ensureSupportedNodeVersion() {
   const major = Number(process.versions?.node?.split(".")[0] ?? 0);
@@ -224,6 +232,45 @@ function registryPath(codexHome) {
   return path.join(codexHome, "accounts", "registry.json");
 }
 
+function providerDashboardCredentialsDir(codexHome) {
+  return path.join(codexHome, "accounts", "provider-dashboard");
+}
+
+function normalizeProviderOrigin(value) {
+  try {
+    return new URL(String(value || "").trim()).origin;
+  } catch {
+    return null;
+  }
+}
+
+function providerDashboardIdentity(origin, userId) {
+  const normalizedOrigin = normalizeProviderOrigin(origin);
+  const normalizedUserId = Number(userId);
+  if (!normalizedOrigin || !Number.isInteger(normalizedUserId) || normalizedUserId <= 0) return null;
+  return `${normalizedOrigin}|${normalizedUserId}`;
+}
+
+function providerDashboardCredentialPath(codexHome, origin, userId) {
+  const identity = providerDashboardIdentity(origin, userId);
+  if (!identity) return null;
+  const fileKey = crypto.createHash("sha256").update(identity).digest("hex").slice(0, 24);
+  return path.join(providerDashboardCredentialsDir(codexHome), `${fileKey}.json`);
+}
+
+function readProviderDashboardCredential(codexHome, account) {
+  const metadata = account?.provider_dashboard;
+  const filePath = providerDashboardCredentialPath(codexHome, metadata?.origin, metadata?.user_id);
+  if (!filePath) return null;
+  const credential = readJsonFile(filePath);
+  if (!credential || credential.account_key !== account?.account_key) return null;
+  if (providerDashboardIdentity(credential.origin, credential.user_id) !== providerDashboardIdentity(metadata.origin, metadata.user_id)) {
+    return null;
+  }
+  if (typeof credential.access_token !== "string" || !credential.access_token.trim()) return null;
+  return credential;
+}
+
 const apiKeySessionConfigKeys = ["model", "review_model", "model_reasoning_effort"];
 const apiKeyRuntimeConfigKeys = [
   "disable_response_storage",
@@ -352,6 +399,79 @@ function providerProxyAccountBaseUrl(codexHome, account) {
 
 function providerProxyHealthUrl() {
   return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/health`;
+}
+
+function providerProxyActiveOperationCount() {
+  return providerProxyActiveRequests + providerProxyActiveUpgrades;
+}
+
+function isProviderProxyLoopbackRequest(req) {
+  const address = String(req.socket?.remoteAddress || "");
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+function writeProviderProxyControlResponse(res, status, payload, extraHeaders = {}) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+    ...extraHeaders
+  });
+  res.end(body);
+}
+
+function providerProxyHealthPayload() {
+  return {
+    ok: true,
+    started_at_ms: providerProxyStartedAtMs,
+    restart_requested: providerProxyRestartRequested,
+    active_requests: providerProxyActiveRequests,
+    active_upgrades: providerProxyActiveUpgrades
+  };
+}
+
+function maybeCompleteGracefulProviderProxyRestart() {
+  if (!providerProxyRestartRequested || providerProxyRestartClosing || providerProxyActiveOperationCount() > 0) return;
+  const server = providerProxyServer;
+  if (!server) return;
+
+  providerProxyRestartClosing = true;
+  server.close((error) => {
+    if (error) {
+      process.stderr.write(`Provider proxy graceful restart failed: ${error?.message || error}\n`);
+      process.exit(1);
+    }
+    process.stdout.write("codex-auth-advanced provider proxy stopped for graceful restart\n");
+    process.exit(0);
+  });
+  // Do not keep idle HTTP connections alive once all active streams have drained.
+  server.closeIdleConnections?.();
+}
+
+function trackProviderProxyRequest(res) {
+  providerProxyActiveRequests += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    providerProxyActiveRequests = Math.max(0, providerProxyActiveRequests - 1);
+    maybeCompleteGracefulProviderProxyRestart();
+  };
+  res.once("finish", release);
+  res.once("close", release);
+}
+
+function trackProviderProxyUpgrade(socket) {
+  providerProxyActiveUpgrades += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    providerProxyActiveUpgrades = Math.max(0, providerProxyActiveUpgrades - 1);
+    maybeCompleteGracefulProviderProxyRestart();
+  };
+  socket.once("close", release);
+  socket.once("error", release);
 }
 
 function isProviderProxyBaseUrl(baseUrl) {
@@ -721,7 +841,8 @@ const apiAccountMetadataKeys = [
   "api_spend_window_minutes",
   "api_spend",
   "api_spend_window",
-  "api_exhausted_reason"
+  "api_exhausted_reason",
+  "provider_dashboard"
 ];
 
 function cloneJsonValue(value) {
@@ -798,7 +919,8 @@ function loadApiKeyAccountsFromRegistry(groupName, codexHome, registry) {
         codexHome,
         account,
         apiKey,
-        endpoint: modelsEndpointFromBaseUrl(baseUrl)
+        endpoint: modelsEndpointFromBaseUrl(baseUrl),
+        dashboardCredential: readProviderDashboardCredential(codexHome, account)
       };
     })
     .filter((entry) => entry.apiKey.length > 0);
@@ -815,14 +937,18 @@ async function checkApiKeyAccount(entry) {
       : costs;
     const limitUsd = apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }) ?? cleanCosts.limitUsd;
     const exhausted = isApiKeyLimitExhausted(health.status, cleanCosts.spend, limitUsd, {
-      providerExhausted: health.exhausted || cleanCosts.exhausted,
+      providerExhausted: cleanCosts.subscription ? cleanCosts.exhausted : health.exhausted || cleanCosts.exhausted,
+      authoritativeSubscription: cleanCosts.subscription != null,
       remaining: cleanCosts.remaining
     });
     return {
       entry,
       ok: health.status === 200,
       label: health.status === 200
-        ? apiSpendRemainingLabel(cleanCosts.spend, limitUsd, exhausted, { windowMinutes: cleanCosts.spendWindowMinutes })
+        ? apiSpendRemainingLabel(cleanCosts.spend, limitUsd, exhausted, {
+          windowMinutes: cleanCosts.spendWindowMinutes,
+          usedPercent: cleanCosts.providerUsedPercent
+        })
         : health.errorName ?? String(health.status),
       daily: cleanCosts.daily,
       weekly: cleanCosts.weekly,
@@ -860,11 +986,18 @@ function responseBodyMatches(body, pattern, options = {}) {
 }
 
 function isInsufficientBalanceBody(body) {
-  return responseBodyMatches(body, /insufficient[_ -]?(balance|quota|credits?)/i);
+  return responseBodyMatches(body, /insufficient[_ -]?(balance|quota|credits?)|额度不足/i);
 }
 
 function isNoActiveSubscriptionBody(body) {
   return responseBodyMatches(body, /no active (subscription|package|plan)|activate (your )?subscription|暂无生效套餐|激活订阅/i);
+}
+
+function isVsllmTransientUsageLimitBody(body) {
+  return responseBodyMatches(
+    body,
+    /you(?:['’]ve| have) hit your usage limit(?:\.\s*try again later\.?)?|当前订阅额度不足或暂不可用|请稍后再试/i
+  );
 }
 
 function isInvalidApiKeyBody(body) {
@@ -894,13 +1027,22 @@ function shouldTrustProviderBalanceExhaustion(account) {
   return apiAccountRollingLimitReached(account);
 }
 
+function apiProviderTransientRetryReason(status, body, account = null) {
+  if (!isVsllmApiAccount(account) || apiAccountRollingLimitReached(account)) return null;
+  if (isInvalidApiKeyBody(body) || isNoActiveSubscriptionBody(body)) return null;
+  if (status === 429 || isVsllmTransientUsageLimitBody(body)) return "vsllm_usage_limit";
+  return null;
+}
+
 function apiProviderExhaustionReason(status, body, account = null) {
   if (isInvalidApiKeyBody(body)) return "invalid_api_key";
   if (isInsufficientBalanceBody(body)) {
     return shouldTrustProviderBalanceExhaustion(account) ? "provider_limit" : null;
   }
-  if (hasConfiguredApiSpendLimit(account) && isNoActiveSubscriptionBody(body)) {
-    return shouldTrustProviderBalanceExhaustion(account) ? "no_active_subscription" : null;
+  if (status === 402 && isNoActiveSubscriptionBody(body)) {
+    // A direct plan/subscription rejection is authoritative. Unlike the rolling
+    // VSLLM spend total, it cannot be a stale cumulative-usage false positive.
+    return "no_active_subscription";
   }
   if (status === 429) return "rate_limit";
   return null;
@@ -1022,6 +1164,157 @@ function accountOrEndpointMatches(value, pattern) {
 function isVsllmApiAccount(account, endpoint = "") {
   const isVsllm = String(account?.email || "").startsWith("vsllm") || String(account?.alias || "").startsWith("vsllm");
   return isVsllm || accountOrEndpointMatches(endpoint, "vsllm.com");
+}
+
+function providerOriginFromModelsEndpoint(endpoint) {
+  return normalizeProviderOrigin(endpoint);
+}
+
+function providerDashboardRequestHeaders(credential) {
+  return {
+    Accept: "application/json",
+    Authorization: `Bearer ${credential.access_token}`,
+    "Cache-Control": "no-store",
+    "New-Api-User": String(credential.user_id),
+    "User-Agent": "codex-auth-advanced"
+  };
+}
+
+async function fetchProviderDashboardJson(credential, pathname, options = {}) {
+  const origin = normalizeProviderOrigin(credential?.origin);
+  if (!origin) return { status: null, body: null, error: "invalid_provider_origin" };
+  const url = new URL(pathname, `${origin}/`).toString();
+  try {
+    const response = await withAbortTimeout(options.timeoutMs ?? 10000, (signal) => fetch(url, {
+      method: options.method || "GET",
+      headers: {
+        ...providerDashboardRequestHeaders(credential),
+        ...(options.headers || {})
+      },
+      body: options.body,
+      signal
+    }));
+    return {
+      status: response.status,
+      body: await readResponseBody(response),
+      error: null
+    };
+  } catch (error) {
+    return {
+      status: null,
+      body: null,
+      error: error?.name === "AbortError" ? "timeout" : "request_failed"
+    };
+  }
+}
+
+function normalizeSubscriptionRecord(summary) {
+  const subscription = summary?.subscription ?? summary;
+  if (!subscription || typeof subscription !== "object") return null;
+  const amountTotal = firstFinite(subscription.amount_total, summary?.amount_total);
+  const amountUsed = firstFinite(subscription.amount_used, summary?.amount_used);
+  const derivedUsedPercent = Number.isFinite(amountTotal) && amountTotal > 0 && Number.isFinite(amountUsed)
+    ? (amountUsed / amountTotal) * 100
+    : null;
+  return {
+    id: firstFinite(subscription.id, summary?.id),
+    planId: firstFinite(subscription.plan_id, summary?.plan_id),
+    status: String(subscription.status || summary?.status || "").toLowerCase(),
+    startAt: firstFinite(subscription.start_time, summary?.start_time),
+    endAt: firstFinite(subscription.end_time, summary?.end_time),
+    lastResetAt: firstFinite(subscription.last_reset_time, summary?.last_reset_time),
+    resetAt: firstFinite(subscription.next_reset_time, summary?.next_reset_time),
+    usedPercent: firstFinite(subscription.used_percent, summary?.used_percent, derivedUsedPercent),
+    unlimited: subscription.unlimited === true || summary?.unlimited === true,
+    consumePriority: firstFinite(subscription.consume_priority, summary?.consume_priority)
+  };
+}
+
+function parseVsllmSubscriptionSelf(body, nowSeconds = Math.floor(Date.now() / 1000)) {
+  if (body?.success !== true || !body?.data || typeof body.data !== "object") return null;
+  const records = Array.isArray(body.data.subscriptions)
+    ? body.data.subscriptions.map(normalizeSubscriptionRecord).filter(Boolean)
+    : [];
+  const active = records.filter((record) => {
+    if (record.status && record.status !== "active") return false;
+    if (Number.isFinite(record.startAt) && record.startAt > nowSeconds) return false;
+    if (Number.isFinite(record.endAt) && record.endAt <= nowSeconds) return false;
+    return true;
+  });
+  active.sort((left, right) => {
+    const leftPriority = Number.isFinite(left.consumePriority) ? left.consumePriority : Number.MAX_SAFE_INTEGER;
+    const rightPriority = Number.isFinite(right.consumePriority) ? right.consumePriority : Number.MAX_SAFE_INTEGER;
+    return leftPriority - rightPriority;
+  });
+
+  const usable = active.filter((record) => record.unlimited || !Number.isFinite(record.usedPercent) || record.usedPercent < 100);
+  const selected = usable[0] ?? active[0] ?? null;
+  const billingPreference = typeof body.data.billing_preference === "string"
+    ? body.data.billing_preference
+    : null;
+  const allActiveSubscriptionsExhausted = active.length > 0 && active.every((record) => (
+    !record.unlimited && Number.isFinite(record.usedPercent) && record.usedPercent >= 100
+  ));
+  const exhausted = billingPreference === "subscription_only" && (active.length === 0 || allActiveSubscriptionsExhausted);
+  const windowSeconds = selected && Number.isFinite(selected.lastResetAt) && Number.isFinite(selected.resetAt)
+    ? selected.resetAt - selected.lastResetAt
+    : null;
+
+  return {
+    activeSubscriptionCount: active.length,
+    billingPreference,
+    exhausted,
+    subscriptionId: selected?.id ?? null,
+    planId: selected?.planId ?? null,
+    usedPercent: selected?.unlimited ? 0 : selected?.usedPercent ?? null,
+    unlimited: selected?.unlimited === true,
+    lastResetAt: selected?.lastResetAt ?? null,
+    resetAt: selected?.resetAt ?? null,
+    endAt: selected?.endAt ?? null,
+    windowMinutes: Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds / 60 : null
+  };
+}
+
+async function fetchVsllmSubscriptionUsage(entry) {
+  const credential = entry?.dashboardCredential;
+  if (!credential || !isVsllmApiAccount(entry.account, entry.endpoint)) {
+    return { configured: false, subscription: null };
+  }
+  const endpointOrigin = providerOriginFromModelsEndpoint(entry.endpoint);
+  if (endpointOrigin !== normalizeProviderOrigin(credential.origin)) {
+    return { configured: true, subscription: null };
+  }
+  const result = await fetchProviderDashboardJson(credential, "/api/subscription/self");
+  if (result.status !== 200) return { configured: true, subscription: null };
+  return {
+    configured: true,
+    subscription: parseVsllmSubscriptionSelf(result.body)
+  };
+}
+
+function costsFromVsllmSubscription(subscription, account) {
+  if (!subscription) return null;
+  const limitUsd = apiSpendLimitUsd(account);
+  const usedPercent = Number(subscription.usedPercent);
+  const spend = Number.isFinite(limitUsd) && Number.isFinite(usedPercent)
+    ? Number((limitUsd * Math.max(0, Math.min(100, usedPercent)) / 100).toFixed(6))
+    : null;
+  const remaining = Number.isFinite(limitUsd) && Number.isFinite(spend)
+    ? Math.max(0, limitUsd - spend)
+    : null;
+  return {
+    daily: spend,
+    weekly: spend,
+    spend,
+    totalSpend: null,
+    limitUsd,
+    remaining,
+    exhausted: subscription.exhausted === true,
+    resetsAt: subscription.resetAt,
+    spendWindowMinutes: subscription.windowMinutes,
+    providerUsedPercent: Number.isFinite(usedPercent) ? usedPercent : null,
+    subscription
+  };
 }
 
 function normalizeProxyModelAlias(model) {
@@ -1246,6 +1539,23 @@ function applyApiSpendWindow(entry, costs) {
 
 async function fetchApiKeyCosts(entry) {
   const now = Math.floor(Date.now() / 1000);
+  const dashboardSubscription = await fetchVsllmSubscriptionUsage(entry);
+  if (dashboardSubscription.subscription) {
+    return costsFromVsllmSubscription(dashboardSubscription.subscription, entry.account);
+  }
+  if (dashboardSubscription.configured) {
+    return {
+      daily: null,
+      weekly: null,
+      spend: null,
+      totalSpend: null,
+      limitUsd: apiSpendLimitUsd(entry.account),
+      remaining: null,
+      exhausted: false,
+      dashboardUnavailable: true
+    };
+  }
+
   let costs = null;
   if (shouldPreferProviderUsage(entry)) {
     const providerUsage = await fetchProviderUsage(entry, isoDateFromSeconds(now));
@@ -1392,7 +1702,7 @@ function markApiAccountExhaustedFromProxy(codexHome, account, status, body) {
 
 async function switchFromExhaustedApiAccount(codexHome, account, status, body, options = {}) {
   const registry = markApiAccountExhaustedFromProxy(codexHome, account, status, body);
-  if (!registry || !autoSwitchEnabled(registry)) return false;
+  if (!registry || (!options.force && !autoSwitchEnabled(registry))) return false;
 
   const candidate = firstUsableSwitchCandidate(registry, {
     preferredAuthMode: "apikey",
@@ -2044,11 +2354,15 @@ async function fetchProviderTarget(req, target, body, options = {}) {
   const signal = Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
     ? AbortSignal.timeout(timeoutMs)
     : undefined;
+  const headers = sanitizeProxyRequestHeaders(req.headers, target, {
+    omitContentEncoding: options.omitContentEncoding === true
+  });
+  if (body != null) {
+    headers["content-length"] = String(Buffer.byteLength(body));
+  }
   return fetch(target.url, {
     method: req.method,
-    headers: sanitizeProxyRequestHeaders(req.headers, target, {
-      omitContentEncoding: options.omitContentEncoding === true
-    }),
+    headers,
     body,
     duplex: body == null ? undefined : "half",
     signal
@@ -2056,16 +2370,26 @@ async function fetchProviderTarget(req, target, body, options = {}) {
 }
 
 async function exhaustedApiResponse(upstream, account = null) {
-  if (![401, 402, 403, 429].includes(upstream.status)) {
-    return { exhausted: false, body: null };
+  if (upstream.status < 400 || upstream.status >= 500) {
+    return { exhausted: false, body: null, transientRetryReason: null };
   }
 
   const body = await readClonedResponseBody(upstream);
+  const transientRetryReason = apiProviderTransientRetryReason(upstream.status, body, account);
+  if (transientRetryReason) {
+    return {
+      exhausted: false,
+      body,
+      reason: null,
+      transientRetryReason
+    };
+  }
   const exhaustionReason = apiProviderExhaustionReason(upstream.status, body, account);
   return {
     exhausted: exhaustionReason != null,
     body,
-    reason: exhaustionReason
+    reason: exhaustionReason,
+    transientRetryReason: null
   };
 }
 
@@ -2500,10 +2824,33 @@ function dummyCompactionResponse(errorMsg) {
 async function handleProviderProxyRequest(req, res) {
   const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
   if (incoming.pathname === `${providerProxyPrefix}/health`) {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
+    writeProviderProxyControlResponse(res, 200, providerProxyHealthPayload());
     return;
   }
+  if (incoming.pathname === `${providerProxyPrefix}/restart`) {
+    if (req.method !== "POST") {
+      writeProviderProxyControlResponse(res, 405, { error: "Use POST to request a graceful provider proxy restart." }, { allow: "POST" });
+      return;
+    }
+    if (!isProviderProxyLoopbackRequest(req)) {
+      writeProviderProxyControlResponse(res, 403, { error: "Provider proxy restart is only available from loopback." });
+      return;
+    }
+
+    providerProxyRestartRequested = true;
+    res.once("finish", maybeCompleteGracefulProviderProxyRestart);
+    writeProviderProxyControlResponse(res, 202, {
+      ...providerProxyHealthPayload(),
+      message: "Provider proxy is draining active requests before restart."
+    });
+    return;
+  }
+  if (providerProxyRestartRequested) {
+    writeProxyError(res, 503, "Provider proxy is restarting; retry after it becomes healthy.");
+    return;
+  }
+
+  trackProviderProxyRequest(res);
 
   const route = providerProxyRouteFromIncoming(incoming);
   if (route.error) {
@@ -2522,6 +2869,7 @@ async function handleProviderProxyRequest(req, res) {
     let body = await readProxyRequestBody(req);
     let upstream = null;
     const attemptedAccountKeys = new Set();
+    const transientUsageLimitRetries = new Map();
     let bodyAlreadyDecoded = false;
     let triedPlaintextCompactRepair = false;
     const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
@@ -2587,17 +2935,34 @@ async function handleProviderProxyRequest(req, res) {
         }
       }
 
-      const { exhausted, body: responseBody } = await exhaustedApiResponse(upstream, target.account);
+      const {
+        exhausted,
+        body: responseBody,
+        reason: exhaustionReason,
+        transientRetryReason
+      } = await exhaustedApiResponse(upstream, target.account);
+      if (transientRetryReason === "vsllm_usage_limit") {
+        const accountKey = target.account?.account_key || target.url;
+        const retries = transientUsageLimitRetries.get(accountKey) || 0;
+        if (retries < vsllmTransientUsageLimitMaxRetries) {
+          transientUsageLimitRetries.set(accountKey, retries + 1);
+          const label = target.account?.alias || target.account?.email || target.account?.account_key || "VSLLM";
+          console.warn(`[Proxy] ${label} returned a transient usage-limit response; retrying the same account.`);
+          await new Promise((resolve) => setTimeout(resolve, vsllmTransientUsageLimitRetryDelayMs));
+          continue;
+        }
+      }
       if (route.accountSelector && exhausted) {
         markApiAccountExhaustedFromProxy(route.codexHome, target.account, upstream.status, responseBody);
       }
-      const shouldFailOver = !route.accountSelector && (exhausted || isTransientApiFailureStatus(upstream.status));
+      const shouldFailOver = !route.accountSelector && (exhausted || transientRetryReason != null || isTransientApiFailureStatus(upstream.status));
       if (!shouldFailOver) break;
 
       const retryTarget = exhausted
         ? await (async () => {
           const switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, responseBody, {
-            excludeAccountKeys: attemptedAccountKeys
+            excludeAccountKeys: attemptedAccountKeys,
+            force: exhaustionReason === "no_active_subscription"
           });
           return switched
             ? targetUrlForProxyRequest(req, { ...route, accountSelector: null, pathPrefix: `${providerProxyPrefix}/${providerProxyGroupId(route.codexHome)}` })
@@ -2661,14 +3026,26 @@ function startProviderProxyServer() {
     });
   });
   server.on("upgrade", (req, socket, head) => {
+    if (providerProxyRestartRequested) {
+      writeProxySocketError(socket, 503, "Provider proxy is restarting; retry after it becomes healthy.");
+      return;
+    }
+    trackProviderProxyUpgrade(socket);
     handleProviderProxyUpgrade(req, socket, head).catch((error) => {
       writeProxySocketError(socket, 500, `Provider proxy crashed: ${error?.message || error}`);
     });
   });
   server.listen(providerProxyPort, providerProxyHost, () => {
+    providerProxyServer = server;
+    providerProxyStartedAtMs = Date.now();
+    providerProxyRestartRequested = false;
+    providerProxyRestartClosing = false;
+    providerProxyActiveRequests = 0;
+    providerProxyActiveUpgrades = 0;
     process.stdout.write(`codex-auth-advanced provider proxy listening on http://${providerProxyHost}:${providerProxyPort}\n`);
   });
   server.on("error", (error) => {
+    if (providerProxyServer === server) providerProxyServer = null;
     if (error?.code === "EADDRINUSE") {
       process.stderr.write(`Provider proxy port ${providerProxyPort} is already in use.\n`);
     } else {
@@ -2816,11 +3193,6 @@ function moneyLimitStatus(spend, limitUsd) {
   return `$${spend.toFixed(2)}/$${limitUsd.toFixed(2)}`;
 }
 
-function hasConfiguredApiSpendLimit(account) {
-  const value = Number(account?.api_spend_limit_usd);
-  return Number.isFinite(value) && value > 0;
-}
-
 function apiSpendLimitUsd(account, options = {}) {
   const value = Number(account?.api_spend_limit_usd);
   if (Number.isFinite(value) && value > 0) return value;
@@ -2828,7 +3200,7 @@ function apiSpendLimitUsd(account, options = {}) {
 }
 
 function isApiKeyLimitExhausted(status, spend, limitUsd, options = {}) {
-  if (status === 429) return true;
+  if (status === 429 && options.authoritativeSubscription !== true) return true;
   if (options.providerExhausted === true) return true;
   if ((status === 402 || status === 403) && Number(options.remaining) === 0) return true;
   return Number.isFinite(limitUsd) && Number.isFinite(spend) && spend >= limitUsd;
@@ -2836,6 +3208,10 @@ function isApiKeyLimitExhausted(status, spend, limitUsd, options = {}) {
 
 function apiSpendRemainingLabel(spend, limitUsd, exhausted, options = {}) {
   if (exhausted) return "0%";
+  const providerUsedPercent = Number(options.usedPercent);
+  if (Number.isFinite(providerUsedPercent)) {
+    return `${Math.max(0, 100 - Math.floor(Math.max(0, Math.min(100, providerUsedPercent))))}%`;
+  }
   if (!Number.isFinite(options.windowMinutes) || !Number.isFinite(spend) || !Number.isFinite(limitUsd) || limitUsd <= 0) return "-";
   const usedPercent = Math.max(0, Math.min(100, Math.floor((spend / limitUsd) * 100)));
   return `${Math.max(0, 100 - usedPercent)}%`;
@@ -2844,8 +3220,11 @@ function apiSpendRemainingLabel(spend, limitUsd, exhausted, options = {}) {
 function usageSnapshotForApiSpend(spend, limitUsd, exhausted, options = {}) {
   const resetsAt = Number(options.resetsAt);
   const resetValue = Number.isFinite(resetsAt) && resetsAt > 0 ? Math.floor(resetsAt) : null;
+  const providerUsedPercent = Number(options.usedPercent);
   const usedPercent = exhausted
     ? 100
+    : Number.isFinite(providerUsedPercent)
+      ? Math.max(0, Math.min(99, Number(providerUsedPercent.toFixed(2))))
     : Number.isFinite(spend) && Number.isFinite(limitUsd) && limitUsd > 0
       ? Math.max(0, Math.min(99, Math.floor((spend / limitUsd) * 100)))
       : 0;
@@ -2863,7 +3242,7 @@ function usageSnapshotForApiSpend(spend, limitUsd, exhausted, options = {}) {
     },
     credits: {
       has_credits: !exhausted,
-      unlimited: false,
+      unlimited: options.unlimited === true,
       balance: Number.isFinite(limitUsd) && Number.isFinite(spend) ? String(Math.max(0, limitUsd - spend)) : null
     },
     plan_type: "apikey"
@@ -3208,6 +3587,17 @@ function accountLastLabel(account) {
   return `${Math.floor(seconds / 86400)}d ago`;
 }
 
+function accountResetLabel(account) {
+  const resetAt = firstFinite(account.api_spend?.reset_at, account.last_usage?.primary?.resets_at);
+  if (!Number.isFinite(resetAt)) return "-";
+  const remaining = Math.max(0, Math.floor(resetAt - Date.now() / 1000));
+  if (remaining === 0) return "Now";
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${Math.max(1, minutes)}m`;
+}
+
 const accountTableColumnLabels = {
   group: "GROUP",
   account: "ACCOUNT",
@@ -3215,6 +3605,7 @@ const accountTableColumnLabels = {
   fiveHour: "PRIMARY LEFT",
   daily: "DAILY",
   weekly: "WEEKLY LEFT",
+  reset: "RESET IN",
   last: "LAST ACTIVITY",
   exhausted: "EXHAUSTED"
 };
@@ -3257,6 +3648,7 @@ function renderLocalList(groups) {
         fiveHour: accountUsageLabel(account, "primary"),
         daily: account.auth_mode === "apikey" ? apiAccountDailyLabel(account) : "-",
         weekly: apiAccountWeeklyLabel(account),
+        reset: accountResetLabel(account),
         last: accountLastLabel(account)
       });
     }
@@ -3266,7 +3658,7 @@ function renderLocalList(groups) {
     return;
   }
 
-  const keys = accountTableKeys(grouped, ["account", "plan", "fiveHour", "daily", "weekly", "last"]);
+  const keys = accountTableKeys(grouped, ["account", "plan", "fiveHour", "daily", "weekly", "reset", "last"]);
   const widths = accountTableWidths(rows, keys);
   const prefixWidth = 5;
   const header = renderAccountTableHeader(keys, widths, prefixWidth);
@@ -3829,6 +4221,231 @@ function readSecretLineFromTty(prompt) {
   }
 }
 
+function parseVsllmDashboardConfigArgs(args) {
+  const options = {
+    account: null,
+    alias: "",
+    origin: "https://vsllm.com",
+    stdin: false,
+    userId: null
+  };
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    const nextValue = () => {
+      const value = args[++i];
+      if (!value) {
+        console.error(`${arg} requires a value.`);
+        process.exit(1);
+      }
+      return value;
+    };
+    if (arg === "--account") {
+      options.account = nextValue();
+    } else if (arg.startsWith("--account=")) {
+      options.account = arg.slice("--account=".length);
+    } else if (arg === "--alias") {
+      options.alias = nextValue();
+    } else if (arg.startsWith("--alias=")) {
+      options.alias = arg.slice("--alias=".length);
+    } else if (arg === "--origin") {
+      options.origin = nextValue();
+    } else if (arg.startsWith("--origin=")) {
+      options.origin = arg.slice("--origin=".length);
+    } else if (arg === "--user-id") {
+      options.userId = Number(nextValue());
+    } else if (arg.startsWith("--user-id=")) {
+      options.userId = Number(arg.slice("--user-id=".length));
+    } else if (arg === "--stdin") {
+      options.stdin = true;
+    } else if (!arg.startsWith("-") && options.account == null) {
+      options.account = arg;
+    } else {
+      console.error(`unknown argument for vsllm-dashboard: ${arg}`);
+      process.exit(1);
+    }
+  }
+
+  options.origin = normalizeProviderOrigin(options.origin);
+  if (!options.origin) {
+    console.error("vsllm-dashboard requires a valid --origin URL.");
+    process.exit(1);
+  }
+  if (!Number.isInteger(options.userId) || options.userId <= 0) {
+    console.error("vsllm-dashboard requires a positive numeric --user-id.");
+    process.exit(1);
+  }
+  return options;
+}
+
+function readVsllmDashboardAccessToken(options) {
+  if (options.stdin) return fs.readFileSync(0, "utf8").trim();
+  if (process.env.CODEX_AUTH_ADVANCED_VSLLM_ACCESS_TOKEN) {
+    return process.env.CODEX_AUTH_ADVANCED_VSLLM_ACCESS_TOKEN.trim();
+  }
+  if (process.stdin.isTTY && process.stderr.isTTY) {
+    return readSecretLineFromTty("VSLLM dashboard access token: ");
+  }
+  console.error("vsllm-dashboard requires --stdin, CODEX_AUTH_ADVANCED_VSLLM_ACCESS_TOKEN, or an interactive terminal.");
+  process.exit(1);
+}
+
+function maskedNewApiTokenKey(apiKey) {
+  const key = String(apiKey || "").trim().replace(/^Bearer\s+/i, "").replace(/^sk-/, "");
+  if (!key) return "";
+  if (key.length <= 4) return "*".repeat(key.length);
+  if (key.length <= 8) return `${key.slice(0, 2)}****${key.slice(-2)}`;
+  return `${key.slice(0, 4)}**********${key.slice(-4)}`;
+}
+
+function normalizeMaskedNewApiTokenKey(value) {
+  return String(value || "").trim().replace(/^sk-/, "");
+}
+
+async function fetchDashboardMaskedTokenKeys(credential) {
+  const maskedKeys = new Set();
+  for (let page = 1; page <= 20; page += 1) {
+    const result = await fetchProviderDashboardJson(credential, `/api/token/?p=${page}&size=100`);
+    if (result.status !== 200 || result.body?.success !== true) {
+      return { ok: false, maskedKeys, message: result.body?.message || result.error || `HTTP ${result.status}` };
+    }
+    const data = result.body?.data;
+    const items = Array.isArray(data?.items) ? data.items : [];
+    for (const item of items) {
+      const masked = normalizeMaskedNewApiTokenKey(item?.key);
+      if (masked) maskedKeys.add(masked);
+    }
+    const total = Number(data?.total);
+    if (!Number.isFinite(total) || page * 100 >= total) break;
+  }
+  return { ok: true, maskedKeys, message: "" };
+}
+
+function matchingDashboardApiEntries(codexHome, credential, maskedKeys) {
+  return loadApiKeyAccountsFromCodexHome("default", codexHome).filter((entry) => {
+    if (providerOriginFromModelsEndpoint(entry.endpoint) !== normalizeProviderOrigin(credential.origin)) return false;
+    const masked = maskedNewApiTokenKey(entry.apiKey);
+    return masked && maskedKeys.has(masked);
+  });
+}
+
+function selectDashboardApiEntry(codexHome, options, tokenResult, credential) {
+  const discovered = matchingDashboardApiEntries(codexHome, credential, tokenResult.maskedKeys);
+  if (options.account) {
+    const requested = loadApiKeyAccountsFromCodexHome("default", codexHome)
+      .filter((entry) => accountMatchesQuery(entry.account, options.account));
+    if (requested.length !== 1) {
+      console.error(requested.length === 0
+        ? `No API-key account matched ${JSON.stringify(options.account)}.`
+        : `Multiple API-key accounts matched ${JSON.stringify(options.account)}.`);
+      process.exit(1);
+    }
+    if (!discovered.some((entry) => entry.account.account_key === requested[0].account.account_key)) {
+      console.error(`Dashboard user ${options.userId} does not own the stored API key for ${accountLabel(requested[0].account)}.`);
+      process.exit(1);
+    }
+    return requested[0];
+  }
+  if (discovered.length === 1) return discovered[0];
+  if (discovered.length === 0) {
+    console.error(`No locally stored API key matched the masked tokens owned by dashboard user ${options.userId}.`);
+  } else {
+    console.error(`Dashboard user ${options.userId} matched multiple local API accounts; rerun with --account <account-key-or-alias>.`);
+  }
+  process.exit(1);
+}
+
+function localTimestampLabel(seconds) {
+  if (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0) return "unknown";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "long"
+  }).format(new Date(Number(seconds) * 1000));
+}
+
+function subscriptionRemainingLabel(subscription) {
+  if (subscription?.unlimited) return "unlimited";
+  const usedPercent = Number(subscription?.usedPercent);
+  if (!Number.isFinite(usedPercent)) return "unknown";
+  return `${Math.max(0, 100 - Math.max(0, Math.min(100, usedPercent))).toFixed(0)}%`;
+}
+
+async function configureVsllmDashboard(codexHome, options) {
+  const accessToken = readVsllmDashboardAccessToken(options).replace(/^Bearer\s+/i, "");
+  if (!accessToken) {
+    console.error("VSLLM dashboard access token cannot be empty.");
+    process.exit(1);
+  }
+  const credential = {
+    schema_version: 1,
+    provider: "vsllm",
+    origin: options.origin,
+    user_id: options.userId,
+    alias: options.alias || `vsllm-user-${options.userId}`,
+    access_token: accessToken
+  };
+  const subscriptionResult = await fetchProviderDashboardJson(credential, "/api/subscription/self");
+  const subscription = subscriptionResult.status === 200
+    ? parseVsllmSubscriptionSelf(subscriptionResult.body)
+    : null;
+  if (!subscription) {
+    const message = subscriptionResult.body?.message || subscriptionResult.error || `HTTP ${subscriptionResult.status}`;
+    console.error(`Could not authenticate VSLLM dashboard user ${options.userId}: ${message}`);
+    process.exit(1);
+  }
+
+  const tokenResult = await fetchDashboardMaskedTokenKeys(credential);
+  if (!tokenResult.ok) {
+    console.error(`Could not verify VSLLM API-key ownership for user ${options.userId}: ${tokenResult.message}`);
+    process.exit(1);
+  }
+  const entry = selectDashboardApiEntry(codexHome, options, tokenResult, credential);
+  credential.account_key = entry.account.account_key;
+  credential.configured_at = Math.floor(Date.now() / 1000);
+
+  const credentialsDir = providerDashboardCredentialsDir(codexHome);
+  ensureDir(credentialsDir);
+  const credentialPath = providerDashboardCredentialPath(codexHome, credential.origin, credential.user_id);
+  writeJsonFile(credentialPath, credential);
+  fs.chmodSync(credentialPath, 0o600);
+
+  const filePath = registryPath(codexHome);
+  const registry = readJsonFile(filePath);
+  const account = registry?.accounts?.find((item) => item?.account_key === entry.account.account_key);
+  if (!account) {
+    console.error("The matched API account disappeared before dashboard credentials could be linked.");
+    process.exit(1);
+  }
+  account.provider_dashboard = {
+    provider: "vsllm",
+    origin: credential.origin,
+    user_id: credential.user_id,
+    alias: credential.alias
+  };
+  writeJsonFile(filePath, registry);
+  await syncApiKeySpendLimits();
+
+  process.stdout.write(`Configured ${credential.alias} (dashboard user ${credential.user_id}) for ${accountLabel(account)}.\n`);
+  process.stdout.write(`subscription: ${subscription.exhausted ? "exhausted" : "active"}, ${subscriptionRemainingLabel(subscription)} remaining\n`);
+  process.stdout.write(`next reset: ${localTimestampLabel(subscription.resetAt)}\n`);
+  process.stdout.write(`subscription ends: ${localTimestampLabel(subscription.endAt)}\n`);
+}
+
+async function maybeHandleVsllmDashboardConfig(argv) {
+  let codexHome = null;
+  let args = null;
+  if (argv[0] === "config" && argv[1] === "vsllm-dashboard") {
+    codexHome = defaultCodexHome();
+    args = argv.slice(2);
+  } else if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "config" && argv[3] === "vsllm-dashboard") {
+    codexHome = managedGroupCodexHome(argv[1]);
+    args = argv.slice(4);
+  } else {
+    return false;
+  }
+  await configureVsllmDashboard(codexHome, parseVsllmDashboardConfigArgs(args));
+  return true;
+}
+
 function loadOrCreateRegistry(codexHome) {
   const filePath = registryPath(codexHome);
   const existing = readJsonFile(filePath);
@@ -4025,15 +4642,17 @@ async function syncApiKeySpendLimits() {
   const byRegistry = new Map();
   for (const entry of entries) {
     const health = await fetchApiKeyHealth(entry);
-    const costs = health.status == null
+    const costs = health.status == null && !entry.dashboardCredential
       ? { spend: null, limitUsd: null, remaining: null, exhausted: false }
       : await fetchApiKeyCosts(entry);
+    if (costs.dashboardUnavailable) continue;
     const limitUsd = apiSpendLimitUsd(entry.account, { endpoint: entry.endpoint }) ?? costs.limitUsd;
     const exhausted = isApiKeyLimitExhausted(health.status, costs.spend, limitUsd, {
-      providerExhausted: health.exhausted || costs.exhausted,
+      providerExhausted: costs.subscription ? costs.exhausted : health.exhausted || costs.exhausted,
+      authoritativeSubscription: costs.subscription != null,
       remaining: costs.remaining
     });
-    if (!Number.isFinite(limitUsd) && !exhausted && !Number.isFinite(costs.spend)) continue;
+    if (!costs.subscription && !Number.isFinite(limitUsd) && !exhausted && !Number.isFinite(costs.spend)) continue;
     const key = registryPath(entry.codexHome);
     if (!byRegistry.has(key)) byRegistry.set(key, []);
     byRegistry.get(key).push({
@@ -4046,7 +4665,9 @@ async function syncApiKeySpendLimits() {
       remaining: costs.remaining,
       resetsAt: costs.resetsAt,
       windowMinutes: costs.spendWindowMinutes,
-      rollingState: costs.rollingState
+      rollingState: costs.rollingState,
+      providerUsedPercent: costs.providerUsedPercent,
+      subscription: costs.subscription
     });
   }
 
@@ -4068,12 +4689,31 @@ async function syncApiKeySpendLimits() {
         window_minutes: Number.isFinite(update.windowMinutes) ? update.windowMinutes : null,
         status: update.status,
         exhausted: update.exhausted,
-        checked_at: Math.floor(Date.now() / 1000)
+        checked_at: Math.floor(Date.now() / 1000),
+        source: update.subscription ? "provider_subscription" : "provider_billing"
       };
+      if (update.subscription) {
+        account.api_spend.subscription_id = update.subscription.subscriptionId;
+        account.api_spend.plan_id = update.subscription.planId;
+        account.api_spend.billing_preference = update.subscription.billingPreference;
+        account.api_spend.active_subscription_count = update.subscription.activeSubscriptionCount;
+        account.api_spend.last_reset_at = update.subscription.lastResetAt;
+        account.api_spend.reset_at = update.subscription.resetAt;
+        account.api_spend.subscription_end_at = update.subscription.endAt;
+        account.api_spend.used_percent = update.subscription.usedPercent;
+        account.api_spend.unlimited = update.subscription.unlimited;
+        if (update.exhausted) {
+          account.api_exhausted_reason = "subscription_limit";
+        } else {
+          delete account.api_exhausted_reason;
+        }
+      }
       if (update.rollingState) account.api_spend_window = update.rollingState;
       account.last_usage = usageSnapshotForApiSpend(update.spend, update.limitUsd, update.exhausted, {
         windowMinutes: update.windowMinutes,
-        resetsAt: update.resetsAt
+        resetsAt: update.resetsAt,
+        usedPercent: update.providerUsedPercent,
+        unlimited: update.subscription?.unlimited === true
       });
       account.last_usage_at = Math.floor(Date.now() / 1000);
     }
@@ -4624,6 +5264,10 @@ if (await maybeHandleProviderProxy(argv)) {
 }
 
 if (await maybeHandleApiSpendLimitConfig(argv)) {
+  process.exit(0);
+}
+
+if (await maybeHandleVsllmDashboardConfig(argv)) {
   process.exit(0);
 }
 

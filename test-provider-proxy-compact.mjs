@@ -122,6 +122,19 @@ const upstream = http.createServer(async (req, res) => {
       }));
       return;
     }
+    if (responseFailure === "transient_usage_limit") {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "You've hit your usage limit. Try again later.",
+          code: "usage_limit_reached"
+        }
+      }));
+      return;
+    }
+    if (responseFailure === "delayed_completed") {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ type: "response.completed" }));
   }
@@ -134,18 +147,40 @@ function listen(server, host = "127.0.0.1") {
   });
 }
 
-async function waitForHealth(port) {
+async function readProxyHealth(port) {
   const url = `http://127.0.0.1:${port}/_codex-auth-advanced/health`;
+  try {
+    const response = await fetch(url);
+    if (response.status !== 200) return null;
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function waitForHealth(port) {
   for (let i = 0; i < 50; i += 1) {
-    try {
-      const response = await fetch(url);
-      if (response.status === 200) return;
-    } catch {
-      // keep polling
-    }
+    const health = await readProxyHealth(port);
+    if (health) return health;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("proxy did not become healthy");
+}
+
+function waitForChildExit(child, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const timeout = setTimeout(() => {
+      reject(new Error("proxy did not exit after graceful restart request"));
+    }, timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 
 function proxyGroupId(home) {
@@ -744,7 +779,66 @@ try {
     throw new Error("unknown pinned account should not make an upstream request");
   }
 
+  accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
+  setActive("apikey-vsllm", false);
+  responseFailures.push("transient_usage_limit");
+  const beforeTransientUsageLimit = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforeTransientUsageLimit + 2) {
+    throw new Error(`expected transient VSLLM usage limit to retry once, got ${upstreamRequests.length - beforeTransientUsageLimit} upstream requests`);
+  }
+  assertRequestAt(beforeTransientUsageLimit, { label: "transient VSLLM usage limit first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertRequestAt(beforeTransientUsageLimit + 1, { label: "transient VSLLM usage limit same-account retry", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const transientUsageLimitRegistry = readRegistry();
+  const transientUsageLimitAccount = transientUsageLimitRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  if (transientUsageLimitRegistry.active_account_key !== "apikey-vsllm" || transientUsageLimitAccount?.api_spend?.exhausted === true) {
+    throw new Error(`transient VSLLM usage limit should not exhaust or switch the account, got ${JSON.stringify(transientUsageLimitRegistry)}`);
+  }
+
   setActive("apikey-vsllm", true);
+  responseFailures.push("transient_usage_limit", "transient_usage_limit");
+  const beforePersistentUsageLimit = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforePersistentUsageLimit + 3) {
+    throw new Error(`expected persistent transient VSLLM usage limit to retry once and then use another account, got ${upstreamRequests.length - beforePersistentUsageLimit} upstream requests`);
+  }
+  assertRequestAt(beforePersistentUsageLimit, { label: "persistent VSLLM usage limit first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertRequestAt(beforePersistentUsageLimit + 1, { label: "persistent VSLLM usage limit same-account retry", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  if (upstreamRequests[beforePersistentUsageLimit + 2]?.authorization === "Bearer vsllm-secret") {
+    throw new Error("expected persistent transient VSLLM usage limit to fall back to another usable account");
+  }
+  const persistentUsageLimitRegistry = readRegistry();
+  const persistentUsageLimitAccount = persistentUsageLimitRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  if (persistentUsageLimitAccount?.api_spend?.exhausted === true) {
+    throw new Error(`persistent transient VSLLM usage limit should not mark the account exhausted, got ${JSON.stringify(persistentUsageLimitAccount)}`);
+  }
+
+  const cappedUsageLimitRegistry = JSON.parse(JSON.stringify(autoConfigRegistry));
+  const cappedUsageLimitAccount = cappedUsageLimitRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  cappedUsageLimitAccount.api_spend.exhausted = false;
+  cappedUsageLimitAccount.api_spend.spend_usd = 55;
+  cappedUsageLimitAccount.api_spend.limit_usd = 55;
+  cappedUsageLimitAccount.last_usage.primary.used_percent = 100;
+  accounts.splice(0, accounts.length, ...cappedUsageLimitRegistry.accounts);
+  setActive("apikey-vsllm-2", true);
+  responseFailures.push("transient_usage_limit");
+  const beforeExhaustedUsageLimit = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforeExhaustedUsageLimit + 2) {
+    throw new Error(`expected capped VSLLM usage limit to switch without same-account retry, got ${upstreamRequests.length - beforeExhaustedUsageLimit} upstream requests`);
+  }
+  assertRequestAt(beforeExhaustedUsageLimit, { label: "capped VSLLM usage limit first attempt", bearer: "vsllm-2-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  if (upstreamRequests[beforeExhaustedUsageLimit + 1]?.authorization === "Bearer vsllm-2-secret") {
+    throw new Error("expected capped VSLLM usage limit to switch to another usable account immediately");
+  }
+  const exhaustedUsageLimitRegistry = readRegistry();
+  const exhaustedUsageLimitAccount = exhaustedUsageLimitRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (exhaustedUsageLimitAccount?.api_spend?.exhausted !== true || exhaustedUsageLimitAccount?.api_exhausted_reason !== "rate_limit") {
+    throw new Error(`expected capped VSLLM usage limit to mark the account exhausted, got ${JSON.stringify(exhaustedUsageLimitAccount)}`);
+  }
+
+  accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
+  setActive("apikey-vsllm", false);
   responseFailures.push("no_active_subscription");
   const beforePinnedNoActive = upstreamRequests.length;
   const pinnedNoActiveResponse = await proxyAccountRawRequest(proxyPort, "vsllm-2", "/responses", body);
@@ -761,29 +855,28 @@ try {
     throw new Error(`pinned account failure should not switch the active Codex account, got ${pinnedNoActiveRegistry.active_account_key}`);
   }
 
-  setActive("apikey-vsllm", true);
+  setActive("apikey-vsllm", false);
   responseFailures.push("no_active_subscription");
   const beforeVsllmNoActive = upstreamRequests.length;
-  const noActiveResponse = await proxyRawRequest(proxyPort, "/responses", body);
-  if (noActiveResponse.status !== 402) {
-    throw new Error(`expected no-active-subscription response to pass through as 402, got ${noActiveResponse.status}: ${await noActiveResponse.text()}`);
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforeVsllmNoActive + 2) {
+    throw new Error(`expected no-active-subscription response to fail over and retry, got ${upstreamRequests.length - beforeVsllmNoActive} upstream requests`);
   }
-  await noActiveResponse.text();
-  if (upstreamRequests.length !== beforeVsllmNoActive + 1) {
-    throw new Error(`expected no-active-subscription response not to retry, got ${upstreamRequests.length - beforeVsllmNoActive} upstream requests`);
+  assertRequestAt(beforeVsllmNoActive, { label: "vsllm no active subscription first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const vsllmNoActiveRetry = upstreamRequests[beforeVsllmNoActive + 1];
+  if (vsllmNoActiveRetry?.authorization === "Bearer vsllm-secret") {
+    throw new Error("expected no-active-subscription retry to switch away from vsllm");
   }
-  assertRequestAt(beforeVsllmNoActive, { label: "vsllm no active subscription passthrough", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
   const noActiveRegistry = readRegistry();
-  if (noActiveRegistry.active_account_key !== "apikey-vsllm") {
-    throw new Error(`expected active account to remain vsllm, got ${noActiveRegistry.active_account_key}`);
+  if (noActiveRegistry.auto_switch?.enabled !== false) {
+    throw new Error(`expected hard proxy failover not to enable scheduled auto-switch, got ${JSON.stringify(noActiveRegistry.auto_switch)}`);
   }
-  const notExhaustedVsllm = noActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
-  if (notExhaustedVsllm?.api_spend?.exhausted === true) {
-    throw new Error(`expected vsllm not to be marked exhausted by no-active-subscription text, got ${JSON.stringify(notExhaustedVsllm)}`);
+  if (noActiveRegistry.active_account_key === "apikey-vsllm") {
+    throw new Error("expected hard proxy failover to switch away from vsllm even with scheduled auto-switch disabled");
   }
-  const stillExhaustedVsllm2 = noActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
-  if (stillExhaustedVsllm2?.api_spend?.exhausted !== true) {
-    throw new Error(`expected vsllm-2 to remain exhausted, got ${JSON.stringify(stillExhaustedVsllm2)}`);
+  const exhaustedVsllm = noActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  if (exhaustedVsllm?.api_spend?.exhausted !== true || exhaustedVsllm?.api_exhausted_reason !== "no_active_subscription") {
+    throw new Error(`expected vsllm to be marked exhausted by no-active-subscription text, got ${JSON.stringify(exhaustedVsllm)}`);
   }
 
   const usableVsllm2Registry = JSON.parse(JSON.stringify(autoConfigRegistry));
@@ -813,47 +906,22 @@ try {
     plan_type: "apikey"
   };
   accounts.splice(0, accounts.length, ...usableVsllm2Registry.accounts);
-  setActive("apikey-vsllm-2", true);
+  setActive("apikey-vsllm-2", false);
   responseFailures.push("no_active_subscription");
   const beforeUsableVsllm2NoActive = upstreamRequests.length;
-  const usableNoActiveResponse = await proxyRawRequest(proxyPort, "/responses", body);
-  if (usableNoActiveResponse.status !== 402) {
-    throw new Error(`expected usable vsllm-2 no-active-subscription response to pass through as 402, got ${usableNoActiveResponse.status}: ${await usableNoActiveResponse.text()}`);
-  }
-  await usableNoActiveResponse.text();
-  if (upstreamRequests.length !== beforeUsableVsllm2NoActive + 1) {
-    throw new Error(`expected usable vsllm-2 no-active-subscription response not to retry, got ${upstreamRequests.length - beforeUsableVsllm2NoActive} upstream requests`);
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforeUsableVsllm2NoActive + 2) {
+    throw new Error(`expected usable vsllm-2 no-active-subscription response to fail over and retry, got ${upstreamRequests.length - beforeUsableVsllm2NoActive} upstream requests`);
   }
   const usableNoActiveRegistry = readRegistry();
-  if (usableNoActiveRegistry.active_account_key !== "apikey-vsllm-2") {
-    throw new Error(`expected active account to remain usable vsllm-2, got ${usableNoActiveRegistry.active_account_key}`);
+  if (usableNoActiveRegistry.active_account_key === "apikey-vsllm-2") {
+    throw new Error("expected usable vsllm-2 to switch after a direct no-active-subscription response");
   }
-  const stillUsableVsllm2 = usableNoActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
-  if (stillUsableVsllm2?.api_spend?.exhausted === true || stillUsableVsllm2?.api_exhausted_reason) {
-    throw new Error(`expected usable vsllm-2 not to be exhausted by no-active-subscription text, got ${JSON.stringify(stillUsableVsllm2)}`);
+  const exhaustedUsableVsllm2 = usableNoActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
+  if (exhaustedUsableVsllm2?.api_spend?.exhausted !== true || exhaustedUsableVsllm2?.api_exhausted_reason !== "no_active_subscription") {
+    throw new Error(`expected usable vsllm-2 to be marked exhausted by no-active-subscription text, got ${JSON.stringify(exhaustedUsableVsllm2)}`);
   }
   accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
-
-  setActive("apikey-vsllm-2", true);
-  responseFailures.push("no_active_subscription");
-  const beforeVsllm2NoActive = upstreamRequests.length;
-  await proxyRequest(proxyPort, "/responses", body);
-  if (upstreamRequests.length !== beforeVsllm2NoActive + 2) {
-    throw new Error(`expected explicitly capped vsllm-2 no-active-subscription response to retry, got ${upstreamRequests.length - beforeVsllm2NoActive} upstream requests`);
-  }
-  assertRequestAt(beforeVsllm2NoActive, { label: "vsllm-2 no active subscription first attempt", bearer: "vsllm-2-secret", acceptEncoding: "identity", expectEncryptedContent: true });
-  const vsllm2Retry = upstreamRequests[beforeVsllm2NoActive + 1];
-  if (vsllm2Retry?.authorization === "Bearer vsllm-2-secret") {
-    throw new Error("expected vsllm-2 no-active-subscription retry to switch away from vsllm-2");
-  }
-  const vsllm2NoActiveRegistry = readRegistry();
-  if (vsllm2NoActiveRegistry.active_account_key === "apikey-vsllm-2") {
-    throw new Error("expected active account to switch away from exhausted vsllm-2");
-  }
-  const noActiveExhaustedVsllm2 = vsllm2NoActiveRegistry.accounts.find((account) => account.account_key === "apikey-vsllm-2");
-  if (noActiveExhaustedVsllm2?.api_spend?.exhausted !== true || noActiveExhaustedVsllm2?.api_exhausted_reason !== "no_active_subscription") {
-    throw new Error(`expected vsllm-2 to be marked exhausted by no-active-subscription text, got ${JSON.stringify(noActiveExhaustedVsllm2)}`);
-  }
 
   setActive("apikey-tcdmx");
   await proxyRequest(proxyPort, "/responses", aliasedModelBody);
@@ -932,13 +1000,47 @@ try {
   await proxyRequest(proxyPort, "/responses", body);
   assertLatestRequest({ label: "business responses", bearer: "business-token", expectEncryptedContent: true });
 
+  setActive("apikey-openai");
+  responseFailures.push("delayed_completed");
+  const beforeGracefulRestartRequest = upstreamRequests.length;
+  const inFlightResponse = proxyRequest(proxyPort, "/responses", body);
+  for (let i = 0; i < 50 && upstreamRequests.length === beforeGracefulRestartRequest; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (upstreamRequests.length !== beforeGracefulRestartRequest + 1) {
+    throw new Error("expected an upstream request to be active before requesting graceful restart");
+  }
+
+  const restartResponse = await fetch(`http://127.0.0.1:${proxyPort}/_codex-auth-advanced/restart`, { method: "POST" });
+  if (restartResponse.status !== 202) {
+    throw new Error(`expected graceful restart request to return 202, got ${restartResponse.status}: ${await restartResponse.text()}`);
+  }
+  const restartPayload = await restartResponse.json();
+  if (restartPayload.restart_requested !== true || restartPayload.active_requests < 1) {
+    throw new Error(`expected graceful restart to preserve the active response, got ${JSON.stringify(restartPayload)}`);
+  }
+
+  const rejectedDuringRestart = await proxyRawRequest(proxyPort, "/responses", body);
+  if (rejectedDuringRestart.status !== 503) {
+    throw new Error(`expected new requests to be rejected while the proxy drains, got ${rejectedDuringRestart.status}: ${await rejectedDuringRestart.text()}`);
+  }
+  await rejectedDuringRestart.text();
+
+  const completedDuringRestart = await inFlightResponse;
+  if (completedDuringRestart?.type !== "response.completed") {
+    throw new Error(`expected the in-flight response to finish before restart, got ${JSON.stringify(completedDuringRestart)}`);
+  }
+  await waitForChildExit(proxy);
+
   console.log("provider proxy compact sanitizer ok");
 } finally {
-  proxy.kill("SIGTERM");
-  await new Promise((resolve) => {
-    proxy.once("exit", resolve);
-    setTimeout(resolve, 1000);
-  });
+  if (proxy.exitCode === null && proxy.signalCode === null) {
+    proxy.kill("SIGTERM");
+    await new Promise((resolve) => {
+      proxy.once("exit", resolve);
+      setTimeout(resolve, 1000);
+    });
+  }
   upstream.close();
   fs.rmSync(tempRoot, { recursive: true, force: true });
 }

@@ -22,7 +22,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --check bin/codex-auth-advanced-wrapper.js && node --check test-provider-proxy-compact.mjs && node test-provider-proxy-compact.mjs"
+    "test": "node --check bin/codex-auth-advanced-wrapper.js && node --check scripts/start-proxy.mjs && node --check scripts/restart-proxy.mjs && node --check test-provider-proxy-compact.mjs && node --check test-vsllm-dashboard.mjs && node test-provider-proxy-compact.mjs && node test-vsllm-dashboard.mjs"
   },
   "publishConfig": {
     "access": "public"

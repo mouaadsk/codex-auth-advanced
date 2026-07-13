@@ -10,8 +10,17 @@ const repoRoot = path.dirname(scriptDir);
 const wrapper = path.join(repoRoot, "bin", "codex-auth-advanced.js");
 const logDir = path.join(repoRoot, "scratch");
 const logFile = path.join(logDir, "proxy.log");
-const healthUrl = "http://127.0.0.1:47778/_codex-auth-advanced/health";
+const proxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
+const proxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
+const proxyPrefix = "/_codex-auth-advanced";
+const formattedProxyHost = proxyHost.includes(":") && !proxyHost.startsWith("[") ? `[${proxyHost}]` : proxyHost;
+const healthUrl = `http://${formattedProxyHost}:${proxyPort}${proxyPrefix}/health`;
 let lastHealthError = "";
+
+if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
+  console.error(`Invalid CODEX_AUTH_ADVANCED_PROXY_PORT: ${process.env.CODEX_AUTH_ADVANCED_PROXY_PORT}`);
+  process.exit(1);
+}
 
 async function proxyIsRunning() {
   try {
