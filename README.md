@@ -46,15 +46,15 @@ This repository is maintained as a local macOS checkout. It is not currently pub
 
 ## How It Works
 
-The project has four main layers:
+The project has four runtime layers:
 
 1. **Vendored account manager**
 
    The native `codex-auth-advanced` binary handles the original account registry, login, import, grouping, and ChatGPT usage workflows.
 
-2. **JavaScript wrapper**
+2. **JavaScript composition wrapper**
 
-   [`bin/codex-auth-advanced-wrapper.js`](bin/codex-auth-advanced-wrapper.js) adds API-key accounts, provider usage tracking, local proxy routing, VSLLM behavior, pinned endpoints, and background switching support.
+   [`bin/codex-auth-advanced-wrapper.js`](bin/codex-auth-advanced-wrapper.js) validates the runtime, composes the services under [`src/`](src/), adapts arguments, and delegates to either a wrapper command or the vendored binary. Provider, account, client, and manager behavior lives in focused modules rather than in the entrypoint.
 
 3. **Provider proxy**
 
@@ -65,6 +65,23 @@ The project has four main layers:
    When auto-switching is enabled, one manager refreshes usage for all enabled groups every 30 seconds and switches away from exhausted active accounts.
 
 ChatGPT account switches normally require restarting the Codex client so it reloads credentials. API-to-API switches can remain hot after Codex has been configured to use the local proxy. `codext` can launch against a selected group and carry its current model configuration into resumed sessions.
+
+### Source Architecture
+
+| Module | Responsibility |
+| --- | --- |
+| `src/storage.mjs` | Private file writes, account paths, managed group paths, JSON/text reads, and backups. |
+| `src/codex-config.mjs` | TOML parsing/merging, API account templates, and Codex provider configuration. |
+| `src/provider-policy.mjs` | Provider error classification, VSLLM subscription windows, spend state, retries, and model aliases. |
+| `src/provider-client.mjs` | Provider health, billing, New API dashboard access, and dashboard credential lookup. |
+| `src/proxy-transforms.mjs` | Request rewriting, compressed JSON decoding, encrypted-content repair, SSE normalization, and compact fallback. |
+| `src/provider-proxy.mjs` | Route parsing, pinned/default targeting, HTTP/WebSocket transport, failover orchestration, streaming, and graceful lifecycle. |
+| `src/account-service.mjs` | Registry loading, account selection, target resolution, exhaustion mutation, and account activation. |
+| `src/client-config.mjs` | Codex and Claude Code configuration through the local proxy. |
+| `src/cli-service.mjs` | Wrapper-owned account, usage, dashboard, auto-switch, list, and proxy commands. |
+| `src/manager-service.mjs` | Background manager lifecycle, macOS LaunchAgent handling, and status augmentation. |
+
+Keep new domain behavior in the owning module. The wrapper should remain limited to composition, launch argument handling, help/version adaptation, native binary resolution, and final dispatch.
 
 ## Requirements
 
@@ -661,6 +678,7 @@ npm test
 
 The test suite covers:
 
+- Direct storage, TOML, provider-policy, transform, routing, account-selection, and client-configuration contracts.
 - Proxy model remapping and reasoning-effort forwarding.
 - Claude Fable routing, Anthropic header forwarding, model discovery, and byte-preserving SSE responses.
 - Native and fallback compaction.

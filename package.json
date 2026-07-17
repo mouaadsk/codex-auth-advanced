@@ -17,6 +17,7 @@
   },
   "files": [
     "bin/",
+    "src/",
     "scripts/",
     "vendor/",
     "LICENSE",
@@ -24,7 +25,7 @@
   ],
   "scripts": {
     "setup:macos": "node scripts/install-macos.mjs",
-    "test": "node --check bin/codex-auth-advanced-wrapper.js && node --check scripts/proxy-runtime.mjs && node --check scripts/start-proxy.mjs && node --check scripts/restart-proxy.mjs && node --check scripts/run-proxy-service.mjs && node --check scripts/install-macos.mjs && node --check test-provider-proxy-compact.mjs && node --check test-vsllm-dashboard.mjs && node --check test-install-macos.mjs && node --check test-proxy-service.mjs && node test-provider-proxy-compact.mjs && node test-vsllm-dashboard.mjs && node test-install-macos.mjs && node test-proxy-service.mjs"
+    "test": "node --check bin/codex-auth-advanced-wrapper.js && node --check src/storage.mjs && node --check src/codex-config.mjs && node --check src/provider-policy.mjs && node --check src/provider-client.mjs && node --check src/proxy-transforms.mjs && node --check src/provider-proxy.mjs && node --check src/account-service.mjs && node --check src/client-config.mjs && node --check src/cli-service.mjs && node --check src/manager-service.mjs && node --check scripts/proxy-runtime.mjs && node --check scripts/start-proxy.mjs && node --check scripts/restart-proxy.mjs && node --check scripts/run-proxy-service.mjs && node --check scripts/install-macos.mjs && node --check test-core-modules.mjs && node --check test-provider-proxy-compact.mjs && node --check test-vsllm-dashboard.mjs && node --check test-install-macos.mjs && node --check test-proxy-service.mjs && node test-core-modules.mjs && node test-provider-proxy-compact.mjs && node test-vsllm-dashboard.mjs && node test-install-macos.mjs && node test-proxy-service.mjs"
   },
   "publishConfig": {
     "access": "public"
