@@ -178,6 +178,26 @@ const upstream = http.createServer(async (req, res) => {
       }));
       return;
     }
+    if (responseFailure === "model_capacity" || responseFailure === "model_capacity_slow_down") {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "Selected model is temporarily at capacity.",
+          code: responseFailure === "model_capacity_slow_down" ? "slow_down" : "server_is_overloaded"
+        }
+      }));
+      return;
+    }
+    if (responseFailure === "generic_service_unavailable") {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "Scheduled maintenance.",
+          code: "service_unavailable"
+        }
+      }));
+      return;
+    }
     if (responseFailure === "delayed_completed") {
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
@@ -535,7 +555,8 @@ const proxy = spawn(process.execPath, [wrapper, "proxy", "serve"], {
     ...process.env,
     CODEX_HOME: codexHome,
     CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort),
-    CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL: upstreamBaseUrl
+    CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL: upstreamBaseUrl,
+    CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS: "5"
   },
   stdio: ["ignore", "pipe", "pipe"]
 });
@@ -914,6 +935,55 @@ try {
   const transientUsageLimitAccount = transientUsageLimitRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
   if (transientUsageLimitRegistry.active_account_key !== "apikey-vsllm" || transientUsageLimitAccount?.api_spend?.exhausted === true) {
     throw new Error(`transient VSLLM usage limit should not exhaust or switch the account, got ${JSON.stringify(transientUsageLimitRegistry)}`);
+  }
+
+  responseFailures.push("generic_service_unavailable");
+  const beforeGenericUnavailable = upstreamRequests.length;
+  const genericUnavailable = await proxyRawRequest(proxyPort, "/responses", body);
+  if (genericUnavailable.status !== 503) {
+    throw new Error(`expected unrelated service-unavailable response to remain 503, got ${genericUnavailable.status}: ${await genericUnavailable.text()}`);
+  }
+  await genericUnavailable.text();
+  if (upstreamRequests.length !== beforeGenericUnavailable + 1) {
+    throw new Error(`unrelated 503 should not retry the same account, got ${upstreamRequests.length - beforeGenericUnavailable} upstream requests`);
+  }
+
+  responseFailures.push("model_capacity_slow_down");
+  const beforeTransientCapacity = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforeTransientCapacity + 2) {
+    throw new Error(`expected transient model capacity to retry once before succeeding, got ${upstreamRequests.length - beforeTransientCapacity} upstream requests`);
+  }
+  assertRequestAt(beforeTransientCapacity, { label: "model capacity first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  assertRequestAt(beforeTransientCapacity + 1, { label: "model capacity same-account retry", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true });
+  const transientCapacityRegistry = readRegistry();
+  const transientCapacityAccount = transientCapacityRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  if (transientCapacityRegistry.active_account_key !== "apikey-vsllm" || transientCapacityAccount?.api_spend?.exhausted === true) {
+    throw new Error(`model capacity should not exhaust or switch an account after a successful retry, got ${JSON.stringify(transientCapacityRegistry)}`);
+  }
+
+  setActive("apikey-vsllm", true);
+  responseFailures.push("model_capacity", "model_capacity", "model_capacity", "model_capacity");
+  const beforePersistentCapacity = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  if (upstreamRequests.length !== beforePersistentCapacity + 5) {
+    throw new Error(`expected persistent model capacity to use three same-account retries and then fail over, got ${upstreamRequests.length - beforePersistentCapacity} upstream requests`);
+  }
+  for (let offset = 0; offset < 4; offset += 1) {
+    assertRequestAt(beforePersistentCapacity + offset, {
+      label: `persistent model capacity attempt ${offset + 1}`,
+      bearer: "vsllm-secret",
+      acceptEncoding: "identity",
+      expectEncryptedContent: true
+    });
+  }
+  if (upstreamRequests[beforePersistentCapacity + 4]?.authorization === "Bearer vsllm-secret") {
+    throw new Error("expected persistent model capacity to fall back to another usable account after bounded retries");
+  }
+  const persistentCapacityRegistry = readRegistry();
+  const persistentCapacityAccount = persistentCapacityRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
+  if (persistentCapacityAccount?.api_spend?.exhausted === true) {
+    throw new Error(`persistent model capacity should not mark the account exhausted, got ${JSON.stringify(persistentCapacityAccount)}`);
   }
 
   setActive("apikey-vsllm", true);

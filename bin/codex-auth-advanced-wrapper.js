@@ -23,6 +23,12 @@ const providerProxyPrefix = "/_codex-auth-advanced";
 const claudeProxyAuthMarker = "codex-auth-advanced-local-proxy";
 const vsllmTransientUsageLimitMaxRetries = 1;
 const vsllmTransientUsageLimitRetryDelayMs = 500;
+const modelCapacityMaxRetries = 3;
+const configuredModelCapacityRetryBaseDelayMs = Number(process.env.CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS);
+const modelCapacityRetryBaseDelayMs = Number.isFinite(configuredModelCapacityRetryBaseDelayMs)
+  && configuredModelCapacityRetryBaseDelayMs >= 0
+  ? configuredModelCapacityRetryBaseDelayMs
+  : 1000;
 const chatgptCodexBaseUrl = process.env.CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api/codex";
 const chatgptCloudflareCookies = new Map();
 const vsllmDefaultSpendWindowMinutes = 480;
@@ -1001,6 +1007,13 @@ function isVsllmTransientUsageLimitBody(body) {
   );
 }
 
+function isModelCapacityBody(body) {
+  return responseBodyMatches(
+    body,
+    /server[_ -]?is[_ -]?overloaded|slow[_ -]?down|selected model is at capacity|model.{0,40}at capacity/i
+  );
+}
+
 function isInvalidApiKeyBody(body) {
   return responseBodyMatches(body, /invalid[_ -]?api[_ -]?key|invalid[_ -]?key|unauthorized/i);
 }
@@ -1029,6 +1042,7 @@ function shouldTrustProviderBalanceExhaustion(account) {
 }
 
 function apiProviderTransientRetryReason(status, body, account = null) {
+  if (status === 503 && isModelCapacityBody(body)) return "model_capacity";
   if (!isVsllmApiAccount(account) || apiAccountRollingLimitReached(account)) return null;
   if (isInvalidApiKeyBody(body) || isNoActiveSubscriptionBody(body)) return null;
   if (status === 429 || isVsllmTransientUsageLimitBody(body)) return "vsllm_usage_limit";
@@ -2375,7 +2389,7 @@ async function fetchProviderTarget(req, target, body, options = {}) {
 }
 
 async function exhaustedApiResponse(upstream, account = null) {
-  if (upstream.status < 400 || upstream.status >= 500) {
+  if (upstream.status < 400 || (upstream.status >= 500 && upstream.status !== 503)) {
     return { exhausted: false, body: null, transientRetryReason: null };
   }
 
@@ -2875,6 +2889,7 @@ async function handleProviderProxyRequest(req, res) {
     let upstream = null;
     const attemptedAccountKeys = new Set();
     const transientUsageLimitRetries = new Map();
+    const modelCapacityRetries = new Map();
     let bodyAlreadyDecoded = false;
     let triedPlaintextCompactRepair = false;
     const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
@@ -2954,6 +2969,18 @@ async function handleProviderProxyRequest(req, res) {
           const label = target.account?.alias || target.account?.email || target.account?.account_key || "VSLLM";
           console.warn(`[Proxy] ${label} returned a transient usage-limit response; retrying the same account.`);
           await new Promise((resolve) => setTimeout(resolve, vsllmTransientUsageLimitRetryDelayMs));
+          continue;
+        }
+      }
+      if (transientRetryReason === "model_capacity") {
+        const accountKey = target.account?.account_key || target.url;
+        const retries = modelCapacityRetries.get(accountKey) || 0;
+        if (retries < modelCapacityMaxRetries) {
+          modelCapacityRetries.set(accountKey, retries + 1);
+          const delayMs = modelCapacityRetryBaseDelayMs * (2 ** retries);
+          const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+          console.warn(`[Proxy] ${label} reported model capacity; retrying the same account in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
           continue;
         }
       }
