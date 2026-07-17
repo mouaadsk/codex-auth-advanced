@@ -3,6 +3,7 @@ node_modules/
 .local-codex-group-test/
 .local-home/
 .omx/
+.omc/
 .zig-global-cache/
 .zig-local-cache/
 npm-debug.log*

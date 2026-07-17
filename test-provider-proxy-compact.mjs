@@ -16,6 +16,34 @@ fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
 const upstreamRequests = [];
 const compactFailures = [];
 const responseFailures = [];
+const claudeSseBody = [
+  "event: message_start",
+  `data: ${JSON.stringify({
+    type: "message_start",
+    message: {
+      id: "msg_test",
+      type: "message",
+      role: "assistant",
+      model: "claude-fake-5",
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 4, output_tokens: 1 }
+    }
+  })}`,
+  "",
+  "event: content_block_delta",
+  `data: ${JSON.stringify({
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "text_delta", text: "ok" }
+  })}`,
+  "",
+  "event: message_stop",
+  `data: ${JSON.stringify({ type: "message_stop" })}`,
+  "",
+  ""
+].join("\n");
 const usageTotalsByBearer = new Map([
   ["Bearer vsllm-secret", 28.097534],
   ["Bearer vsllm-2-secret", 96.242272]
@@ -28,6 +56,11 @@ const upstream = http.createServer(async (req, res) => {
     method: req.method,
     url: req.url,
     authorization: req.headers.authorization,
+    apiKey: req.headers["x-api-key"],
+    anthropicVersion: req.headers["anthropic-version"],
+    anthropicBeta: req.headers["anthropic-beta"],
+    claudeSessionId: req.headers["x-claude-code-session-id"],
+    claudeAgentId: req.headers["x-claude-code-agent-id"],
     acceptEncoding: req.headers["accept-encoding"],
     contentEncoding: req.headers["content-encoding"],
     bodyText
@@ -45,9 +78,22 @@ const upstream = http.createServer(async (req, res) => {
     }));
     return;
   }
-  if (req.method === "GET" && req.url.endsWith("/v1/models")) {
+  if (req.method === "GET" && req.url.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ data: [] }));
+    res.end(JSON.stringify({
+      data: [
+        { id: "claude-fable-5", display_name: "Claude Fable 5" },
+        { id: "claude-fake-5", display_name: "Claude Fake 5" }
+      ]
+    }));
+    return;
+  }
+  if (req.method === "POST" && req.url.startsWith("/v1/messages")) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache"
+    });
+    res.end(claudeSseBody);
     return;
   }
   if (compactFailure) {
@@ -237,10 +283,13 @@ function writeAccount({
   return account;
 }
 
-async function proxyRawRequest(port, suffix, body) {
+async function proxyRawRequest(port, suffix, body, headers = {}) {
   return fetch(`http://127.0.0.1:${port}/_codex-auth-advanced/${proxyGroupId(codexHome)}${suffix}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...headers
+    },
     body: JSON.stringify(body)
   });
 }
@@ -726,6 +775,78 @@ try {
     });
   }
 
+  const claudeModelAliases = ["fable", "fable-5", "claude-fable-5"];
+  for (const inputModel of claudeModelAliases) {
+    const beforeClaudeRequest = upstreamRequests.length;
+    const response = await proxyRawRequest(proxyPort, "/v1/messages?beta=true", {
+      model: inputModel,
+      max_tokens: 256,
+      stream: true,
+      system: [{ type: "text", text: "Keep the response short." }],
+      messages: [{ role: "user", content: "Reply with ok." }]
+    }, {
+      authorization: "Bearer local-claude-marker",
+      "x-api-key": "local-claude-api-key-marker",
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "test-beta-2026-07-17",
+      "x-claude-code-session-id": "session-test",
+      "x-claude-code-agent-id": "agent-test"
+    });
+    if (response.status !== 200) {
+      throw new Error(`Claude ${inputModel} request failed with ${response.status}: ${await response.text()}`);
+    }
+    const responseText = await response.text();
+    if (responseText !== claudeSseBody) {
+      throw new Error(`Claude ${inputModel} SSE response was modified:\n${responseText}`);
+    }
+    if (responseText.includes("encrypted_content")) {
+      throw new Error(`Claude ${inputModel} SSE response must not receive OpenAI encrypted_content fields`);
+    }
+    if (upstreamRequests.length !== beforeClaudeRequest + 1) {
+      throw new Error(`Claude ${inputModel} request should make one upstream request`);
+    }
+    const claudeRequest = upstreamRequests.at(-1);
+    if (claudeRequest.url !== "/v1/messages?beta=true") {
+      throw new Error(`Claude ${inputModel} request used the wrong upstream path: ${claudeRequest.url}`);
+    }
+    if (claudeRequest.authorization !== "Bearer vsllm-secret" || claudeRequest.apiKey !== undefined) {
+      throw new Error(`Claude ${inputModel} request did not replace local credentials with the active account key`);
+    }
+    if (claudeRequest.anthropicVersion !== "2023-06-01"
+      || claudeRequest.anthropicBeta !== "test-beta-2026-07-17"
+      || claudeRequest.claudeSessionId !== "session-test"
+      || claudeRequest.claudeAgentId !== "agent-test") {
+      throw new Error(`Claude ${inputModel} request headers were not preserved: ${JSON.stringify(claudeRequest)}`);
+    }
+    const claudeBody = JSON.parse(claudeRequest.bodyText);
+    if (claudeBody.model !== "claude-fake-5") {
+      throw new Error(`Claude ${inputModel} should map to claude-fake-5, got ${claudeBody.model}`);
+    }
+    if (claudeBody.system?.[0]?.text !== "Keep the response short." || claudeBody.messages?.[0]?.content !== "Reply with ok.") {
+      throw new Error(`Claude ${inputModel} request body fields were not preserved`);
+    }
+  }
+
+  const modelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}/v1/models?limit=1000`, {
+    headers: {
+      authorization: "Bearer local-claude-marker",
+      "x-api-key": "local-claude-api-key-marker"
+    }
+  });
+  if (modelsResponse.status !== 200) {
+    throw new Error(`Claude gateway model discovery failed with ${modelsResponse.status}: ${await modelsResponse.text()}`);
+  }
+  const models = await modelsResponse.json();
+  if (!models.data?.some((model) => model.id === "claude-fable-5") || !models.data?.some((model) => model.id === "claude-fake-5")) {
+    throw new Error(`Claude gateway model discovery did not preserve VSLLM models: ${JSON.stringify(models)}`);
+  }
+  const modelsRequest = upstreamRequests.at(-1);
+  if (modelsRequest.url !== "/v1/models?limit=1000"
+    || modelsRequest.authorization !== "Bearer vsllm-secret"
+    || modelsRequest.apiKey !== undefined) {
+    throw new Error(`Claude gateway model discovery used incorrect routing or credentials: ${JSON.stringify(modelsRequest)}`);
+  }
+
   const expectedDefaultProxyUrl = `http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}`;
   const expectedVsllm2ProxyUrl = `${expectedDefaultProxyUrl}/accounts/apikey-vsllm-2/v1`;
   const defaultProxyUrl = await runWrapper(["proxy", "url"]);
@@ -942,6 +1063,21 @@ try {
     acceptEncoding: "identity",
     expectEncryptedContent: true,
     expectedModel: "gpt-5.6-terra"
+  });
+  const tcdmxClaudeResponse = await proxyRawRequest(proxyPort, "/v1/messages", {
+    model: "claude-fable-5",
+    max_tokens: 64,
+    stream: true,
+    messages: [{ role: "user", content: "test" }]
+  }, {
+    "anthropic-version": "2023-06-01"
+  });
+  await tcdmxClaudeResponse.text();
+  assertLatestRequest({
+    label: "tcdmx Claude model untouched",
+    bearer: "tcdmx-secret",
+    acceptEncoding: "identity",
+    expectedModel: "claude-fable-5"
   });
   const compactRes2 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestTcdmxReq = upstreamRequests.at(-1);

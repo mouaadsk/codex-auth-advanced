@@ -4,23 +4,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import {
+  kickstartProxyLaunchAgent,
+  proxyLaunchAgentIsLoaded,
+  proxyRuntime
+} from "./proxy-runtime.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.dirname(scriptDir);
 const wrapper = path.join(repoRoot, "bin", "codex-auth-advanced.js");
 const logDir = path.join(repoRoot, "scratch");
 const logFile = path.join(logDir, "proxy.log");
-const proxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
-const proxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
-const proxyPrefix = "/_codex-auth-advanced";
-const formattedProxyHost = proxyHost.includes(":") && !proxyHost.startsWith("[") ? `[${proxyHost}]` : proxyHost;
-const healthUrl = `http://${formattedProxyHost}:${proxyPort}${proxyPrefix}/health`;
+const runtime = proxyRuntime();
+const healthUrl = runtime.healthUrl;
 let lastHealthError = "";
-
-if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
-  console.error(`Invalid CODEX_AUTH_ADVANCED_PROXY_PORT: ${process.env.CODEX_AUTH_ADVANCED_PROXY_PORT}`);
-  process.exit(1);
-}
 
 async function proxyIsRunning() {
   try {
@@ -50,6 +47,17 @@ if (!fs.existsSync(wrapper)) {
 if (await waitForProxy(10, 200)) {
   console.log(`provider proxy: running (${healthUrl})`);
   process.exit(0);
+}
+
+if (proxyLaunchAgentIsLoaded()) {
+  kickstartProxyLaunchAgent();
+  if (await waitForProxy(200, 100)) {
+    console.log(`provider proxy: running (${healthUrl}, managed by launchd)`);
+    process.exit(0);
+  }
+  const managedLog = path.join(process.env.HOME || "~", "Library", "Logs", "codex-auth-advanced", "proxy.error.log");
+  console.error(`launchd provider proxy did not start; last health check: ${lastHealthError}; see ${managedLog}`);
+  process.exit(1);
 }
 
 fs.mkdirSync(logDir, { recursive: true });

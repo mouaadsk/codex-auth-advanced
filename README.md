@@ -3,7 +3,7 @@
 [![latest release](https://img.shields.io/github/v/release/mouaadsk/codex-auth-advanced?sort=semver&label=latest)](https://github.com/mouaadsk/codex-auth-advanced/releases/latest)
 [![latest pre-release](https://img.shields.io/github/v/release/mouaadsk/codex-auth-advanced?include_prereleases&sort=semver&filter=*-*&label=pre-release)](https://github.com/mouaadsk/codex-auth-advanced/releases)
 
-`codex-auth-advanced` manages multiple Codex and OpenAI-compatible API accounts from one local installation. This fork adds a stable loopback provider proxy, managed account groups, API-key switching, pinned routes for secondary clients, VSLLM model routing, exact New API subscription-window tracking, resilient compact requests, and graceful proxy restarts.
+`codex-auth-advanced` manages multiple Codex, Claude Code, and OpenAI-compatible API accounts from one local installation. This fork adds a stable loopback provider proxy, managed account groups, API-key switching, Anthropic Messages compatibility, pinned routes for secondary clients, VSLLM model routing, exact New API subscription-window tracking, resilient compact requests, and graceful proxy restarts.
 
 This repository is maintained as a local macOS checkout. It is not currently published as a general npm release.
 
@@ -17,6 +17,7 @@ This repository is maintained as a local macOS checkout. It is not currently pub
 - [Command Reference](#command-reference)
 - [Account Storage](#account-storage)
 - [Provider Proxy](#provider-proxy)
+- [Claude Code](#claude-code)
 - [VSLLM Integration](#vsllm-integration)
 - [Automatic Switching](#automatic-switching)
 - [OpenClaw and Pinned Routes](#openclaw-and-pinned-routes)
@@ -31,11 +32,13 @@ This repository is maintained as a local macOS checkout. It is not currently pub
 - Store and switch between ChatGPT/Codex authentication snapshots.
 - Store OpenAI-compatible API-key accounts with independent provider URLs.
 - Keep Codex pointed at one stable localhost URL while the active upstream account changes.
+- Point Claude Code at the same proxy through the Anthropic Messages API.
 - Organize accounts into independent `CODEX_HOME` groups.
 - Launch `codext` with the model and reasoning settings from the selected group.
 - Give OpenClaw or another client a route pinned to one API account.
 - Preserve requested models and reasoning effort through the proxy.
 - Route selected Codex model names to VSLLM `pro20x` models.
+- Route Claude Fable 5 selections to the VSLLM pay-per-request `claude-fake-5` model.
 - Send compact requests to the provider-native compact endpoint with a local fallback.
 - Read authoritative VSLLM/New API subscription usage and exact reset timestamps.
 - Retry transient VSLLM usage-limit responses without immediately exhausting an available account.
@@ -55,7 +58,7 @@ The project has four main layers:
 
 3. **Provider proxy**
 
-   The proxy listens on `127.0.0.1:47778` by default. Codex uses a stable local base URL while the proxy reads the active account from its registry for each request.
+   The proxy listens on `127.0.0.1:47778` by default. Codex and Claude Code use stable local base URLs while the proxy reads the active account from its registry for each request.
 
 4. **Background manager**
 
@@ -67,6 +70,7 @@ ChatGPT account switches normally require restarting the Codex client so it relo
 
 - Node.js 22 or newer.
 - The OpenAI Codex CLI for login and normal Codex workflows.
+- Claude Code 2.1.170 or newer when using Fable 5.
 - macOS arm64 for the vendored binary currently included in this checkout.
 
 Install Codex if needed:
@@ -83,7 +87,27 @@ vendor/<platform>-<arch>/bin/
 
 ## Installation
 
-From this checkout:
+The macOS installer is idempotent and can be run directly from a clone:
+
+```shell
+cd /path/to/codex-auth-advanced
+./scripts/install.zsh
+```
+
+It:
+
+1. Runs `npm link` for the local CLI.
+2. Configures Codex when it is installed and an API-key account is active.
+3. Configures Claude Code when it is installed, preserving unrelated settings and creating backups before changes.
+4. Installs a per-user launchd service that starts the proxy at login and restarts it after crashes or graceful reloads.
+
+Preview the actions without changing the system:
+
+```shell
+./scripts/install.zsh --dry-run
+```
+
+For manual CLI-only installation:
 
 ```shell
 cd /path/to/codex-auth-advanced
@@ -103,6 +127,8 @@ Remove the local link with:
 ```shell
 npm uninstall -g codex-auth-advanced
 ```
+
+Windows installation is intentionally postponed; see [`task.md`](task.md).
 
 ## Quick Start
 
@@ -234,6 +260,14 @@ The `default` group maps to `~/.codex`. Additional groups normally live under:
 
 For normal operations, prefer the lifecycle scripts described in [Operations](#operations).
 
+### Client Configuration
+
+| Command | Purpose |
+| --- | --- |
+| `configure [all]` | Configure Codex and Claude Code; `all` is the default when omitted. |
+| `configure codex` | Point Codex at the default proxy route for its active API-key account. |
+| `configure claude` | Merge the Claude Code gateway settings and Fable route into `~/.claude/settings.json`. |
+
 ## Account Storage
 
 The default account files are stored under:
@@ -262,10 +296,10 @@ API account keys are identified internally by a stable SHA-256-derived `account_
 The default proxy route follows the active account in a group:
 
 ```text
-http://127.0.0.1:47778/_codex-auth-advanced/<group-id>/v1
+http://127.0.0.1:47778/_codex-auth-advanced/<group-id>
 ```
 
-When an API account is activated, the root Codex config points its OpenAI base URL at this local route. The real upstream URL remains in the per-account config.
+When an API account is activated, the root Codex config points its OpenAI base URL at this local route. Codex and Claude Code append their wire-protocol paths; the proxy normalizes `/v1` before forwarding. The real upstream URL remains in the per-account config.
 
 ### Pinned Route
 
@@ -309,6 +343,52 @@ The health response includes the proxy start time, restart state, active request
 
 Keep the proxy on loopback unless inbound authentication is added. The proxy route itself is not designed to be exposed directly to a LAN or the internet.
 
+## Claude Code
+
+Configure both installed clients, or select one explicitly:
+
+```shell
+codex-auth-advanced configure
+codex-auth-advanced configure all
+codex-auth-advanced configure codex
+codex-auth-advanced configure claude
+```
+
+The macOS installer configures both installed clients and the launchd service:
+
+```shell
+./scripts/install.zsh
+```
+
+The command backs up an existing `~/.claude/settings.json`, preserves unrelated settings, removes conflicting `ANTHROPIC_API_KEY` authentication, and sets:
+
+```text
+ANTHROPIC_BASE_URL=<default codex-auth-advanced proxy route>
+ANTHROPIC_AUTH_TOKEN=codex-auth-advanced-local-proxy
+ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+The marker token is never used as the VSLLM credential. The proxy removes caller authentication and injects the stored key for the selected account.
+
+Select Fable 5 from an interactive session:
+
+```text
+/model fable
+```
+
+Or select it at startup:
+
+```shell
+claude --model fable
+```
+
+For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. The mapping is not applied to other providers.
+
+Claude Code requests use `/v1/messages?beta=true`; `/v1/messages/count_tokens` and `/v1/models?limit=1000` also pass through. Anthropic beta/version headers, Claude session and agent headers, request fields, error bodies, and SSE events are forwarded without OpenAI response normalization.
+
+If `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is present, Claude Code suppresses gateway model discovery even when discovery is enabled. The configured `/model fable` route still works.
+
 ## VSLLM Integration
 
 ### Model Routing
@@ -323,6 +403,14 @@ For VSLLM accounts, these Codex model names are rewritten before forwarding:
 | `gpt-5.6-luna` | `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
 
 Other model names pass through unchanged.
+
+Claude Code Fable routing is separate from the Codex table:
+
+| Claude Code request | VSLLM request |
+| --- | --- |
+| `fable` | `claude-fake-5` |
+| `fable-5` | `claude-fake-5` |
+| `claude-fable-5` | `claude-fake-5` |
 
 The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
 
@@ -523,7 +611,7 @@ The restart script:
 1. Requests a loopback graceful restart.
 2. Stops accepting new work.
 3. Waits for active requests and upgraded connections to drain.
-4. Starts a detached replacement.
+4. Lets the installed launchd supervisor start the replacement, or starts a detached replacement when no service is installed.
 5. Verifies the replacement health endpoint.
 
 Never use `kill`, `pkill`, or direct process termination to restart the provider proxy. Doing so can cut an in-flight Codex stream and leave the current session blocked.
@@ -532,7 +620,14 @@ If the running proxy predates graceful restart support, the restart script refus
 
 ### Logs
 
-Detached proxy output is written to:
+The macOS launchd service writes output to:
+
+```text
+~/Library/Logs/codex-auth-advanced/proxy.log
+~/Library/Logs/codex-auth-advanced/proxy.error.log
+```
+
+An unmanaged detached proxy writes output to:
 
 ```text
 scratch/proxy.log
@@ -565,6 +660,7 @@ npm test
 The test suite covers:
 
 - Proxy model remapping and reasoning-effort forwarding.
+- Claude Fable routing, Anthropic header forwarding, model discovery, and byte-preserving SSE responses.
 - Native and fallback compaction.
 - Encrypted-content compatibility repair.
 - Pinned account routing.
@@ -573,6 +669,8 @@ The test suite covers:
 - Graceful restart draining.
 - Dashboard-token storage and masked-key account discovery.
 - Exact subscription reset and multi-window usage persistence.
+- Idempotent macOS client/service installation.
+- launchd-managed graceful proxy replacement.
 
 ## Troubleshooting
 
@@ -667,6 +765,7 @@ Use of automated account or usage APIs can carry provider policy and account-res
 ## Current Limitations
 
 - This checkout currently vendors only the macOS arm64 native binary.
+- Automated system installation currently supports macOS only; Windows service and client setup are postponed.
 - Auto-switching is still considered experimental.
 - The VSLLM model-tier policy is hardcoded to `pro20x`; account-level normal/pro20x selection is postponed.
 - A newly reset fallback account becomes eligible but does not trigger automatic failback while the active account remains usable.

@@ -20,6 +20,7 @@ const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
 const providerProxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
 const providerProxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
 const providerProxyPrefix = "/_codex-auth-advanced";
+const claudeProxyAuthMarker = "codex-auth-advanced-local-proxy";
 const vsllmTransientUsageLimitMaxRetries = 1;
 const vsllmTransientUsageLimitRetryDelayMs = 500;
 const chatgptCodexBaseUrl = process.env.CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api/codex";
@@ -1327,6 +1328,9 @@ function normalizeProxyModelAlias(model) {
 function remappedVsllmModel(model, { compact = false } = {}) {
   const normalized = normalizeProxyModelAlias(model);
   const aliases = {
+    "fable": "claude-fake-5",
+    "fable-5": "claude-fake-5",
+    "claude-fable-5": "claude-fake-5",
     "gpt-5.6-sol": "gpt-5.6-sol-pro20x",
     "gpt-5.6-terra": "gpt-5.6-terra-pro20x",
     "gpt-5.6-luna": "gpt-5.6-luna-pro20x"
@@ -1927,6 +1931,7 @@ function sanitizeProxyRequestHeaders(headers, target, { websocket = false, omitC
     if (!websocket && (lower === "connection" || lower === "upgrade")) continue;
     if (lower === "accept-encoding" && websocket) continue;
     if (!target.chatgpt) {
+      if (lower === "authorization" || lower === "x-api-key") continue;
       if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-") || (!websocket && lower.startsWith("sec-"))) continue;
     } else if (lower === "authorization" || lower === "x-authorization") {
       continue;
@@ -2994,8 +2999,9 @@ async function handleProviderProxyRequest(req, res) {
       responseStream = responseStream.pipe(zlib.createBrotliDecompress());
     }
     const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
-    const isStream = contentType.includes("event-stream") || isCompactProxyTarget(target) || isResponsesProxyTarget(target);
-    const diagnostics = isStream ? createStreamDiagnostics(target, req.url) : null;
+    const shouldTransformOpenAiResponse = !target.chatgpt
+      && (isCompactProxyTarget(target) || isResponsesProxyTarget(target));
+    const diagnostics = shouldTransformOpenAiResponse ? createStreamDiagnostics(target, req.url) : null;
     let diagnosticsFinished = false;
     const finishDiagnostics = (reason) => {
       if (!diagnostics || diagnosticsFinished) return;
@@ -3003,7 +3009,7 @@ async function handleProviderProxyRequest(req, res) {
       diagnostics.finish(reason);
     };
     responseStream.on("error", () => finishDiagnostics("source_error"));
-    if (!target.chatgpt && isStream) {
+    if (shouldTransformOpenAiResponse) {
       responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream"), diagnostics));
     }
     responseStream.on("end", () => finishDiagnostics("end"));
@@ -4575,27 +4581,157 @@ function removeTomlTopLevelKeyAndSection(toml, topLevelKeys, sections) {
   return `${out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
 
-function ensureActiveAccountConfig(codexHome, registry = readJsonFile(registryPath(codexHome))) {
-  if (!registry?.active_account_key) return;
-
-  const configPath = rootConfigPath(codexHome);
-  let current = "";
-  try {
-    current = fs.readFileSync(configPath, "utf8");
-  } catch {
-    return;
+function ensureActiveAccountConfig(codexHome, registry = readJsonFile(registryPath(codexHome)), options = {}) {
+  const active = activeRegistryAccountFromRegistry(registry);
+  if (!active || active.auth_mode !== "apikey") {
+    return { configured: false, changed: false, reason: active ? "active_account_is_not_api_key" : "no_active_account" };
   }
 
-  const next = upsertOpenAiProviderConfig(current, providerProxyBaseUrl(codexHome));
+  const accountConfig = readTextFile(accountConfigPath(codexHome, active.account_key));
+  const configPath = rootConfigPath(codexHome);
+  const current = readTextFile(configPath);
+  if (!current.trim() && !accountConfig.trim()) {
+    return { configured: false, changed: false, reason: "missing_codex_config" };
+  }
+
+  const next = apiKeyProxyConfig(codexHome, accountConfig, current);
   if (next !== current) {
+    ensureDir(path.dirname(configPath));
+    if (options.backup === true) backupIfExists(configPath);
     writeTextFilePrivate(configPath, next, 0o600);
   }
+  return {
+    configured: true,
+    changed: next !== current,
+    account: active,
+    configPath,
+    baseUrl: providerProxyBaseUrl(codexHome)
+  };
 }
 
 function ensureAllActiveAccountConfigs() {
   for (const group of loadManagedRegistryRecords()) {
     ensureActiveAccountConfig(group.codexHome, group.registry);
   }
+}
+
+function claudeSettingsPath() {
+  return path.join(userHome(), ".claude", "settings.json");
+}
+
+function isClaudeModelSelection(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/\[1m\]$/, "");
+  return ["default", "best", "fable", "opus", "sonnet", "haiku", "opusplan"].includes(normalized)
+    || normalized.startsWith("claude-")
+    || normalized.startsWith("anthropic-");
+}
+
+function configureClaudeCodeClient(codexHome) {
+  const settingsPath = claudeSettingsPath();
+  const existingText = readTextFile(settingsPath);
+  let settings = {};
+  if (existingText.trim()) {
+    try {
+      settings = JSON.parse(existingText);
+    } catch (error) {
+      throw new Error(`Claude Code settings are not valid JSON at ${settingsPath}: ${error?.message || error}`);
+    }
+    if (!settings || Array.isArray(settings) || typeof settings !== "object") {
+      throw new Error(`Claude Code settings must contain a JSON object at ${settingsPath}.`);
+    }
+  }
+
+  const previousBaseUrl = typeof settings.env?.ANTHROPIC_BASE_URL === "string"
+    ? settings.env.ANTHROPIC_BASE_URL.trim()
+    : "";
+  const env = settings.env && !Array.isArray(settings.env) && typeof settings.env === "object"
+    ? { ...settings.env }
+    : {};
+  const removedModelOverrides = [];
+  if (previousBaseUrl && previousBaseUrl !== providerProxyBaseUrl(codexHome)) {
+    for (const key of [
+      "ANTHROPIC_MODEL",
+      "ANTHROPIC_SMALL_FAST_MODEL",
+      "ANTHROPIC_DEFAULT_FABLE_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "CLAUDE_CODE_SUBAGENT_MODEL"
+    ]) {
+      if (env[key] != null && !isClaudeModelSelection(env[key])) {
+        removedModelOverrides.push(key);
+        delete env[key];
+      }
+    }
+  }
+
+  delete env.ANTHROPIC_API_KEY;
+  env.ANTHROPIC_BASE_URL = providerProxyBaseUrl(codexHome);
+  env.ANTHROPIC_AUTH_TOKEN = claudeProxyAuthMarker;
+  env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5";
+  env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
+  settings.env = env;
+
+  const nextText = `${JSON.stringify(settings, null, 2)}\n`;
+  if (nextText !== existingText) {
+    ensureDir(path.dirname(settingsPath));
+    backupIfExists(settingsPath);
+    writeTextFilePrivate(settingsPath, nextText, 0o600);
+  }
+
+  return {
+    configured: true,
+    changed: nextText !== existingText,
+    settingsPath,
+    baseUrl: env.ANTHROPIC_BASE_URL,
+    removedModelOverrides,
+    discoverySuppressed: String(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "") === "1"
+  };
+}
+
+async function maybeHandleClientConfigure(argv) {
+  const direct = argv[0] === "configure";
+  const compatibilityAlias = argv[0] === "client" && argv[1] === "configure";
+  if (!direct && !compatibilityAlias) return false;
+  const args = direct ? argv.slice(1) : argv.slice(2);
+  if (args[0] === "--help" || args[0] === "-h") {
+    process.stdout.write([
+      "Usage: codex-auth-advanced configure [all|codex|claude]",
+      "",
+      "  all      Configure Codex and Claude Code (default).",
+      "  codex    Configure Codex to use the active account through the local proxy.",
+      "  claude   Configure Claude Code to use the Anthropic gateway and Fable route.",
+      ""
+    ].join("\n"));
+    return true;
+  }
+  const target = args[0] || "all";
+  if (args.length > 1 || !["all", "codex", "claude"].includes(target)) {
+    console.error("Usage: codex-auth-advanced configure [all|codex|claude]");
+    process.exit(1);
+  }
+
+  const codexHome = defaultCodexHome();
+  if (target === "all" || target === "codex") {
+    const result = ensureActiveAccountConfig(codexHome, readJsonFile(registryPath(codexHome)), { backup: true });
+    if (result.configured) {
+      process.stdout.write(`Codex: ${result.changed ? "configured" : "already configured"} for ${accountLabel(result.account)} at ${result.baseUrl}.\n`);
+    } else {
+      process.stdout.write(`Codex: skipped (${result.reason.replaceAll("_", " ")}).\n`);
+    }
+  }
+
+  if (target === "all" || target === "claude") {
+    const result = configureClaudeCodeClient(codexHome);
+    process.stdout.write(`Claude Code: ${result.changed ? "configured" : "already configured"} at ${result.baseUrl}.\n`);
+    if (result.removedModelOverrides.length > 0) {
+      process.stdout.write(`Claude Code: removed stale model overrides: ${result.removedModelOverrides.join(", ")}.\n`);
+    }
+    if (result.discoverySuppressed) {
+      process.stdout.write("Claude Code: gateway model discovery remains disabled by CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; /model fable still uses the configured Fable route.\n");
+    }
+  }
+  return true;
 }
 
 async function ensureProviderProxyForActiveApiAccounts() {
@@ -4950,6 +5086,29 @@ function maybePrintPreviewVersion(argv) {
   return true;
 }
 
+function patchTopLevelHelp(output) {
+  const command = "  configure [all|codex|claude]                                                  Configure Codex and/or Claude Code to use the local proxy";
+  if (output.includes(command)) return output;
+  const notes = "\nNotes:\n";
+  if (output.includes(notes)) return output.replace(notes, `${command}\n${notes}`);
+  return `${output.trimEnd()}\n${command}\n`;
+}
+
+function maybeRunTopLevelHelp(binaryPath, argv) {
+  if (argv.length !== 1 || !["--help", "-h"].includes(argv[0])) return false;
+  const child = spawnSync(binaryPath, argv, {
+    stdio: ["inherit", "pipe", "pipe"],
+    encoding: "utf8",
+    env: childEnvForArgv(argv)
+  });
+  const helpOutput = child.stdout ? patchTopLevelHelp(child.stdout) : "";
+  if (helpOutput) process.stdout.write(helpOutput);
+  if (helpOutput.includes("\nCommands:\n") || helpOutput.includes("Usage:")) return true;
+  if (child.stderr) process.stderr.write(child.stderr);
+  exitFromChild(child);
+  return true;
+}
+
 if (maybePrintPreviewVersion(process.argv.slice(2))) {
   process.exit(0);
 }
@@ -5252,6 +5411,9 @@ if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-V")) {
   });
   exitFromChild(child);
 }
+if (maybeRunTopLevelHelp(binaryPath, argv)) {
+  process.exit(0);
+}
 const apiSpendLimitImportInfo = importCommandInfo(argv);
 
 if (parsedApiSpendLimitArgs.found && !apiSpendLimitImportInfo) {
@@ -5260,6 +5422,10 @@ if (parsedApiSpendLimitArgs.found && !apiSpendLimitImportInfo) {
 }
 
 if (await maybeHandleProviderProxy(argv)) {
+  process.exit(0);
+}
+
+if (await maybeHandleClientConfigure(argv)) {
   process.exit(0);
 }
 

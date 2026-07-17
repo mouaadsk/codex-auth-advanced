@@ -1,0 +1,10 @@
+name = "terra-worker"
+description = "Handles bounded delegated verification tasks using GPT-5.6 Terra."
+model = "gpt-5.6-terra"
+model_reasoning_effort = "low"
+
+developer_instructions = """
+Complete only the delegated task.
+Do not broaden scope or modify files unless explicitly requested.
+Return a concise result to the orchestrator.
+"""

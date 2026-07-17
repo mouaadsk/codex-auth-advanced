@@ -4,22 +4,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import { proxyLaunchAgentIsLoaded, proxyRuntime } from "./proxy-runtime.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.dirname(scriptDir);
 const startScript = path.join(scriptDir, "start-proxy.mjs");
-const proxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
-const proxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
-const proxyPrefix = "/_codex-auth-advanced";
-const formattedProxyHost = proxyHost.includes(":") && !proxyHost.startsWith("[") ? `[${proxyHost}]` : proxyHost;
-const proxyBaseUrl = `http://${formattedProxyHost}:${proxyPort}${proxyPrefix}`;
-const healthUrl = `${proxyBaseUrl}/health`;
-const restartUrl = `${proxyBaseUrl}/restart`;
-
-if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
-  console.error(`Invalid CODEX_AUTH_ADVANCED_PROXY_PORT: ${process.env.CODEX_AUTH_ADVANCED_PROXY_PORT}`);
-  process.exit(1);
-}
+const runtime = proxyRuntime();
+const healthUrl = runtime.healthUrl;
+const restartUrl = runtime.restartUrl;
 
 async function readHealth() {
   try {
@@ -33,6 +25,21 @@ async function readHealth() {
 
 async function waitForProxyStop() {
   while (await readHealth()) {
+    await sleep(150);
+  }
+}
+
+async function waitForManagedProxyReplacement(previousStartedAtMs) {
+  let stoppedAtMs = null;
+  while (true) {
+    const health = await readHealth();
+    if (health && health.started_at_ms !== previousStartedAtMs) return health;
+    if (!health) {
+      if (stoppedAtMs == null) stoppedAtMs = Date.now();
+      if (Date.now() - stoppedAtMs > 20000) {
+        throw new Error(`launchd did not restore the provider proxy after graceful shutdown (${healthUrl})`);
+      }
+    }
     await sleep(150);
   }
 }
@@ -89,8 +96,15 @@ if (!healthBeforeRestart) {
   process.exit(0);
 }
 
+const managedByLaunchd = proxyLaunchAgentIsLoaded();
 const restart = await requestGracefulRestart();
 console.log(`provider proxy: draining ${restart.active_requests ?? 0} active request(s) and ${restart.active_upgrades ?? 0} active upgrade(s)`);
+if (managedByLaunchd) {
+  await waitForManagedProxyReplacement(healthBeforeRestart.started_at_ms);
+  console.log(`provider proxy: restarted (${healthUrl}, managed by launchd)`);
+  process.exit(0);
+}
+
 await waitForProxyStop();
 await runStartScript();
 

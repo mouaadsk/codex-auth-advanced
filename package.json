@@ -2,7 +2,7 @@
   "name": "codex-auth-advanced",
   "version": "0.3.0-alpha.2",
   "type": "module",
-  "description": "CLI for switching Codex accounts",
+  "description": "Multi-account Codex and Claude Code provider proxy with resilient routing",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,12 +17,14 @@
   },
   "files": [
     "bin/",
+    "scripts/",
     "vendor/",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "test": "node --check bin/codex-auth-advanced-wrapper.js && node --check scripts/start-proxy.mjs && node --check scripts/restart-proxy.mjs && node --check test-provider-proxy-compact.mjs && node --check test-vsllm-dashboard.mjs && node test-provider-proxy-compact.mjs && node test-vsllm-dashboard.mjs"
+    "setup:macos": "node scripts/install-macos.mjs",
+    "test": "node --check bin/codex-auth-advanced-wrapper.js && node --check scripts/proxy-runtime.mjs && node --check scripts/start-proxy.mjs && node --check scripts/restart-proxy.mjs && node --check scripts/run-proxy-service.mjs && node --check scripts/install-macos.mjs && node --check test-provider-proxy-compact.mjs && node --check test-vsllm-dashboard.mjs && node --check test-install-macos.mjs && node --check test-proxy-service.mjs && node test-provider-proxy-compact.mjs && node test-vsllm-dashboard.mjs && node test-install-macos.mjs && node test-proxy-service.mjs"
   },
   "publishConfig": {
     "access": "public"
