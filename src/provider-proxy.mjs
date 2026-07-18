@@ -13,9 +13,11 @@ import {
   isInvalidEncryptedContentBody
 } from "./provider-policy.mjs";
 import {
+  claudeGatewayModelsResponse,
   createSseResponseTransformStream,
   createStreamDiagnostics,
   dummyCompactionResponse,
+  isClaudeGatewayModelsRequest,
   isCompactProxyTarget,
   isResponsesProxyTarget,
   repairProviderProxyBodyPlaintext,
@@ -594,6 +596,15 @@ export function createProviderProxy(options) {
     }
 
     try {
+      if ((req.method || "GET") === "GET" && isClaudeGatewayModelsRequest(target, req.headers)) {
+        const catalog = claudeGatewayModelsResponse();
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(catalog)
+        });
+        res.end(catalog);
+        return;
+      }
       console.log(`[Proxy Request] ${req.method} ${req.url} -> target: ${target.url}`);
       let body = await readProxyRequestBody(req);
       let upstream = null;
@@ -859,4 +870,3 @@ export function createProviderProxy(options) {
     ensureRunning: ensureProviderProxyRunning
   };
 }
-

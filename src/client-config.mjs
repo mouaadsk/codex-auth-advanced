@@ -108,6 +108,10 @@ export function createClientConfigService({ providerProxy, accountService, claud
       }
     }
 
+    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL === "kimi-k3") delete env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL === "grok-4.5") delete env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+    const removedDiscoverySuppression = String(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "") === "1";
+    if (removedDiscoverySuppression) delete env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
     delete env.ANTHROPIC_API_KEY;
     env.ANTHROPIC_BASE_URL = providerProxyBaseUrl(codexHome);
     env.ANTHROPIC_AUTH_TOKEN = claudeProxyAuthMarker;
@@ -128,7 +132,7 @@ export function createClientConfigService({ providerProxy, accountService, claud
       settingsPath,
       baseUrl: env.ANTHROPIC_BASE_URL,
       removedModelOverrides,
-      discoverySuppressed: String(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "") === "1"
+      removedDiscoverySuppression
     };
   }
 
@@ -170,8 +174,8 @@ export function createClientConfigService({ providerProxy, accountService, claud
       if (result.removedModelOverrides.length > 0) {
         process.stdout.write(`Claude Code: removed stale model overrides: ${result.removedModelOverrides.join(", ")}.\n`);
       }
-      if (result.discoverySuppressed) {
-        process.stdout.write("Claude Code: gateway model discovery remains disabled by CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; /model fable still uses the configured Fable route.\n");
+      if (result.removedDiscoverySuppression) {
+        process.stdout.write("Claude Code: removed CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 so gateway models can appear in /model.\n");
       }
     }
     return true;
@@ -195,4 +199,3 @@ export function createClientConfigService({ providerProxy, accountService, claud
     ensureProviderProxyForActiveApiAccounts
   };
 }
-

@@ -209,7 +209,7 @@ for (const stale of [
 ]) {
   if (claudeSettings.env[stale] != null) throw new Error(`Claude settings retained stale ${stale}`);
 }
-if (claudeSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC !== "1"
+if (claudeSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC != null
   || claudeSettings.env.CUSTOM_SETTING_TO_KEEP !== "yes") {
   throw new Error(`Claude settings lost preserved environment values: ${JSON.stringify(claudeSettings.env)}`);
 }

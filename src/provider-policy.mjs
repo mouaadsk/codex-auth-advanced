@@ -1,4 +1,36 @@
 const vsllmDefaultSpendWindowMinutes = 480;
+const claudeGatewayModelPrefix = "claude-fable-5-dd-";
+
+function reversedModelId(value) {
+  return [...value].reverse().join("");
+}
+
+function splitClaudeGatewayModelSuffix(value) {
+  let base = value;
+  let suffix = "";
+  while (true) {
+    const match = base.match(/(\[1m\]|\([^()]+\))$/i);
+    if (!match) break;
+    suffix = `${match[0]}${suffix}`;
+    base = base.slice(0, -match[0].length);
+  }
+  return { base, suffix };
+}
+
+export function encodedClaudeGatewayModelId(model) {
+  const id = String(model || "").trim();
+  if (!id || /^(claude|anthropic)/i.test(id)) return id;
+  return `${claudeGatewayModelPrefix}${reversedModelId(id)}`;
+}
+
+export function resolvedClaudeGatewayModelId(model) {
+  const id = String(model || "").trim();
+  const { base, suffix } = splitClaudeGatewayModelSuffix(id);
+  if (!base.startsWith(claudeGatewayModelPrefix)) return id;
+  const encoded = base.slice(claudeGatewayModelPrefix.length);
+  if (!encoded) return id;
+  return `${reversedModelId(encoded)}${suffix}`;
+}
 
 export function firstFinite(...values) {
   for (const value of values) {
@@ -320,6 +352,7 @@ function remappedVsllmModel(model, { compact = false } = {}) {
     "fable": "claude-fake-5",
     "fable-5": "claude-fake-5",
     "claude-fable-5": "claude-fake-5",
+    "grok-4.5[1m]": "grok-4.5",
     "gpt-5.6-sol": "gpt-5.6-sol-pro20x",
     "gpt-5.6-terra": "gpt-5.6-terra-pro20x",
     "gpt-5.6-luna": "gpt-5.6-luna-pro20x"

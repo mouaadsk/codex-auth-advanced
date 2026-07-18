@@ -83,7 +83,11 @@ const upstream = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       data: [
         { id: "claude-fable-5", display_name: "Claude Fable 5" },
-        { id: "claude-fake-5", display_name: "Claude Fake 5" }
+        { id: "claude-fake-5", display_name: "Claude Fake 5" },
+        { id: "kimi-k3", display_name: "Kimi K3" },
+        { id: "kimi-k3[1m]", display_name: "Kimi K3 1M" },
+        { id: "grok-4.5", display_name: "Grok 4.5" },
+        { id: "gpt-5.5", display_name: "GPT 5.5" }
       ]
     }));
     return;
@@ -796,8 +800,17 @@ try {
     });
   }
 
-  const claudeModelAliases = ["fable", "fable-5", "claude-fable-5"];
-  for (const inputModel of claudeModelAliases) {
+  const claudeModelRoutes = [
+    { inputModel: "fable", expectedModel: "claude-fake-5" },
+    { inputModel: "fable-5", expectedModel: "claude-fake-5" },
+    { inputModel: "claude-fable-5", expectedModel: "claude-fake-5" },
+    { inputModel: "grok-4.5[1m]", expectedModel: "grok-4.5" },
+    { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3[1m]" },
+    { inputModel: "claude-fable-5-dd-3k-imik", expectedModel: "kimi-k3" },
+    { inputModel: "claude-fable-5-dd-5.4-korg", expectedModel: "grok-4.5" },
+    { inputModel: "claude-fable-5-dd-5.4-korg[1m]", expectedModel: "grok-4.5" }
+  ];
+  for (const { inputModel, expectedModel } of claudeModelRoutes) {
     const beforeClaudeRequest = upstreamRequests.length;
     const response = await proxyRawRequest(proxyPort, "/v1/messages?beta=true", {
       model: inputModel,
@@ -840,32 +853,51 @@ try {
       throw new Error(`Claude ${inputModel} request headers were not preserved: ${JSON.stringify(claudeRequest)}`);
     }
     const claudeBody = JSON.parse(claudeRequest.bodyText);
-    if (claudeBody.model !== "claude-fake-5") {
-      throw new Error(`Claude ${inputModel} should map to claude-fake-5, got ${claudeBody.model}`);
+    if (claudeBody.model !== expectedModel) {
+      throw new Error(`Claude ${inputModel} should map to ${expectedModel}, got ${claudeBody.model}`);
     }
     if (claudeBody.system?.[0]?.text !== "Keep the response short." || claudeBody.messages?.[0]?.content !== "Reply with ok.") {
       throw new Error(`Claude ${inputModel} request body fields were not preserved`);
     }
   }
 
+  const beforeClaudeModelsRequest = upstreamRequests.length;
   const modelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}/v1/models?limit=1000`, {
     headers: {
       authorization: "Bearer local-claude-marker",
-      "x-api-key": "local-claude-api-key-marker"
+      "x-api-key": "local-claude-api-key-marker",
+      "anthropic-version": "2023-06-01",
+      "user-agent": "claude-cli/2.1.201"
     }
   });
   if (modelsResponse.status !== 200) {
     throw new Error(`Claude gateway model discovery failed with ${modelsResponse.status}: ${await modelsResponse.text()}`);
   }
   const models = await modelsResponse.json();
-  if (!models.data?.some((model) => model.id === "claude-fable-5") || !models.data?.some((model) => model.id === "claude-fake-5")) {
-    throw new Error(`Claude gateway model discovery did not preserve VSLLM models: ${JSON.stringify(models)}`);
+  const kimiModel = models.data?.find((model) => model.id === "claude-fable-5-dd-3k-imik");
+  const grokModel = models.data?.find((model) => model.id === "claude-fable-5-dd-5.4-korg");
+  if (models.has_more !== false
+    || kimiModel?.display_name !== "kimi-k3"
+    || grokModel?.display_name !== "grok-4.5"
+    || models.data?.length !== 2) {
+    throw new Error(`Claude gateway model discovery did not expose the independent VSLLM models: ${JSON.stringify(models)}`);
   }
-  const modelsRequest = upstreamRequests.at(-1);
-  if (modelsRequest.url !== "/v1/models?limit=1000"
-    || modelsRequest.authorization !== "Bearer vsllm-secret"
-    || modelsRequest.apiKey !== undefined) {
-    throw new Error(`Claude gateway model discovery used incorrect routing or credentials: ${JSON.stringify(modelsRequest)}`);
+  if (upstreamRequests.length !== beforeClaudeModelsRequest) {
+    throw new Error("Claude gateway model discovery should be served locally without waiting for VSLLM");
+  }
+
+  const plainModelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}/v1/models?limit=1000`, {
+    headers: { authorization: "Bearer local-codex-marker" }
+  });
+  const plainModels = await plainModelsResponse.json();
+  if (!plainModels.data?.some((model) => model.id === "gpt-5.5")
+    || !plainModels.data?.some((model) => model.id === "kimi-k3")) {
+    throw new Error(`non-Claude model discovery should remain pass-through: ${JSON.stringify(plainModels)}`);
+  }
+  const plainModelsRequest = upstreamRequests.at(-1);
+  if (plainModelsRequest?.url !== "/v1/models?limit=1000"
+    || plainModelsRequest?.authorization !== "Bearer vsllm-secret") {
+    throw new Error(`non-Claude model discovery used incorrect upstream routing: ${JSON.stringify(plainModelsRequest)}`);
   }
 
   const expectedDefaultProxyUrl = `http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}`;

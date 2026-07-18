@@ -283,7 +283,7 @@ For normal operations, prefer the lifecycle scripts described in [Operations](#o
 | --- | --- |
 | `configure [all]` | Configure Codex and Claude Code; `all` is the default when omitted. |
 | `configure codex` | Point Codex at the default proxy route for its active API-key account. |
-| `configure claude` | Merge the Claude Code gateway settings and Fable route into `~/.claude/settings.json`. |
+| `configure claude` | Merge the Claude Code gateway settings and independent VSLLM model discovery into `~/.claude/settings.json`. |
 
 ## Account Storage
 
@@ -386,25 +386,35 @@ ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-The marker token is never used as the VSLLM credential. The proxy removes caller authentication and injects the stored key for the selected account.
+The command also removes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` when present because that setting suppresses Claude Code's gateway model discovery. The marker token is never used as the VSLLM credential. The proxy removes caller authentication and injects the stored key for the selected account.
 
-Select Fable 5 from an interactive session:
+Open the interactive model picker:
 
 ```text
-/model fable
+/model
 ```
 
-Or select it at startup:
+The picker includes independent gateway entries:
+
+| Picker entry | VSLLM model |
+| --- | --- |
+| `kimi-k3` | `kimi-k3` |
+| `grok-4.5` | `grok-4.5` |
+| `fable` | `claude-fake-5` |
+
+Kimi K3 and Grok 4.5 no longer replace Claude's Sonnet or Opus tiers. Claude Code only accepts discovered model IDs beginning with `claude` or `anthropic`, so the proxy advertises reversible internal IDs while displaying the exact `kimi-k3` and `grok-4.5` names. The internal ID is decoded before the Anthropic request is forwarded to VSLLM.
+
+Fable can still be selected directly:
 
 ```shell
 claude --model fable
 ```
 
-For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. The mapping is not applied to other providers.
+For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. Kimi K3 and Grok 4.5 use their VSLLM catalog IDs. If Claude Code appends its `[1m]` context suffix to Grok 4.5, the proxy removes it because VSLLM advertises only `grok-4.5`; `kimi-k3[1m]` remains unchanged because it is a real VSLLM model ID. These mappings are not applied to other providers.
 
-Claude Code requests use `/v1/messages?beta=true`; `/v1/messages/count_tokens` and `/v1/models?limit=1000` also pass through. Anthropic beta/version headers, Claude session and agent headers, request fields, error bodies, and SSE events are forwarded without OpenAI response normalization.
+Claude Code requests use `/v1/messages?beta=true`; `/v1/messages/count_tokens` passes through unchanged. For a VSLLM route, the proxy answers Claude's `/v1/models?limit=1000` request locally with Kimi K3 and Grok 4.5 under reversible Claude-compatible IDs, avoiding the gateway discovery timeout caused by a slow upstream catalog. Non-Claude model catalog requests still pass through to the provider. Anthropic beta/version headers, Claude session and agent headers, request fields, error bodies, and SSE events are forwarded without OpenAI response normalization.
 
-If `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is present, Claude Code suppresses gateway model discovery even when discovery is enabled. The configured `/model fable` route still works.
+Do not restore `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` if the independent gateway models must remain visible in `/model`.
 
 ## VSLLM Integration
 
@@ -428,6 +438,7 @@ Claude Code Fable routing is separate from the Codex table:
 | `fable` | `claude-fake-5` |
 | `fable-5` | `claude-fake-5` |
 | `claude-fable-5` | `claude-fake-5` |
+| `grok-4.5[1m]` | `grok-4.5` |
 
 The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
 

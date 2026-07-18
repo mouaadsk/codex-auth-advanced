@@ -27,8 +27,10 @@ import { modelsEndpointFromBaseUrl, normalizeProviderOrigin } from "./src/provid
 import {
   apiProviderExhaustionReason,
   apiProviderTransientRetryReason,
+  encodedClaudeGatewayModelId,
   parseVsllmSubscriptionSelf,
   remappedProxyRequestModel,
+  resolvedClaudeGatewayModelId,
   rollingApiSpendFromTotal
 } from "./src/provider-policy.mjs";
 import {
@@ -153,6 +155,18 @@ try {
     remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }, { compact: true }),
     "gpt-5.5-pro20x-openai-compact"
   );
+  assert.equal(
+    remappedProxyRequestModel("grok-4.5[1m]", { account: vsllmAccount }),
+    "grok-4.5"
+  );
+  assert.equal(
+    remappedProxyRequestModel("kimi-k3[1m]", { account: vsllmAccount }),
+    null
+  );
+  assert.equal(encodedClaudeGatewayModelId("kimi-k3"), "claude-fable-5-dd-3k-imik");
+  assert.equal(encodedClaudeGatewayModelId("grok-4.5"), "claude-fable-5-dd-5.4-korg");
+  assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik"), "kimi-k3");
+  assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-5.4-korg[1m]"), "grok-4.5[1m]");
 
   const rolling = rollingApiSpendFromTotal({
     api_spend_window: {
