@@ -1,6 +1,7 @@
 import path from "node:path";
 import { upsertModelCatalogConfig } from "./codex-config.mjs";
 import { ensureCodexAuthAdvancedModelCatalog } from "./codex-model-catalog.mjs";
+import { encodedClaudeGatewayModelId } from "./provider-policy.mjs";
 import {
   accountConfigPath,
   backupIfExists,
@@ -101,6 +102,14 @@ export function createClientConfigService({ providerProxy, accountService, claud
     const env = settings.env && !Array.isArray(settings.env) && typeof settings.env === "object"
       ? { ...settings.env }
       : {};
+    const legacyKimiModel = encodedClaudeGatewayModelId("kimi-k3");
+    const kimi1mModel = `${legacyKimiModel}[1m]`;
+    if (["kimi-k3", legacyKimiModel].includes(String(settings.model || "").trim())) {
+      settings.model = kimi1mModel;
+    }
+    if (["kimi-k3", legacyKimiModel].includes(String(env.ANTHROPIC_MODEL || "").trim())) {
+      env.ANTHROPIC_MODEL = kimi1mModel;
+    }
     const removedModelOverrides = [];
     if (previousBaseUrl && previousBaseUrl !== providerProxyBaseUrl(codexHome)) {
       for (const key of [

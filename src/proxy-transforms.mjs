@@ -12,7 +12,8 @@ const claudeGatewayVsllmModels = new Map([
     displayName: "kimi-k3",
     description: "Kimi K3 through VSLLM",
     ownedBy: "moonshot",
-    maxInputTokens: 262144,
+    contextSuffix: "[1m]",
+    maxInputTokens: 1000000,
     maxTokens: 65536
   }],
   ["grok-4.5", {
@@ -42,7 +43,7 @@ export function isClaudeGatewayModelsRequest(target, headers = {}) {
 
 export function claudeGatewayModelsResponse() {
   const models = [...claudeGatewayVsllmModels.entries()].map(([id, metadata]) => ({
-      id: encodedClaudeGatewayModelId(id),
+      id: `${encodedClaudeGatewayModelId(id)}${metadata.contextSuffix || ""}`,
       object: "model",
       owned_by: metadata.ownedBy,
       type: "model",

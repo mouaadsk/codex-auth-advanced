@@ -200,11 +200,12 @@ try {
   );
   assert.equal(
     remappedProxyRequestModel("kimi-k3[1m]", { account: vsllmAccount }),
-    null
+    "kimi-k3"
   );
   assert.equal(encodedClaudeGatewayModelId("kimi-k3"), "claude-fable-5-dd-3k-imik");
   assert.equal(encodedClaudeGatewayModelId("grok-4.5"), "claude-fable-5-dd-5.4-korg");
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik"), "kimi-k3");
+  assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik[1m]"), "kimi-k3[1m]");
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-5.4-korg[1m]"), "grok-4.5[1m]");
 
   const rolling = rollingApiSpendFromTotal({

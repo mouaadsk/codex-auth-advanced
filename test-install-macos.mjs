@@ -78,6 +78,7 @@ fs.writeFileSync(path.join(accountsDir, "registry.json"), JSON.stringify({
 
 const originalClaudeSettings = {
   effortLevel: "high",
+  model: "claude-fable-5-dd-3k-imik",
   env: {
     ANTHROPIC_BASE_URL: "https://old-gateway.example/anthropic",
     ANTHROPIC_AUTH_TOKEN: "old-token",
@@ -228,6 +229,9 @@ const claudeSettingsPath = path.join(claudeDir, "settings.json");
 const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf8"));
 if (claudeSettings.effortLevel !== "high" || claudeSettings.enabledPlugins?.example !== true) {
   throw new Error(`Claude settings lost unrelated values: ${JSON.stringify(claudeSettings)}`);
+}
+if (claudeSettings.model !== "claude-fable-5-dd-3k-imik[1m]") {
+  throw new Error(`Claude Kimi selection was not migrated to 1M context: ${JSON.stringify(claudeSettings)}`);
 }
 if (claudeSettings.env.ANTHROPIC_BASE_URL !== expectedBaseUrl
   || claudeSettings.env.ANTHROPIC_AUTH_TOKEN !== "codex-auth-advanced-local-proxy"

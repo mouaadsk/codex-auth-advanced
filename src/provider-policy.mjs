@@ -352,6 +352,7 @@ function remappedVsllmModel(model, { compact = false } = {}) {
     "fable": "claude-fake-5",
     "fable-5": "claude-fake-5",
     "claude-fable-5": "claude-fake-5",
+    "kimi-k3[1m]": "kimi-k3",
     "grok-4.5[1m]": "grok-4.5"
   };
   if (aliases[normalized]) return aliases[normalized];

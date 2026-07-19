@@ -85,7 +85,6 @@ const upstream = http.createServer(async (req, res) => {
         { id: "claude-fable-5", display_name: "Claude Fable 5" },
         { id: "claude-fake-5", display_name: "Claude Fake 5" },
         { id: "kimi-k3", display_name: "Kimi K3" },
-        { id: "kimi-k3[1m]", display_name: "Kimi K3 1M" },
         { id: "grok-4.5", display_name: "Grok 4.5" },
         { id: "gpt-5.5", display_name: "GPT 5.5" }
       ]
@@ -808,8 +807,9 @@ try {
     { inputModel: "fable-5", expectedModel: "claude-fake-5" },
     { inputModel: "claude-fable-5", expectedModel: "claude-fake-5" },
     { inputModel: "grok-4.5[1m]", expectedModel: "grok-4.5" },
-    { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3[1m]" },
+    { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3" },
     { inputModel: "claude-fable-5-dd-3k-imik", expectedModel: "kimi-k3" },
+    { inputModel: "claude-fable-5-dd-3k-imik[1m]", expectedModel: "kimi-k3" },
     { inputModel: "claude-fable-5-dd-5.4-korg", expectedModel: "grok-4.5" },
     { inputModel: "claude-fable-5-dd-5.4-korg[1m]", expectedModel: "grok-4.5" }
   ];
@@ -877,10 +877,11 @@ try {
     throw new Error(`Claude gateway model discovery failed with ${modelsResponse.status}: ${await modelsResponse.text()}`);
   }
   const models = await modelsResponse.json();
-  const kimiModel = models.data?.find((model) => model.id === "claude-fable-5-dd-3k-imik");
+  const kimiModel = models.data?.find((model) => model.id === "claude-fable-5-dd-3k-imik[1m]");
   const grokModel = models.data?.find((model) => model.id === "claude-fable-5-dd-5.4-korg");
   if (models.has_more !== false
     || kimiModel?.display_name !== "kimi-k3"
+    || kimiModel?.max_input_tokens !== 1000000
     || grokModel?.display_name !== "grok-4.5"
     || models.data?.length !== 2) {
     throw new Error(`Claude gateway model discovery did not expose the independent VSLLM models: ${JSON.stringify(models)}`);

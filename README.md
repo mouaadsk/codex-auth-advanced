@@ -416,6 +416,8 @@ CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 
 The command also removes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` when present because that setting suppresses Claude Code's gateway model discovery. The marker token is never used as the VSLLM credential. The proxy removes caller authentication and injects the stored key for the selected account.
 
+Start a new Claude Code process after configuration or proxy model-catalog changes. Claude Code discovers gateway models at startup and caches the picker entries for the lifetime of the process.
+
 Open the interactive model picker:
 
 ```text
@@ -430,7 +432,7 @@ The picker includes independent gateway entries:
 | `grok-4.5` | `grok-4.5` |
 | `fable` | `claude-fake-5` |
 
-Kimi K3 and Grok 4.5 no longer replace Claude's Sonnet or Opus tiers. Claude Code only accepts discovered model IDs beginning with `claude` or `anthropic`, so the proxy advertises reversible internal IDs while displaying the exact `kimi-k3` and `grok-4.5` names. The internal ID is decoded before the Anthropic request is forwarded to VSLLM.
+Kimi K3 and Grok 4.5 no longer replace Claude's Sonnet or Opus tiers. Claude Code only accepts discovered model IDs beginning with `claude` or `anthropic`, so the proxy advertises reversible internal IDs while displaying the exact `kimi-k3` and `grok-4.5` names. Kimi's internal ID includes Claude Code's `[1m]` suffix so the client budgets its native 1M context window. The internal ID is decoded before the Anthropic request is forwarded to VSLLM.
 
 Fable can still be selected directly:
 
@@ -438,7 +440,7 @@ Fable can still be selected directly:
 claude --model fable
 ```
 
-For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. Kimi K3 and Grok 4.5 use their VSLLM catalog IDs. If Claude Code appends its `[1m]` context suffix to Grok 4.5, the proxy removes it because VSLLM advertises only `grok-4.5`; `kimi-k3[1m]` remains unchanged because it is a real VSLLM model ID. These mappings are not applied to other providers.
+For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. Kimi K3 and Grok 4.5 use their VSLLM catalog IDs. Claude Code's `[1m]` suffix is client-side context metadata, so the proxy removes it from Kimi K3 and Grok 4.5 before forwarding. VSLLM currently advertises plain `kimi-k3` and `grok-4.5`; Kimi K3 itself provides the native 1M context window. These mappings are not applied to other providers.
 
 Claude Code requests use `/v1/messages?beta=true`; `/v1/messages/count_tokens` passes through unchanged. For a VSLLM route, the proxy answers Claude's `/v1/models?limit=1000` request locally with Kimi K3 and Grok 4.5 under reversible Claude-compatible IDs, avoiding the gateway discovery timeout caused by a slow upstream catalog. Non-Claude model catalog requests still pass through to the provider. Anthropic beta/version headers, Claude session and agent headers, request fields, error bodies, and SSE events are forwarded without OpenAI response normalization.
 
