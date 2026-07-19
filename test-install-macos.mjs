@@ -18,11 +18,26 @@ const proxyPort = 47891;
 for (const directory of [accountsDir, claudeDir, fakeBin]) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 }
-for (const command of ["codex", "claude"]) {
-  const executable = path.join(fakeBin, command);
-  fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  fs.chmodSync(executable, 0o755);
-}
+const fakeReasoningLevels = ["low", "medium", "high", "xhigh", "max", "ultra"]
+  .map((effort) => ({ effort, description: effort }));
+const fakeCodexCatalog = {
+  models: [
+    { slug: "gpt-5.6-sol", display_name: "GPT-5.6-Sol", supported_reasoning_levels: fakeReasoningLevels, visibility: "list", priority: 1 },
+    { slug: "gpt-5.6-terra", display_name: "GPT-5.6-Terra", supported_reasoning_levels: fakeReasoningLevels, visibility: "list", priority: 2 },
+    { slug: "gpt-5.6-luna", display_name: "GPT-5.6-Luna", supported_reasoning_levels: fakeReasoningLevels.slice(0, -1), visibility: "list", priority: 3 }
+  ]
+};
+const fakeCodexExecutable = path.join(fakeBin, "codex");
+fs.writeFileSync(fakeCodexExecutable, [
+  "#!/usr/bin/env node",
+  `const catalog = ${JSON.stringify(fakeCodexCatalog)};`,
+  "if (process.argv.slice(2).join(' ') === 'debug models --bundled') process.stdout.write(JSON.stringify(catalog));",
+  ""
+].join("\n"), { mode: 0o755 });
+fs.chmodSync(fakeCodexExecutable, 0o755);
+const fakeClaudeExecutable = path.join(fakeBin, "claude");
+fs.writeFileSync(fakeClaudeExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+fs.chmodSync(fakeClaudeExecutable, 0o755);
 
 const accountKey = "apikey-vsllm-install-test";
 fs.writeFileSync(path.join(codexHome, "config.toml"), [
@@ -144,6 +159,7 @@ function backupCount(filePath) {
 
 const expectedGroupId = Buffer.from(path.resolve(codexHome), "utf8").toString("base64url");
 const expectedBaseUrl = `http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${expectedGroupId}`;
+const expectedModelCatalogPath = path.join(codexHome, "model-catalogs", "codex-auth-advanced.json");
 const configureHelp = await runWrapper(["configure", "--help"]);
 for (const expected of [
   "Usage: codex-auth-advanced configure [all|codex|claude]",
@@ -164,6 +180,9 @@ const first = await runInstaller();
 if (!first.stdout.includes("Codex: configured") || !first.stdout.includes("Claude Code: configured")) {
   throw new Error(`installer did not configure both clients:\n${first.stdout}\n${first.stderr}`);
 }
+if (!first.stdout.includes("Codex models: configured")) {
+  throw new Error(`installer did not configure the Codex model picker:\n${first.stdout}\n${first.stderr}`);
+}
 if (!first.stdout.includes("removed stale model overrides")) {
   throw new Error(`installer did not report stale Claude model cleanup:\n${first.stdout}`);
 }
@@ -176,6 +195,7 @@ for (const expected of [
   'model_reasoning_effort = "max"',
   'model_provider = "openai"',
   `openai_base_url = "${expectedBaseUrl}"`,
+  `model_catalog_json = "${expectedModelCatalogPath}"`,
   "[features]",
   "multi_agent = true"
 ]) {
@@ -183,6 +203,25 @@ for (const expected of [
 }
 if (codexConfig.includes("[model_providers.OpenAI]") || codexConfig.includes("old-gateway.example")) {
   throw new Error(`Codex config retained the obsolete provider block:\n${codexConfig}`);
+}
+const configuredModelCatalog = JSON.parse(fs.readFileSync(expectedModelCatalogPath, "utf8"));
+const configuredModelSlugs = configuredModelCatalog.models.map(({ slug }) => slug);
+for (const expected of [
+  "gpt-5.6-sol",
+  "gpt-5.6-sol-pro20x",
+  "gpt-5.6-terra",
+  "gpt-5.6-terra-pro20x",
+  "gpt-5.6-luna",
+  "gpt-5.6-luna-pro20x"
+]) {
+  if (!configuredModelSlugs.includes(expected)) {
+    throw new Error(`Codex model catalog is missing ${expected}: ${configuredModelSlugs.join(", ")}`);
+  }
+}
+const configuredSol = configuredModelCatalog.models.find(({ slug }) => slug === "gpt-5.6-sol");
+const configuredSolPro20x = configuredModelCatalog.models.find(({ slug }) => slug === "gpt-5.6-sol-pro20x");
+if (JSON.stringify(configuredSol.supported_reasoning_levels) !== JSON.stringify(configuredSolPro20x.supported_reasoning_levels)) {
+  throw new Error("Codex Pro20x catalog entry did not preserve Sol reasoning levels");
 }
 
 const claudeSettingsPath = path.join(claudeDir, "settings.json");
@@ -229,6 +268,9 @@ if (codexBackupsAfterFirst !== 1 || claudeBackupsAfterFirst !== 1) {
 const second = await runInstaller();
 if (!second.stdout.includes("Codex: already configured") || !second.stdout.includes("Claude Code: already configured")) {
   throw new Error(`installer was not idempotent:\n${second.stdout}\n${second.stderr}`);
+}
+if (!second.stdout.includes("Codex models: already configured")) {
+  throw new Error(`installer rewrote an unchanged Codex model catalog:\n${second.stdout}\n${second.stderr}`);
 }
 if (backupCount(codexConfigPath) !== codexBackupsAfterFirst || backupCount(claudeSettingsPath) !== claudeBackupsAfterFirst) {
   throw new Error("idempotent install created unnecessary additional backups");

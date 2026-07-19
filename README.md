@@ -72,6 +72,7 @@ ChatGPT account switches normally require restarting the Codex client so it relo
 | --- | --- |
 | `src/storage.mjs` | Private file writes, account paths, managed group paths, JSON/text reads, and backups. |
 | `src/codex-config.mjs` | TOML parsing/merging, API account templates, and Codex provider configuration. |
+| `src/codex-model-catalog.mjs` | Installed Codex catalog discovery and selectable VSLLM normal/Pro20x model variants. |
 | `src/provider-policy.mjs` | Provider error classification, VSLLM subscription windows, spend state, retries, and model aliases. |
 | `src/provider-client.mjs` | Provider health, billing, New API dashboard access, and dashboard credential lookup. |
 | `src/proxy-transforms.mjs` | Request rewriting, compressed JSON decoding, encrypted-content repair, SSE normalization, and compact fallback. |
@@ -360,6 +361,33 @@ The health response includes the proxy start time, restart state, active request
 
 Keep the proxy on loopback unless inbound authentication is added. The proxy route itself is not designed to be exposed directly to a LAN or the internet.
 
+## Codex Model Selection
+
+Configure Codex after installation or whenever Codex adds updated model metadata:
+
+```shell
+codex-auth-advanced configure codex
+```
+
+The command reads the model catalog bundled with the installed Codex CLI, preserves each model's supported reasoning efforts and tool behavior, adds explicit VSLLM Pro20x variants, and sets `model_catalog_json` in `~/.codex/config.toml`. The generated catalog is stored at:
+
+```text
+~/.codex/model-catalogs/codex-auth-advanced.json
+```
+
+Start a new Codex process after configuration because Codex loads `model_catalog_json` only at startup. Open `/model` to choose among these independent routes:
+
+| Picker entry | VSLLM request model |
+| --- | --- |
+| `gpt-5.6-sol` | `gpt-5.6-sol` |
+| `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` |
+| `gpt-5.6-terra` | `gpt-5.6-terra` |
+| `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` |
+| `gpt-5.6-luna` | `gpt-5.6-luna` |
+| `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
+
+The selected ID is preserved for regular responses, compact requests, compact fallback, and subagent requests. If one VSLLM tier is unavailable, select the corresponding normal or Pro20x entry without changing accounts or proxy configuration.
+
 ## Claude Code
 
 Configure both installed clients, or select one explicitly:
@@ -420,14 +448,17 @@ Do not restore `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` if the independent g
 
 ### Model Routing
 
-For VSLLM accounts, these Codex model names are rewritten before forwarding:
+For VSLLM accounts, the selected GPT-5.6 tier is forwarded unchanged. The older GPT-5.2 compatibility alias remains rewritten:
 
-| Codex request | VSLLM normal request | VSLLM compact request |
+| Codex request | VSLLM responses request | VSLLM compact request |
 | --- | --- | --- |
 | `gpt-5.2` | `gpt-5.5-pro20x` | `gpt-5.5-pro20x-openai-compact` |
-| `gpt-5.6-sol` | `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` |
-| `gpt-5.6-terra` | `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` |
-| `gpt-5.6-luna` | `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
+| `gpt-5.6-sol` | `gpt-5.6-sol` | `gpt-5.6-sol` |
+| `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` |
+| `gpt-5.6-terra` | `gpt-5.6-terra` | `gpt-5.6-terra` |
+| `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` |
+| `gpt-5.6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |
+| `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
 
 Other model names pass through unchanged.
 
@@ -442,7 +473,7 @@ Claude Code Fable routing is separate from the Codex table:
 
 The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
 
-Per-account `normal` versus `pro20x` tier selection is intentionally postponed. The current default always uses the mappings above; see [`task.md`](task.md).
+Manual normal versus Pro20x selection is available through Codex's model picker. Automatic per-account tier preferences remain postponed; see [`task.md`](task.md).
 
 ### Compact Requests
 

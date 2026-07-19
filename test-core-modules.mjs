@@ -11,8 +11,13 @@ import {
   mergeSessionModelConfig,
   parseTomlString,
   topLevelTomlValues,
+  upsertModelCatalogConfig,
   upsertOpenAiProviderConfig
 } from "./src/codex-config.mjs";
+import {
+  augmentedCodexModelCatalog,
+  vsllmCodexModelVariants
+} from "./src/codex-model-catalog.mjs";
 import {
   accountAuthPath,
   backupIfExists,
@@ -100,6 +105,36 @@ try {
   assert.doesNotMatch(proxied, /\[model_providers\.OpenAI\]/);
   assert.match(proxied, /^model = "gpt-5\.6-sol"$/m);
 
+  const catalogConfig = upsertModelCatalogConfig(proxied, "/tmp/codex-auth-advanced-models.json");
+  assert.match(catalogConfig, /^model_catalog_json = "\/tmp\/codex-auth-advanced-models\.json"$/m);
+  assert.equal(
+    upsertModelCatalogConfig(catalogConfig, "/tmp/codex-auth-advanced-models.json"),
+    catalogConfig
+  );
+
+  const baseCatalog = {
+    models: vsllmCodexModelVariants.map(({ normal }, index) => ({
+      slug: normal,
+      display_name: normal.replace("gpt-", "GPT-").replaceAll("-", " "),
+      description: `base model ${index}`,
+      supported_reasoning_levels: [{ effort: index === 2 ? "max" : "ultra" }],
+      model_messages: { instructions_template: `instructions ${index}` },
+      visibility: "list"
+    }))
+  };
+  const augmentedCatalog = augmentedCodexModelCatalog(baseCatalog);
+  assert.deepEqual(
+    augmentedCatalog.models.map(({ slug }) => slug),
+    vsllmCodexModelVariants.flatMap(({ normal, pro20x }) => [normal, pro20x])
+  );
+  for (const { normal, pro20x } of vsllmCodexModelVariants) {
+    const baseModel = augmentedCatalog.models.find(({ slug }) => slug === normal);
+    const pro20xModel = augmentedCatalog.models.find(({ slug }) => slug === pro20x);
+    assert.deepEqual(pro20xModel.supported_reasoning_levels, baseModel.supported_reasoning_levels);
+    assert.deepEqual(pro20xModel.model_messages, baseModel.model_messages);
+    assert.equal(pro20xModel.availability_nux, null);
+  }
+
   const generated = defaultApiKeyConfig("https://vsllm.example/v1", sourceToml, "openai");
   assert.match(generated, /^model = "gpt-5\.6-sol"$/m);
   assert.match(generated, /^model_context_window = 320000$/m);
@@ -149,7 +184,11 @@ try {
   );
   assert.equal(
     remappedProxyRequestModel("gpt-5.6-terra", { account: vsllmAccount }),
-    "gpt-5.6-terra-pro20x"
+    null
+  );
+  assert.equal(
+    remappedProxyRequestModel("gpt-5.6-terra-pro20x", { account: vsllmAccount }),
+    null
   );
   assert.equal(
     remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }, { compact: true }),

@@ -352,10 +352,7 @@ function remappedVsllmModel(model, { compact = false } = {}) {
     "fable": "claude-fake-5",
     "fable-5": "claude-fake-5",
     "claude-fable-5": "claude-fake-5",
-    "grok-4.5[1m]": "grok-4.5",
-    "gpt-5.6-sol": "gpt-5.6-sol-pro20x",
-    "gpt-5.6-terra": "gpt-5.6-terra-pro20x",
-    "gpt-5.6-luna": "gpt-5.6-luna-pro20x"
+    "grok-4.5[1m]": "grok-4.5"
   };
   if (aliases[normalized]) return aliases[normalized];
   if (normalized !== "gpt-5.2") return null;

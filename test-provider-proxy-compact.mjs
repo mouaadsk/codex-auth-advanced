@@ -670,10 +670,13 @@ try {
     ...body,
     model: "gpt-5.2"
   };
-  const vsllmPro20xModelAliases = [
-    ["gpt-5.6-sol", "gpt-5.6-sol-pro20x", "ultra"],
-    ["gpt-5.6-terra", "gpt-5.6-terra-pro20x", "ultra"],
-    ["gpt-5.6-luna", "gpt-5.6-luna-pro20x", "max"]
+  const vsllmSelectableModelVariants = [
+    ["gpt-5.6-sol", "gpt-5.6-sol", "ultra"],
+    ["gpt-5.6-sol-pro20x", "gpt-5.6-sol-pro20x", "ultra"],
+    ["gpt-5.6-terra", "gpt-5.6-terra", "ultra"],
+    ["gpt-5.6-terra-pro20x", "gpt-5.6-terra-pro20x", "ultra"],
+    ["gpt-5.6-luna", "gpt-5.6-luna", "max"],
+    ["gpt-5.6-luna-pro20x", "gpt-5.6-luna-pro20x", "max"]
   ];
 
   setActive("apikey-vsllm");
@@ -746,7 +749,7 @@ try {
     expectedModel: "gpt-5.5-pro20x-openai-compact"
   });
 
-  for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmPro20xModelAliases) {
+  for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmSelectableModelVariants) {
     const aliasBody = {
       ...body,
       model: inputModel,
@@ -939,7 +942,7 @@ try {
     label: "pinned vsllm-2 OpenClaw chat completion",
     bearer: "vsllm-2-secret",
     acceptEncoding: "identity",
-    expectedModel: "gpt-5.6-terra-pro20x",
+    expectedModel: "gpt-5.6-terra",
     expectedReasoningEffort: "ultra"
   });
 

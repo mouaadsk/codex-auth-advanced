@@ -147,6 +147,14 @@ export function upsertOpenAiProviderConfig(toml, baseUrl) {
   return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
 }
 
+export function upsertModelCatalogConfig(toml, modelCatalogPath) {
+  return applyTopLevelTomlValues(
+    toml,
+    new Map([["model_catalog_json", JSON.stringify(modelCatalogPath)]]),
+    ["model_catalog_json"]
+  );
+}
+
 function apiKeyContextDefaults(templateName) {
   const template = apiKeyTemplate(templateName);
   return {

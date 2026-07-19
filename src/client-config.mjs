@@ -1,4 +1,6 @@
 import path from "node:path";
+import { upsertModelCatalogConfig } from "./codex-config.mjs";
+import { ensureCodexAuthAdvancedModelCatalog } from "./codex-model-catalog.mjs";
 import {
   accountConfigPath,
   backupIfExists,
@@ -37,15 +39,24 @@ export function createClientConfigService({ providerProxy, accountService, claud
       return { configured: false, changed: false, reason: "missing_codex_config" };
     }
 
-    const next = apiKeyProxyConfig(codexHome, accountConfig, current);
-    if (next !== current) {
+    const modelCatalog = options.configureModelCatalog === true
+      ? ensureCodexAuthAdvancedModelCatalog(codexHome, current)
+      : null;
+    const configuredCurrent = modelCatalog
+      ? upsertModelCatalogConfig(current, modelCatalog.catalogPath)
+      : current;
+    const next = apiKeyProxyConfig(codexHome, accountConfig, configuredCurrent);
+    const configChanged = next !== current;
+    if (configChanged) {
       ensureDir(path.dirname(configPath));
       if (options.backup === true) backupIfExists(configPath);
       writeTextFilePrivate(configPath, next, 0o600);
     }
     return {
       configured: true,
-      changed: next !== current,
+      changed: configChanged || modelCatalog?.changed === true,
+      configChanged,
+      modelCatalog,
       account: active,
       configPath,
       baseUrl: providerProxyBaseUrl(codexHome)
@@ -160,9 +171,13 @@ export function createClientConfigService({ providerProxy, accountService, claud
 
     const codexHome = defaultCodexHome();
     if (target === "all" || target === "codex") {
-      const result = ensureActiveAccountConfig(codexHome, readJsonFile(registryPath(codexHome)), { backup: true });
+      const result = ensureActiveAccountConfig(codexHome, readJsonFile(registryPath(codexHome)), {
+        backup: true,
+        configureModelCatalog: true
+      });
       if (result.configured) {
         process.stdout.write(`Codex: ${result.changed ? "configured" : "already configured"} for ${accountLabel(result.account)} at ${result.baseUrl}.\n`);
+        process.stdout.write(`Codex models: ${result.modelCatalog.changed ? "configured" : "already configured"} at ${result.modelCatalog.catalogPath}.\n`);
       } else {
         process.stdout.write(`Codex: skipped (${result.reason.replaceAll("_", " ")}).\n`);
       }
