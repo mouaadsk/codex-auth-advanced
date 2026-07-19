@@ -44,6 +44,33 @@ const claudeSseBody = [
   "",
   ""
 ].join("\n");
+function responsesBridgeSseBody(model) {
+  const response = {
+    id: "resp_bridge_test",
+    model,
+    output: [{
+      id: "msg_bridge_test",
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "ok" }]
+    }],
+    usage: {
+      input_tokens: 12,
+      input_tokens_details: { cached_tokens: 2 },
+      output_tokens: 1
+    }
+  };
+  const events = [
+    { type: "response.created", response: { id: response.id, model } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "msg_bridge_test", type: "message" } },
+    { type: "response.content_part.added", output_index: 0, item_id: "msg_bridge_test", part: { type: "output_text", text: "" } },
+    { type: "response.output_text.delta", output_index: 0, item_id: "msg_bridge_test", delta: "ok" },
+    { type: "response.content_part.done", output_index: 0, item_id: "msg_bridge_test", part: { type: "output_text", text: "ok" } },
+    { type: "response.output_item.done", output_index: 0, item: response.output[0] },
+    { type: "response.completed", response }
+  ];
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
 const usageTotalsByBearer = new Map([
   ["Bearer vsllm-secret", 28.097534],
   ["Bearer vsllm-2-secret", 96.242272]
@@ -203,6 +230,35 @@ const upstream = http.createServer(async (req, res) => {
     }
     if (responseFailure === "delayed_completed") {
       await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    let parsedBody = null;
+    try {
+      parsedBody = JSON.parse(bodyText);
+    } catch {
+      parsedBody = null;
+    }
+    if (req.url.endsWith("/responses")
+      && parsedBody?.model === "grok-4.5"
+      && Array.isArray(parsedBody?.input)) {
+      if (parsedBody.stream === true) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(responsesBridgeSseBody(parsedBody.model));
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "resp_bridge_nonstream",
+          object: "response",
+          model: parsedBody.model,
+          output: [{
+            id: "msg_bridge_nonstream",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "ok" }]
+          }],
+          usage: { input_tokens: 9, output_tokens: 1 }
+        }));
+      }
+      return;
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ type: "response.completed" }));
@@ -803,17 +859,17 @@ try {
   }
 
   const claudeModelRoutes = [
-    { inputModel: "fable", expectedModel: "claude-fake-5" },
-    { inputModel: "fable-5", expectedModel: "claude-fake-5" },
-    { inputModel: "claude-fable-5", expectedModel: "claude-fake-5" },
-    { inputModel: "grok-4.5[1m]", expectedModel: "grok-4.5" },
-    { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3" },
-    { inputModel: "claude-fable-5-dd-3k-imik", expectedModel: "kimi-k3" },
-    { inputModel: "claude-fable-5-dd-3k-imik[1m]", expectedModel: "kimi-k3" },
-    { inputModel: "claude-fable-5-dd-5.4-korg", expectedModel: "grok-4.5" },
-    { inputModel: "claude-fable-5-dd-5.4-korg[1m]", expectedModel: "grok-4.5" }
+    { inputModel: "fable", expectedModel: "claude-fake-5", wireApi: "anthropic" },
+    { inputModel: "fable-5", expectedModel: "claude-fake-5", wireApi: "anthropic" },
+    { inputModel: "claude-fable-5", expectedModel: "claude-fake-5", wireApi: "anthropic" },
+    { inputModel: "grok-4.5[1m]", expectedModel: "grok-4.5", wireApi: "responses" },
+    { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3", wireApi: "anthropic" },
+    { inputModel: "claude-fable-5-dd-3k-imik", expectedModel: "kimi-k3", wireApi: "anthropic" },
+    { inputModel: "claude-fable-5-dd-3k-imik[1m]", expectedModel: "kimi-k3", wireApi: "anthropic" },
+    { inputModel: "claude-fable-5-dd-5.4-korg", expectedModel: "grok-4.5", wireApi: "responses" },
+    { inputModel: "claude-fable-5-dd-5.4-korg[1m]", expectedModel: "grok-4.5", wireApi: "responses" }
   ];
-  for (const { inputModel, expectedModel } of claudeModelRoutes) {
+  for (const { inputModel, expectedModel, wireApi } of claudeModelRoutes) {
     const beforeClaudeRequest = upstreamRequests.length;
     const response = await proxyRawRequest(proxyPort, "/v1/messages?beta=true", {
       model: inputModel,
@@ -833,35 +889,98 @@ try {
       throw new Error(`Claude ${inputModel} request failed with ${response.status}: ${await response.text()}`);
     }
     const responseText = await response.text();
-    if (responseText !== claudeSseBody) {
-      throw new Error(`Claude ${inputModel} SSE response was modified:\n${responseText}`);
+    if (wireApi === "anthropic" && responseText !== claudeSseBody) {
+      throw new Error(`Claude ${inputModel} native Anthropic SSE response was modified:\n${responseText}`);
     }
-    if (responseText.includes("encrypted_content")) {
+    if (wireApi === "responses"
+      && (!responseText.includes("event: message_start")
+        || !responseText.includes('"type":"text_delta","text":"ok"')
+        || !responseText.includes('"stop_reason":"end_turn"')
+        || !responseText.includes("event: message_stop"))) {
+      throw new Error(`Claude ${inputModel} Responses SSE was not translated to Anthropic events:\n${responseText}`);
+    }
+    if (responseText.includes("encrypted_content") || responseText.includes("response.completed")) {
       throw new Error(`Claude ${inputModel} SSE response must not receive OpenAI encrypted_content fields`);
     }
     if (upstreamRequests.length !== beforeClaudeRequest + 1) {
       throw new Error(`Claude ${inputModel} request should make one upstream request`);
     }
     const claudeRequest = upstreamRequests.at(-1);
-    if (claudeRequest.url !== "/v1/messages?beta=true") {
+    const expectedUrl = wireApi === "responses" ? "/v1/responses" : "/v1/messages?beta=true";
+    if (claudeRequest.url !== expectedUrl) {
       throw new Error(`Claude ${inputModel} request used the wrong upstream path: ${claudeRequest.url}`);
     }
     if (claudeRequest.authorization !== "Bearer vsllm-secret" || claudeRequest.apiKey !== undefined) {
       throw new Error(`Claude ${inputModel} request did not replace local credentials with the active account key`);
     }
-    if (claudeRequest.anthropicVersion !== "2023-06-01"
-      || claudeRequest.anthropicBeta !== "test-beta-2026-07-17"
-      || claudeRequest.claudeSessionId !== "session-test"
+    if (claudeRequest.claudeSessionId !== "session-test"
       || claudeRequest.claudeAgentId !== "agent-test") {
-      throw new Error(`Claude ${inputModel} request headers were not preserved: ${JSON.stringify(claudeRequest)}`);
+      throw new Error(`Claude ${inputModel} session headers were not preserved: ${JSON.stringify(claudeRequest)}`);
+    }
+    if (wireApi === "anthropic"
+      && (claudeRequest.anthropicVersion !== "2023-06-01" || claudeRequest.anthropicBeta !== "test-beta-2026-07-17")) {
+      throw new Error(`Claude ${inputModel} Anthropic headers were not preserved: ${JSON.stringify(claudeRequest)}`);
+    }
+    if (wireApi === "responses"
+      && (claudeRequest.anthropicVersion !== undefined || claudeRequest.anthropicBeta !== undefined)) {
+      throw new Error(`Claude ${inputModel} Anthropic headers leaked into the Responses request: ${JSON.stringify(claudeRequest)}`);
     }
     const claudeBody = JSON.parse(claudeRequest.bodyText);
     if (claudeBody.model !== expectedModel) {
       throw new Error(`Claude ${inputModel} should map to ${expectedModel}, got ${claudeBody.model}`);
     }
-    if (claudeBody.system?.[0]?.text !== "Keep the response short." || claudeBody.messages?.[0]?.content !== "Reply with ok.") {
-      throw new Error(`Claude ${inputModel} request body fields were not preserved`);
+    if (wireApi === "anthropic"
+      && (claudeBody.system?.[0]?.text !== "Keep the response short." || claudeBody.messages?.[0]?.content !== "Reply with ok.")) {
+      throw new Error(`Claude ${inputModel} native request body fields were not preserved`);
     }
+    if (wireApi === "responses"
+      && (claudeBody.input?.[0]?.role !== "developer"
+        || claudeBody.input?.[0]?.content?.[0]?.text !== "Keep the response short."
+        || claudeBody.input?.[1]?.role !== "user"
+        || claudeBody.input?.[1]?.content?.[0]?.text !== "Reply with ok."
+        || claudeBody.store !== false
+        || claudeBody.stream !== true)) {
+      throw new Error(`Claude ${inputModel} request body was not translated to Responses format: ${claudeRequest.bodyText}`);
+    }
+  }
+
+  const beforeClaudeCountTokens = upstreamRequests.length;
+  const countTokensResponse = await proxyRawRequest(proxyPort, "/v1/messages/count_tokens?beta=true", {
+    model: "claude-fable-5-dd-5.4-korg[1m]",
+    system: [{ type: "text", text: "Count locally." }],
+    messages: [{ role: "user", content: "Do not spend an upstream request for this count." }]
+  }, {
+    "anthropic-version": "2023-06-01"
+  });
+  const countTokens = await countTokensResponse.json();
+  if (countTokensResponse.status !== 200 || !Number.isFinite(countTokens.input_tokens) || countTokens.input_tokens <= 0) {
+    throw new Error(`Claude Grok token count bridge returned an invalid response: ${JSON.stringify(countTokens)}`);
+  }
+  if (upstreamRequests.length !== beforeClaudeCountTokens) {
+    throw new Error("Claude Grok token counting should be estimated locally without a VSLLM request");
+  }
+
+  const beforeClaudeNonStream = upstreamRequests.length;
+  const claudeNonStreamResponse = await proxyRawRequest(proxyPort, "/v1/messages?beta=true", {
+    model: "claude-fable-5-dd-5.4-korg[1m]",
+    max_tokens: 256,
+    stream: false,
+    messages: [{ role: "user", content: "Reply with ok." }]
+  }, {
+    "anthropic-version": "2023-06-01"
+  });
+  const claudeNonStream = await claudeNonStreamResponse.json();
+  if (claudeNonStreamResponse.status !== 200
+    || claudeNonStream.type !== "message"
+    || claudeNonStream.model !== "grok-4.5"
+    || claudeNonStream.content?.[0]?.text !== "ok"
+    || claudeNonStream.stop_reason !== "end_turn") {
+    throw new Error(`Claude Grok non-stream response was not translated: ${JSON.stringify(claudeNonStream)}`);
+  }
+  if (upstreamRequests.length !== beforeClaudeNonStream + 1
+    || upstreamRequests.at(-1)?.url !== "/v1/responses"
+    || JSON.parse(upstreamRequests.at(-1).bodyText).stream !== false) {
+    throw new Error("Claude Grok non-stream request did not use the Responses bridge");
   }
 
   const beforeClaudeModelsRequest = upstreamRequests.length;
@@ -878,11 +997,12 @@ try {
   }
   const models = await modelsResponse.json();
   const kimiModel = models.data?.find((model) => model.id === "claude-fable-5-dd-3k-imik[1m]");
-  const grokModel = models.data?.find((model) => model.id === "claude-fable-5-dd-5.4-korg");
+  const grokModel = models.data?.find((model) => model.id === "claude-fable-5-dd-5.4-korg[1m]");
   if (models.has_more !== false
     || kimiModel?.display_name !== "kimi-k3"
     || kimiModel?.max_input_tokens !== 1000000
     || grokModel?.display_name !== "grok-4.5"
+    || grokModel?.max_input_tokens !== 1000000
     || models.data?.length !== 2) {
     throw new Error(`Claude gateway model discovery did not expose the independent VSLLM models: ${JSON.stringify(models)}`);
   }

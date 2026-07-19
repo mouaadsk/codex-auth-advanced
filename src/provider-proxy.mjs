@@ -8,16 +8,24 @@ import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import { readClonedResponseBody } from "./provider-client.mjs";
 import {
+  claudeGatewayModelsResponse,
+  isClaudeGatewayModelsRequest
+} from "./claude-gateway.mjs";
+import {
+  createClaudeResponsesSseTransformStream,
+  prepareClaudeResponsesBridge,
+  retargetClaudeResponsesBridge,
+  translateResponsesResponseToClaude
+} from "./claude-responses-bridge.mjs";
+import {
   apiProviderExhaustionReason,
   apiProviderTransientRetryReason,
   isInvalidEncryptedContentBody
 } from "./provider-policy.mjs";
 import {
-  claudeGatewayModelsResponse,
   createSseResponseTransformStream,
   createStreamDiagnostics,
   dummyCompactionResponse,
-  isClaudeGatewayModelsRequest,
   isCompactProxyTarget,
   isResponsesProxyTarget,
   repairProviderProxyBodyPlaintext,
@@ -360,6 +368,7 @@ export function createProviderProxy(options) {
       if (!target.chatgpt) {
         if (lower === "authorization" || lower === "x-api-key") continue;
         if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-") || (!websocket && lower.startsWith("sec-"))) continue;
+        if (target.claudeResponsesBridge && (lower.startsWith("anthropic-") || lower.startsWith("x-stainless-"))) continue;
       } else if (lower === "authorization" || lower === "x-authorization") {
         continue;
       }
@@ -368,6 +377,10 @@ export function createProviderProxy(options) {
 
     if (!target.chatgpt) {
       out["accept-encoding"] = "identity";
+    }
+
+    if (target.claudeResponsesBridge) {
+      out.accept = "text/event-stream, application/json";
     }
 
     if (!target.chatgpt) {
@@ -613,6 +626,7 @@ export function createProviderProxy(options) {
       const modelCapacityRetries = new Map();
       let bodyAlreadyDecoded = false;
       let triedPlaintextCompactRepair = false;
+      let claudeResponsesBridge = null;
       const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
       if (rewrittenBody.rewritten) {
         body = rewrittenBody.body;
@@ -623,6 +637,22 @@ export function createProviderProxy(options) {
       } else if (rewrittenBody.decoded) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = true;
+      }
+      claudeResponsesBridge = prepareClaudeResponsesBridge(target, body);
+      if (claudeResponsesBridge?.kind === "count_tokens") {
+        const responseBody = Buffer.from(JSON.stringify({ input_tokens: claudeResponsesBridge.inputTokens }), "utf8");
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": responseBody.length
+        });
+        res.end(responseBody);
+        return;
+      }
+      if (claudeResponsesBridge?.kind === "responses") {
+        target = claudeResponsesBridge.target;
+        body = claudeResponsesBridge.body;
+        bodyAlreadyDecoded = true;
+        console.log(`[Proxy] Bridging Claude Messages model ${claudeResponsesBridge.originalRequest.model} through OpenAI Responses.`);
       }
       while (true) {
         if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
@@ -734,15 +764,36 @@ export function createProviderProxy(options) {
         if (retryTarget.error || retryTarget.account?.account_key === target.account?.account_key || attemptedAccountKeys.has(retryTarget.account?.account_key)) {
           break;
         }
-        target = retryTarget;
+        target = retargetClaudeResponsesBridge(retryTarget, claudeResponsesBridge);
       }
 
       console.log(`[Proxy Response] ${req.url} -> status: ${upstream.status}`);
-      res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
       if (!upstream.body) {
+        res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
         res.end();
         return;
       }
+      const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
+      if (claudeResponsesBridge?.kind === "responses"
+        && upstream.status >= 200
+        && upstream.status < 300
+        && !contentType.includes("event-stream")) {
+        const rawBody = await upstream.text();
+        let translatedBody = null;
+        try {
+          translatedBody = translateResponsesResponseToClaude(JSON.parse(rawBody), claudeResponsesBridge.originalRequest);
+        } catch {
+          translatedBody = null;
+        }
+        const responseBody = Buffer.from(translatedBody ? JSON.stringify(translatedBody) : rawBody, "utf8");
+        const responseHeaders = stripProxyResponseHeaders(upstream.headers);
+        if (translatedBody) responseHeaders["content-type"] = "application/json";
+        responseHeaders["content-length"] = String(responseBody.length);
+        res.writeHead(upstream.status, responseHeaders);
+        res.end(responseBody);
+        return;
+      }
+      res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
       const contentEncoding = String(upstream.headers.get("content-encoding") || "").toLowerCase();
       let responseStream = Readable.fromWeb(upstream.body).on("error", () => res.destroy());
       if (contentEncoding === "gzip" || contentEncoding === "x-gzip") {
@@ -752,10 +803,12 @@ export function createProviderProxy(options) {
       } else if (contentEncoding === "br") {
         responseStream = responseStream.pipe(zlib.createBrotliDecompress());
       }
-      const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
-      const shouldTransformOpenAiResponse = !target.chatgpt
+      const shouldTransformOpenAiResponse = claudeResponsesBridge?.kind !== "responses"
+        && !target.chatgpt
         && (isCompactProxyTarget(target) || isResponsesProxyTarget(target));
-      const diagnostics = shouldTransformOpenAiResponse ? createStreamDiagnostics(target, req.url) : null;
+      const diagnostics = !target.chatgpt && isResponsesProxyTarget(target)
+        ? createStreamDiagnostics(target, req.url)
+        : null;
       let diagnosticsFinished = false;
       const finishDiagnostics = (reason) => {
         if (!diagnostics || diagnosticsFinished) return;
@@ -763,7 +816,12 @@ export function createProviderProxy(options) {
         diagnostics.finish(reason);
       };
       responseStream.on("error", () => finishDiagnostics("source_error"));
-      if (shouldTransformOpenAiResponse) {
+      if (claudeResponsesBridge?.kind === "responses" && contentType.includes("event-stream")) {
+        responseStream = responseStream.pipe(createClaudeResponsesSseTransformStream(
+          claudeResponsesBridge.originalRequest,
+          diagnostics
+        ));
+      } else if (shouldTransformOpenAiResponse) {
         responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream"), diagnostics));
       }
       responseStream.on("end", () => finishDiagnostics("end"));

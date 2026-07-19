@@ -39,6 +39,7 @@ This repository is maintained as a local macOS checkout. It is not currently pub
 - Preserve requested models and reasoning effort through the proxy.
 - Route selected Codex model names to VSLLM `pro20x` models.
 - Route Claude Fable 5 selections to the VSLLM pay-per-request `claude-fake-5` model.
+- Let Claude Code use selected OpenAI-Responses-only VSLLM models through an in-process protocol bridge.
 - Send compact requests to the provider-native compact endpoint with a local fallback.
 - Read authoritative VSLLM/New API subscription usage and exact reset timestamps.
 - Retry transient VSLLM usage-limit responses without immediately exhausting an available account.
@@ -75,6 +76,8 @@ ChatGPT account switches normally require restarting the Codex client so it relo
 | `src/codex-model-catalog.mjs` | Installed Codex catalog discovery and selectable VSLLM normal/Pro20x model variants. |
 | `src/provider-policy.mjs` | Provider error classification, VSLLM subscription windows, spend state, retries, and model aliases. |
 | `src/provider-client.mjs` | Provider health, billing, New API dashboard access, and dashboard credential lookup. |
+| `src/claude-gateway.mjs` | Claude gateway model discovery metadata and per-model upstream wire protocol. |
+| `src/claude-responses-bridge.mjs` | Claude Messages to OpenAI Responses request, response, tool-use, token-count, and SSE translation. |
 | `src/proxy-transforms.mjs` | Request rewriting, compressed JSON decoding, encrypted-content repair, SSE normalization, and compact fallback. |
 | `src/provider-proxy.mjs` | Route parsing, pinned/default targeting, HTTP/WebSocket transport, failover orchestration, streaming, and graceful lifecycle. |
 | `src/account-service.mjs` | Registry loading, account selection, target resolution, exhaustion mutation, and account activation. |
@@ -432,7 +435,7 @@ The picker includes independent gateway entries:
 | `grok-4.5` | `grok-4.5` |
 | `fable` | `claude-fake-5` |
 
-Kimi K3 and Grok 4.5 no longer replace Claude's Sonnet or Opus tiers. Claude Code only accepts discovered model IDs beginning with `claude` or `anthropic`, so the proxy advertises reversible internal IDs while displaying the exact `kimi-k3` and `grok-4.5` names. Kimi's internal ID includes Claude Code's `[1m]` suffix so the client budgets its native 1M context window. The internal ID is decoded before the Anthropic request is forwarded to VSLLM.
+Kimi K3 and Grok 4.5 no longer replace Claude's Sonnet or Opus tiers. Claude Code only accepts discovered model IDs beginning with `claude` or `anthropic`, so the proxy advertises reversible internal IDs while displaying the exact `kimi-k3` and `grok-4.5` names. Both internal IDs include Claude Code's `[1m]` suffix so the client budgets their 1M context windows. The internal ID and context suffix are removed before forwarding to VSLLM.
 
 Fable can still be selected directly:
 
@@ -440,9 +443,13 @@ Fable can still be selected directly:
 claude --model fable
 ```
 
-For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. Kimi K3 and Grok 4.5 use their VSLLM catalog IDs. Claude Code's `[1m]` suffix is client-side context metadata, so the proxy removes it from Kimi K3 and Grok 4.5 before forwarding. VSLLM currently advertises plain `kimi-k3` and `grok-4.5`; Kimi K3 itself provides the native 1M context window. These mappings are not applied to other providers.
+For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. Kimi K3 and Grok 4.5 use their VSLLM catalog IDs. Claude Code's `[1m]` suffix is client-side context metadata, so the proxy removes it before forwarding. These mappings are not applied to other providers.
 
-Claude Code requests use `/v1/messages?beta=true`; `/v1/messages/count_tokens` passes through unchanged. For a VSLLM route, the proxy answers Claude's `/v1/models?limit=1000` request locally with Kimi K3 and Grok 4.5 under reversible Claude-compatible IDs, avoiding the gateway discovery timeout caused by a slow upstream catalog. Non-Claude model catalog requests still pass through to the provider. Anthropic beta/version headers, Claude session and agent headers, request fields, error bodies, and SSE events are forwarded without OpenAI response normalization.
+Kimi K3 and Fable use VSLLM's native Anthropic endpoint. VSLLM advertises Grok 4.5 only for `openai` and `openai-response`, so Grok requests are translated in-process from Claude Messages to `/v1/responses`. The bridge converts system and conversation content, images, thinking configuration, tools, tool choices, tool calls, and tool results. Streaming Responses events are converted back into Anthropic `message_start`, content-block, `message_delta`, and `message_stop` events; non-stream responses are converted into Anthropic message JSON. Account selection, pinned routes, exhaustion detection, retries, and failover remain owned by the same provider proxy.
+
+For bridged models, `/v1/messages/count_tokens` is estimated locally so context accounting does not consume a paid VSLLM request. Native Anthropic models continue to use their provider endpoint unchanged. The proxy answers Claude's `/v1/models?limit=1000` request locally with Kimi K3 and Grok 4.5 under reversible Claude-compatible IDs, avoiding the gateway discovery timeout caused by a slow upstream catalog. Claude session and agent headers are retained across the bridge, while Anthropic protocol headers are removed from the OpenAI Responses upstream request.
+
+The bridge architecture is informed by the MIT-licensed [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) Claude-to-Codex translator. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 Do not restore `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` if the independent gateway models must remain visible in `/model`.
 
@@ -466,12 +473,13 @@ Other model names pass through unchanged.
 
 Claude Code Fable routing is separate from the Codex table:
 
-| Claude Code request | VSLLM request |
-| --- | --- |
-| `fable` | `claude-fake-5` |
-| `fable-5` | `claude-fake-5` |
-| `claude-fable-5` | `claude-fake-5` |
-| `grok-4.5[1m]` | `grok-4.5` |
+| Claude Code request | VSLLM model | Upstream endpoint |
+| --- | --- | --- |
+| `fable` | `claude-fake-5` | `/v1/messages` |
+| `fable-5` | `claude-fake-5` | `/v1/messages` |
+| `claude-fable-5` | `claude-fake-5` | `/v1/messages` |
+| `kimi-k3[1m]` | `kimi-k3` | `/v1/messages` |
+| `grok-4.5[1m]` | `grok-4.5` | `/v1/responses` through the Claude bridge |
 
 The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
 
@@ -724,7 +732,7 @@ The test suite covers:
 
 - Direct storage, TOML, provider-policy, transform, routing, account-selection, and client-configuration contracts.
 - Proxy model remapping and reasoning-effort forwarding.
-- Claude Fable routing, Anthropic header forwarding, model discovery, and byte-preserving SSE responses.
+- Claude Fable/Kimi native routing, Grok Responses bridging, local token counting, model discovery, tools, and streaming/non-stream conversion.
 - Native and fallback compaction.
 - Encrypted-content compatibility repair.
 - Pinned account routing.
