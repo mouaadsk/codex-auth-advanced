@@ -37,9 +37,9 @@ This repository is maintained as a local macOS checkout. It is not currently pub
 - Launch `codext` with the model and reasoning settings from the selected group.
 - Give OpenClaw or another client a route pinned to one API account.
 - Preserve requested models and reasoning effort through the proxy.
-- Route selected Codex model names to VSLLM `pro20x` models.
-- Route Claude Fable 5 selections to the VSLLM pay-per-request `claude-fake-5` model.
-- Let Claude Code use selected OpenAI-Responses-only VSLLM models through an in-process protocol bridge.
+- Route selected Codex model names to current VSLLM model IDs.
+- Keep official Claude models on Claude Code OAuth while exposing clearly labeled VSLLM alternatives in the same picker.
+- Discover every VSLLM model that advertises Anthropic Messages support, and bridge selected Responses-only models for Claude Code.
 - Send compact requests to the provider-native compact endpoint with a local fallback.
 - Read authoritative VSLLM/New API subscription usage and exact reset timestamps.
 - Retry transient VSLLM usage-limit responses without immediately exhausting an available account.
@@ -73,7 +73,7 @@ ChatGPT account switches normally require restarting the Codex client so it relo
 | --- | --- |
 | `src/storage.mjs` | Private file writes, account paths, managed group paths, JSON/text reads, and backups. |
 | `src/codex-config.mjs` | TOML parsing/merging, API account templates, and Codex provider configuration. |
-| `src/codex-model-catalog.mjs` | Installed Codex catalog discovery and selectable VSLLM normal/Pro20x model variants. |
+| `src/codex-model-catalog.mjs` | Installed Codex catalog discovery and removal of retired VSLLM picker entries. |
 | `src/provider-policy.mjs` | Provider error classification, VSLLM subscription windows, spend state, retries, and model aliases. |
 | `src/provider-client.mjs` | Provider health, billing, New API dashboard access, and dashboard credential lookup. |
 | `src/claude-gateway.mjs` | Claude gateway model discovery metadata and per-model upstream wire protocol. |
@@ -361,6 +361,7 @@ The health response includes the proxy start time, restart state, active request
 | `CODEX_AUTH_ADVANCED_PROXY_HOST` | `127.0.0.1` |
 | `CODEX_AUTH_ADVANCED_PROXY_PORT` | `47778` |
 | `CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL` | `https://chatgpt.com/backend-api/codex` |
+| `CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 
 Keep the proxy on loopback unless inbound authentication is added. The proxy route itself is not designed to be exposed directly to a LAN or the internet.
 
@@ -372,7 +373,7 @@ Configure Codex after installation or whenever Codex adds updated model metadata
 codex-auth-advanced configure codex
 ```
 
-The command reads the model catalog bundled with the installed Codex CLI, preserves each model's supported reasoning efforts and tool behavior, adds explicit VSLLM Pro20x variants, and sets `model_catalog_json` in `~/.codex/config.toml`. The generated catalog is stored at:
+The command reads the model catalog bundled with the installed Codex CLI, preserves each model's supported reasoning efforts and tool behavior, removes retired VSLLM Pro20x entries, and sets `model_catalog_json` in `~/.codex/config.toml`. The generated catalog is stored at:
 
 ```text
 ~/.codex/model-catalogs/codex-auth-advanced.json
@@ -383,13 +384,10 @@ Start a new Codex process after configuration because Codex loads `model_catalog
 | Picker entry | VSLLM request model |
 | --- | --- |
 | `gpt-5.6-sol` | `gpt-5.6-sol` |
-| `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` |
 | `gpt-5.6-terra` | `gpt-5.6-terra` |
-| `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` |
 | `gpt-5.6-luna` | `gpt-5.6-luna` |
-| `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
 
-The selected ID is preserved for regular responses, compact requests, compact fallback, and subagent requests. If one VSLLM tier is unavailable, select the corresponding normal or Pro20x entry without changing accounts or proxy configuration.
+The selected ID is preserved for regular responses, compact requests, compact fallback, and subagent requests.
 
 ## Claude Code
 
@@ -408,18 +406,17 @@ The macOS installer configures both installed clients and the launchd service:
 ./scripts/install.zsh
 ```
 
-The command backs up an existing `~/.claude/settings.json`, preserves unrelated settings, removes conflicting `ANTHROPIC_API_KEY` authentication, and sets:
+The command backs up an existing `~/.claude/settings.json`, preserves unrelated settings, removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` overrides that would bypass Claude Code OAuth, and sets:
 
 ```text
 ANTHROPIC_BASE_URL=<default codex-auth-advanced proxy route>
-ANTHROPIC_AUTH_TOKEN=codex-auth-advanced-local-proxy
 ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-The command also removes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` when present because that setting suppresses Claude Code's gateway model discovery. The marker token is never used as the VSLLM credential. The proxy removes caller authentication and injects the stored key for the selected account.
+The command also removes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` when present because that setting suppresses Claude Code's gateway-model support. It refreshes `~/.claude/cache/gateway-models.json` through the local proxy with the current VSLLM catalog, without persisting a Claude API key or marker token. The proxy preserves Claude Code's OAuth headers for official Anthropic requests. It removes caller authentication only when routing a selected VSLLM model, then injects the stored VSLLM key.
 
-Start a new Claude Code process after configuration or proxy model-catalog changes. Claude Code discovers gateway models at startup and caches the picker entries for the lifetime of the process.
+Start a new Claude Code process after configuration or a VSLLM catalog change. Claude Code loads gateway choices from this cache for the lifetime of the process. Run `codex-auth-advanced configure claude` again to refresh the VSLLM choices.
 
 Open the interactive model picker:
 
@@ -427,27 +424,23 @@ Open the interactive model picker:
 /model
 ```
 
-The picker includes independent gateway entries:
+The picker merges two live catalogs without replacing either one:
 
-| Picker entry | VSLLM model |
+| Picker entry | Destination |
 | --- | --- |
-| `kimi-k3` | `kimi-k3` |
-| `grok-4.5` | `grok-4.5` |
-| `fable` | `claude-fake-5` |
+| `Claude Fable 5` | Official Anthropic `claude-fable-5` using Claude Code OAuth |
+| `VSLLM: claude-fable-5` | VSLLM `claude-fable-5` using the stored VSLLM API key |
+| `VSLLM: claude-fake-5` | VSLLM `claude-fake-5` using the stored VSLLM API key |
+| `VSLLM: kimi-k3` | VSLLM `kimi-k3` using the native Anthropic Messages endpoint |
+| `VSLLM: grok-4.5` | VSLLM `grok-4.5` through the Responses bridge |
 
-Kimi K3 and Grok 4.5 no longer replace Claude's Sonnet or Opus tiers. Claude Code only accepts discovered model IDs beginning with `claude` or `anthropic`, so the proxy advertises reversible internal IDs while displaying the exact `kimi-k3` and `grok-4.5` names. Both internal IDs include Claude Code's `[1m]` suffix so the client budgets their 1M context windows. The internal ID and context suffix are removed before forwarding to VSLLM.
+Official Claude Code entries remain first-party picker choices and use Claude Code OAuth. The cache contains only VSLLM entries, built from every live `/v1/models` item whose `supported_endpoint_types` includes `anthropic`; the bridge also adds VSLLM's Responses-only `grok-4.5`. This is data-driven, so running `configure claude` refreshes newly available Anthropic-compatible VSLLM models without maintaining a static allowlist.
 
-Fable can still be selected directly:
+Claude Code only accepts discovered IDs beginning with `claude` or `anthropic`, so each VSLLM picker choice has a reversible internal `claude-vsllm-...` ID while its display name remains `VSLLM: <actual-model-id>`. That namespace is what lets official and VSLLM versions of Fable coexist. Kimi K3 and Grok 4.5 retain a `[1m]` suffix so Claude Code budgets their 1M context windows; the suffix is removed before forwarding upstream.
 
-```shell
-claude --model fable
-```
+Native VSLLM entries use `/v1/messages`. Grok 4.5 is translated in-process from Claude Messages to `/v1/responses`. The bridge converts system and conversation content, images, thinking configuration, tools, tool choices, tool calls, and tool results. Streaming Responses events are converted back into Anthropic `message_start`, content-block, `message_delta`, and `message_stop` events; non-stream responses are converted into Anthropic message JSON. Account selection, pinned routes, exhaustion detection, retries, and failover remain owned by the same provider proxy.
 
-For VSLLM accounts, `fable`, `fable-5`, and `claude-fable-5` are rewritten to the verified pay-per-request model ID `claude-fake-5`. Kimi K3 and Grok 4.5 use their VSLLM catalog IDs. Claude Code's `[1m]` suffix is client-side context metadata, so the proxy removes it before forwarding. These mappings are not applied to other providers.
-
-Kimi K3 and Fable use VSLLM's native Anthropic endpoint. VSLLM advertises Grok 4.5 only for `openai` and `openai-response`, so Grok requests are translated in-process from Claude Messages to `/v1/responses`. The bridge converts system and conversation content, images, thinking configuration, tools, tool choices, tool calls, and tool results. Streaming Responses events are converted back into Anthropic `message_start`, content-block, `message_delta`, and `message_stop` events; non-stream responses are converted into Anthropic message JSON. Account selection, pinned routes, exhaustion detection, retries, and failover remain owned by the same provider proxy.
-
-For bridged models, `/v1/messages/count_tokens` is estimated locally so context accounting does not consume a paid VSLLM request. Native Anthropic models continue to use their provider endpoint unchanged. The proxy answers Claude's `/v1/models?limit=1000` request locally with Kimi K3 and Grok 4.5 under reversible Claude-compatible IDs, avoiding the gateway discovery timeout caused by a slow upstream catalog. Claude session and agent headers are retained across the bridge, while Anthropic protocol headers are removed from the OpenAI Responses upstream request.
+For bridged models, `/v1/messages/count_tokens` is estimated locally so context accounting does not consume a paid VSLLM request. Native VSLLM models are forwarded to their provider endpoint unchanged. Claude session and agent headers are retained across the bridge, while Anthropic protocol headers are removed from the OpenAI Responses upstream request.
 
 The bridge architecture is informed by the MIT-licensed [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) Claude-to-Codex translator. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
@@ -461,29 +454,24 @@ For VSLLM accounts, the selected GPT-5.6 tier is forwarded unchanged. The older 
 
 | Codex request | VSLLM responses request | VSLLM compact request |
 | --- | --- | --- |
-| `gpt-5.2` | `gpt-5.5-pro20x` | `gpt-5.5-pro20x-openai-compact` |
+| `gpt-5.2` | `gpt-5.5` | `gpt-5.5-openai-compact` |
 | `gpt-5.6-sol` | `gpt-5.6-sol` | `gpt-5.6-sol` |
-| `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` | `gpt-5.6-sol-pro20x` |
 | `gpt-5.6-terra` | `gpt-5.6-terra` | `gpt-5.6-terra` |
-| `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` | `gpt-5.6-terra-pro20x` |
 | `gpt-5.6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |
-| `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` | `gpt-5.6-luna-pro20x` |
 
-Other model names pass through unchanged.
+Retired Pro20x IDs are normalized to their normal-model equivalents for existing sessions. Other model names pass through unchanged.
 
-Claude Code Fable routing is separate from the Codex table:
+Claude model routing is separate from the Codex table:
 
-| Claude Code request | VSLLM model | Upstream endpoint |
+| Claude Code selection | Upstream model | Upstream endpoint |
 | --- | --- | --- |
-| `fable` | `claude-fake-5` | `/v1/messages` |
-| `fable-5` | `claude-fake-5` | `/v1/messages` |
-| `claude-fable-5` | `claude-fake-5` | `/v1/messages` |
-| `kimi-k3[1m]` | `kimi-k3` | `/v1/messages` |
-| `grok-4.5[1m]` | `grok-4.5` | `/v1/responses` through the Claude bridge |
+| Official `claude-fable-5` | Official `claude-fable-5` | `https://api.anthropic.com/v1/messages` with Claude Code OAuth |
+| `VSLLM: claude-fable-5` | VSLLM `claude-fable-5` | VSLLM `/v1/messages` |
+| `VSLLM: claude-fake-5` | VSLLM `claude-fake-5` | VSLLM `/v1/messages` |
+| `VSLLM: kimi-k3` | VSLLM `kimi-k3` | VSLLM `/v1/messages` |
+| `VSLLM: grok-4.5` | VSLLM `grok-4.5` | VSLLM `/v1/responses` through the Claude bridge |
 
 The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
-
-Manual normal versus Pro20x selection is available through Codex's model picker. Automatic per-account tier preferences remain postponed; see [`task.md`](task.md).
 
 ### Compact Requests
 
@@ -754,6 +742,20 @@ The test suite covers:
 
 Do not use the restart script as a process killer. It intentionally protects active streams.
 
+### Official Claude Models Are Unavailable
+
+Official Claude choices require a current Claude Code OAuth login. Check it with:
+
+```shell
+claude auth status
+```
+
+If it reports `loggedIn: false`, sign in again and start a new Claude Code process:
+
+```shell
+claude auth login
+```
+
 ### Code Changed But Runtime Behavior Did Not
 
 Reload a running proxy gracefully:
@@ -839,7 +841,6 @@ Use of automated account or usage APIs can carry provider policy and account-res
 - This checkout currently vendors only the macOS arm64 native binary.
 - Automated system installation currently supports macOS only; Windows service and client setup are postponed.
 - Auto-switching is still considered experimental.
-- The VSLLM model-tier policy is hardcoded to `pro20x`; account-level normal/pro20x selection is postponed.
 - A newly reset fallback account becomes eligible but does not trigger automatic failback while the active account remains usable.
 - Without dashboard credentials, fixed VSLLM subscription windows can only use the less accurate rolling billing fallback.
 - Pinned routes isolate routing but do not reserve an account from other group workflows.

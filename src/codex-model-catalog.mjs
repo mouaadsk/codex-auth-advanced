@@ -8,13 +8,18 @@ import {
   writeTextFilePrivate
 } from "./storage.mjs";
 
-export const vsllmCodexModelVariants = Object.freeze([
-  Object.freeze({ normal: "gpt-5.6-sol", pro20x: "gpt-5.6-sol-pro20x" }),
-  Object.freeze({ normal: "gpt-5.6-terra", pro20x: "gpt-5.6-terra-pro20x" }),
-  Object.freeze({ normal: "gpt-5.6-luna", pro20x: "gpt-5.6-luna-pro20x" })
+export const vsllmCodexModelSlugs = Object.freeze([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna"
 ]);
 
-const managedPro20xSlugs = new Set(vsllmCodexModelVariants.map(({ pro20x }) => pro20x));
+// VSLLM retired these IDs. Keep the set so configure removes stale picker entries.
+const retiredVsllmPro20xSlugs = new Set([
+  "gpt-5.6-sol-pro20x",
+  "gpt-5.6-terra-pro20x",
+  "gpt-5.6-luna-pro20x"
+]);
 
 export function codexAuthAdvancedModelCatalogPath(codexHome) {
   return path.join(codexHome, "model-catalogs", "codex-auth-advanced.json");
@@ -29,31 +34,16 @@ function assertModelCatalog(catalog, source) {
 
 export function augmentedCodexModelCatalog(catalog) {
   const source = assertModelCatalog(catalog, "The source catalog");
-  const variantsByNormalSlug = new Map(vsllmCodexModelVariants.map((variant) => [variant.normal, variant]));
   const found = new Set();
   const models = [];
 
   for (const model of source.models) {
-    if (!model || typeof model.slug !== "string" || managedPro20xSlugs.has(model.slug)) continue;
+    if (!model || typeof model.slug !== "string" || retiredVsllmPro20xSlugs.has(model.slug)) continue;
     models.push(model);
-
-    const variant = variantsByNormalSlug.get(model.slug);
-    if (!variant) continue;
-    found.add(variant.normal);
-    const displayName = String(model.display_name || variant.normal);
-    models.push({
-      ...model,
-      slug: variant.pro20x,
-      display_name: `${displayName} Pro20x`,
-      description: `${displayName} through the VSLLM Pro20x route.`,
-      availability_nux: null,
-      upgrade: null
-    });
+    if (vsllmCodexModelSlugs.includes(model.slug)) found.add(model.slug);
   }
 
-  const missing = vsllmCodexModelVariants
-    .map(({ normal }) => normal)
-    .filter((slug) => !found.has(slug));
+  const missing = vsllmCodexModelSlugs.filter((slug) => !found.has(slug));
   if (missing.length > 0) {
     throw new Error(`The installed Codex model catalog is missing ${missing.join(", ")}. Update Codex before configuring the VSLLM model picker.`);
   }
@@ -100,7 +90,7 @@ function mergeUnmanagedCustomModels(bundledCatalog, configuredCatalog) {
   const bundledSlugs = new Set(bundledCatalog.models.map((model) => model?.slug).filter(Boolean));
   const customModels = configuredCatalog.models.filter((model) => {
     const slug = model?.slug;
-    return typeof slug === "string" && !bundledSlugs.has(slug) && !managedPro20xSlugs.has(slug);
+    return typeof slug === "string" && !bundledSlugs.has(slug) && !retiredVsllmPro20xSlugs.has(slug);
   });
   if (customModels.length === 0) return bundledCatalog;
   return { ...bundledCatalog, models: [...bundledCatalog.models, ...customModels] };

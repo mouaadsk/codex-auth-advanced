@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -78,7 +79,7 @@ fs.writeFileSync(path.join(accountsDir, "registry.json"), JSON.stringify({
 
 const originalClaudeSettings = {
   effortLevel: "high",
-  model: "claude-fable-5-dd-3k-imik",
+  model: "claude-fable-5-dd-3k-imik[1m]",
   env: {
     ANTHROPIC_BASE_URL: "https://old-gateway.example/anthropic",
     ANTHROPIC_AUTH_TOKEN: "old-token",
@@ -95,6 +96,12 @@ const originalClaudeSettings = {
   enabledPlugins: { example: true }
 };
 fs.writeFileSync(path.join(claudeDir, "settings.json"), `${JSON.stringify(originalClaudeSettings, null, 2)}\n`, { mode: 0o600 });
+const claudeGatewayModelsCachePath = path.join(claudeDir, "cache", "gateway-models.json");
+fs.mkdirSync(path.dirname(claudeGatewayModelsCachePath), { recursive: true, mode: 0o700 });
+fs.writeFileSync(claudeGatewayModelsCachePath, JSON.stringify({
+  baseUrl: originalClaudeSettings.env.ANTHROPIC_BASE_URL,
+  models: [{ id: "claude-fable-5-dd-3k-imik[1m]", display_name: "kimi-k3" }]
+}), { mode: 0o600 });
 
 function runInstaller() {
   return new Promise((resolve, reject) => {
@@ -161,6 +168,30 @@ function backupCount(filePath) {
 const expectedGroupId = Buffer.from(path.resolve(codexHome), "utf8").toString("base64url");
 const expectedBaseUrl = `http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${expectedGroupId}`;
 const expectedModelCatalogPath = path.join(codexHome, "model-catalogs", "codex-auth-advanced.json");
+const gatewayRequests = [];
+const gatewayProxy = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/_codex-auth-advanced/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  if (req.method === "GET" && req.url === `/_codex-auth-advanced/${expectedGroupId}/v1/models?limit=1000`) {
+    gatewayRequests.push({ authorization: req.headers.authorization, anthropicVersion: req.headers["anthropic-version"] });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      data: [
+        { id: "claude-vsllm-Y2xhdWRlLWZhYmxlLTU", display_name: "VSLLM: claude-fable-5", owned_by: "vsllm" },
+        { id: "claude-vsllm-a2ltaS1rMw[1m]", display_name: "VSLLM: kimi-k3", owned_by: "vsllm" },
+        { id: "claude-fable-5", display_name: "Claude Fable 5", owned_by: "anthropic" }
+      ]
+    }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
+});
+await new Promise((resolve) => gatewayProxy.listen(proxyPort, "127.0.0.1", resolve));
+gatewayProxy.unref();
 const configureHelp = await runWrapper(["configure", "--help"]);
 for (const expected of [
   "Usage: codex-auth-advanced configure [all|codex|claude]",
@@ -209,20 +240,15 @@ const configuredModelCatalog = JSON.parse(fs.readFileSync(expectedModelCatalogPa
 const configuredModelSlugs = configuredModelCatalog.models.map(({ slug }) => slug);
 for (const expected of [
   "gpt-5.6-sol",
-  "gpt-5.6-sol-pro20x",
   "gpt-5.6-terra",
-  "gpt-5.6-terra-pro20x",
-  "gpt-5.6-luna",
-  "gpt-5.6-luna-pro20x"
+  "gpt-5.6-luna"
 ]) {
   if (!configuredModelSlugs.includes(expected)) {
     throw new Error(`Codex model catalog is missing ${expected}: ${configuredModelSlugs.join(", ")}`);
   }
 }
-const configuredSol = configuredModelCatalog.models.find(({ slug }) => slug === "gpt-5.6-sol");
-const configuredSolPro20x = configuredModelCatalog.models.find(({ slug }) => slug === "gpt-5.6-sol-pro20x");
-if (JSON.stringify(configuredSol.supported_reasoning_levels) !== JSON.stringify(configuredSolPro20x.supported_reasoning_levels)) {
-  throw new Error("Codex Pro20x catalog entry did not preserve Sol reasoning levels");
+if (configuredModelSlugs.some((slug) => /pro[_-]?20x|pro20x/i.test(slug))) {
+  throw new Error(`Codex model catalog retained retired Pro20x entries: ${configuredModelSlugs.join(", ")}`);
 }
 
 const claudeSettingsPath = path.join(claudeDir, "settings.json");
@@ -230,17 +256,16 @@ const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf8"));
 if (claudeSettings.effortLevel !== "high" || claudeSettings.enabledPlugins?.example !== true) {
   throw new Error(`Claude settings lost unrelated values: ${JSON.stringify(claudeSettings)}`);
 }
-if (claudeSettings.model !== "claude-fable-5-dd-3k-imik[1m]") {
+if (claudeSettings.model !== "claude-vsllm-a2ltaS1rMw[1m]") {
   throw new Error(`Claude Kimi selection was not migrated to 1M context: ${JSON.stringify(claudeSettings)}`);
 }
 if (claudeSettings.env.ANTHROPIC_BASE_URL !== expectedBaseUrl
-  || claudeSettings.env.ANTHROPIC_AUTH_TOKEN !== "codex-auth-advanced-local-proxy"
   || claudeSettings.env.ANTHROPIC_DEFAULT_FABLE_MODEL !== "claude-fable-5"
   || claudeSettings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY !== "1") {
   throw new Error(`Claude proxy settings are incomplete: ${JSON.stringify(claudeSettings.env)}`);
 }
-if (claudeSettings.env.ANTHROPIC_API_KEY != null) {
-  throw new Error("Claude settings retained a conflicting ANTHROPIC_API_KEY");
+if (claudeSettings.env.ANTHROPIC_API_KEY != null || claudeSettings.env.ANTHROPIC_AUTH_TOKEN != null) {
+  throw new Error("Claude settings retained an authentication override that would prevent OAuth passthrough");
 }
 for (const stale of [
   "ANTHROPIC_MODEL",
@@ -255,6 +280,23 @@ for (const stale of [
 if (claudeSettings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC != null
   || claudeSettings.env.CUSTOM_SETTING_TO_KEEP !== "yes") {
   throw new Error(`Claude settings lost preserved environment values: ${JSON.stringify(claudeSettings.env)}`);
+}
+if (fs.existsSync(claudeGatewayModelsCachePath)) {
+  const claudeGatewayModelsCache = JSON.parse(fs.readFileSync(claudeGatewayModelsCachePath, "utf8"));
+  if (claudeGatewayModelsCache.baseUrl !== expectedBaseUrl
+    || JSON.stringify(claudeGatewayModelsCache.models) !== JSON.stringify([
+      { id: "claude-vsllm-Y2xhdWRlLWZhYmxlLTU", display_name: "VSLLM: claude-fable-5" },
+      { id: "claude-vsllm-a2ltaS1rMw[1m]", display_name: "VSLLM: kimi-k3" }
+    ])) {
+    throw new Error(`Claude gateway model cache was not refreshed correctly: ${JSON.stringify(claudeGatewayModelsCache)}`);
+  }
+} else {
+  throw new Error("Claude gateway model cache was not created after configuration");
+}
+if (gatewayRequests.length === 0
+  || gatewayRequests.some((request) => request.authorization !== "Bearer codex-auth-advanced-gateway-cache"
+    || request.anthropicVersion !== "2023-06-01")) {
+  throw new Error(`Claude gateway model cache refresh used invalid proxy credentials: ${JSON.stringify(gatewayRequests)}`);
 }
 
 const plistPath = path.join(home, "Library", "LaunchAgents", "com.mouaadsk.codex-auth-advanced.proxy.plist");
@@ -302,4 +344,5 @@ if (backupCount(codexConfigPath) !== codexBackupsAfterFirst || backupCount(claud
   throw new Error("direct configure commands created unnecessary backups");
 }
 
+await new Promise((resolve) => gatewayProxy.close(resolve));
 console.log("macOS installer configuration ok");

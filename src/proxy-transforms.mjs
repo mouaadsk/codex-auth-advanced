@@ -171,7 +171,7 @@ export function decodeProxyJsonBody(body, headers, { alreadyDecoded = false } = 
 
 export function rewriteProviderProxyRequestBody(target, body, headers = {}, options = {}) {
   if (!body || !Buffer.isBuffer(body) || body.length === 0) {
-    return { body, rewritten: false, decoded: false, decodeFailed: false };
+    return { body, rewritten: false, decoded: false, decodeFailed: false, originalModel: null };
   }
 
   const decoded = decodeProxyJsonBody(body, headers, options);
@@ -179,8 +179,10 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
   try {
     parsed = JSON.parse(decoded.body.toString("utf8"));
   } catch {
-    return { body, rewritten: false, decoded: decoded.decoded, decodeFailed: decoded.decodeFailed };
+    return { body, rewritten: false, decoded: decoded.decoded, decodeFailed: decoded.decodeFailed, originalModel: null };
   }
+
+  const originalModel = typeof parsed?.model === "string" ? parsed.model : null;
 
   let rewritten = false;
   if (isCompactProxyTarget(target) && parsed && parsed.client_metadata !== undefined) {
@@ -207,7 +209,8 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
       body: decoded.decoded ? decoded.body : body,
       rewritten: false,
       decoded: decoded.decoded,
-      decodeFailed: decoded.decodeFailed
+      decodeFailed: decoded.decodeFailed,
+      originalModel
     };
   }
 
@@ -215,7 +218,8 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
     body: Buffer.from(JSON.stringify(parsed), "utf8"),
     rewritten: true,
     decoded: true,
-    decodeFailed: decoded.decodeFailed
+    decodeFailed: decoded.decodeFailed,
+    originalModel
   };
 }
 

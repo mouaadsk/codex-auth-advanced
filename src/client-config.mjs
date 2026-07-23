@@ -1,7 +1,10 @@
 import path from "node:path";
 import { upsertModelCatalogConfig } from "./codex-config.mjs";
 import { ensureCodexAuthAdvancedModelCatalog } from "./codex-model-catalog.mjs";
-import { encodedClaudeGatewayModelId } from "./provider-policy.mjs";
+import {
+  encodedClaudeGatewayModelId,
+  encodedVsllmClaudeGatewayModelId
+} from "./provider-policy.mjs";
 import {
   accountConfigPath,
   backupIfExists,
@@ -15,7 +18,7 @@ import {
   writeTextFilePrivate
 } from "./storage.mjs";
 
-export function createClientConfigService({ providerProxy, accountService, claudeProxyAuthMarker }) {
+export function createClientConfigService({ providerProxy, accountService }) {
   const providerProxyBaseUrl = providerProxy.baseUrl;
   const ensureProviderProxyRunning = providerProxy.ensureRunning;
   const activeRegistryAccountFromRegistry = accountService.activeRegistryAccountFromRegistry;
@@ -74,6 +77,65 @@ export function createClientConfigService({ providerProxy, accountService, claud
     return path.join(userHome(), ".claude", "settings.json");
   }
 
+  function claudeGatewayModelsCachePath() {
+    return path.join(userHome(), ".claude", "cache", "gateway-models.json");
+  }
+
+  async function refreshClaudeGatewayModelCache(codexHome) {
+    const cachePath = claudeGatewayModelsCachePath();
+    const baseUrl = providerProxyBaseUrl(codexHome);
+    try {
+      if (!(await ensureProviderProxyRunning({ quiet: true }))) {
+        throw new Error("the local provider proxy is not healthy");
+      }
+      const response = await fetch(`${baseUrl}/v1/models?limit=1000`, {
+        headers: {
+          authorization: "Bearer codex-auth-advanced-gateway-cache",
+          "anthropic-version": "2023-06-01",
+          "user-agent": "codex-auth-advanced configure"
+        },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!response.ok) throw new Error(`the provider proxy returned HTTP ${response.status}`);
+      const body = await response.json();
+      const seen = new Set();
+      const models = (Array.isArray(body?.data) ? body.data : [])
+        .map((model) => {
+          const id = typeof model?.id === "string" ? model.id.trim() : "";
+          if (!id || !/^(claude|anthropic)-/i.test(id) || model?.owned_by !== "vsllm" || seen.has(id)) return null;
+          seen.add(id);
+          return {
+            id,
+            display_name: typeof model.display_name === "string" && model.display_name.trim()
+              ? model.display_name.trim()
+              : id
+          };
+        })
+        .filter(Boolean);
+      if (models.length === 0) throw new Error("the provider proxy returned no VSLLM Anthropic-compatible models");
+
+      const existing = readJsonFile(cachePath);
+      const unchanged = existing?.baseUrl === baseUrl
+        && JSON.stringify(existing?.models || []) === JSON.stringify(models);
+      if (!unchanged) {
+        ensureDir(path.dirname(cachePath));
+        writeTextFilePrivate(cachePath, `${JSON.stringify({
+          baseUrl,
+          fetchedAt: Date.now(),
+          models
+        }, null, 2)}\n`, 0o600);
+      }
+      return { refreshed: true, changed: !unchanged, count: models.length, error: null };
+    } catch (error) {
+      return {
+        refreshed: false,
+        changed: false,
+        count: 0,
+        error: error?.message || String(error)
+      };
+    }
+  }
+
   function isClaudeModelSelection(value) {
     const normalized = String(value || "").trim().toLowerCase().replace(/\[1m\]$/, "");
     return ["default", "best", "fable", "opus", "sonnet", "haiku", "opusplan"].includes(normalized)
@@ -81,7 +143,7 @@ export function createClientConfigService({ providerProxy, accountService, claud
       || normalized.startsWith("anthropic-");
   }
 
-  function configureClaudeCodeClient(codexHome) {
+  async function configureClaudeCodeClient(codexHome) {
     const settingsPath = claudeSettingsPath();
     const existingText = readTextFile(settingsPath);
     let settings = {};
@@ -103,11 +165,17 @@ export function createClientConfigService({ providerProxy, accountService, claud
       ? { ...settings.env }
       : {};
     const legacyKimiModel = encodedClaudeGatewayModelId("kimi-k3");
-    const kimi1mModel = `${legacyKimiModel}[1m]`;
-    if (["kimi-k3", legacyKimiModel].includes(String(settings.model || "").trim())) {
+    const kimi1mModel = `${encodedVsllmClaudeGatewayModelId("kimi-k3")}[1m]`;
+    const isLegacyKimiModel = (value) => [
+      "kimi-k3",
+      "kimi-k3[1m]",
+      legacyKimiModel,
+      `${legacyKimiModel}[1m]`
+    ].includes(String(value || "").trim().toLowerCase());
+    if (isLegacyKimiModel(settings.model)) {
       settings.model = kimi1mModel;
     }
-    if (["kimi-k3", legacyKimiModel].includes(String(env.ANTHROPIC_MODEL || "").trim())) {
+    if (isLegacyKimiModel(env.ANTHROPIC_MODEL)) {
       env.ANTHROPIC_MODEL = kimi1mModel;
     }
     const removedModelOverrides = [];
@@ -133,26 +201,29 @@ export function createClientConfigService({ providerProxy, accountService, claud
     const removedDiscoverySuppression = String(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "") === "1";
     if (removedDiscoverySuppression) delete env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
     delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
     env.ANTHROPIC_BASE_URL = providerProxyBaseUrl(codexHome);
-    env.ANTHROPIC_AUTH_TOKEN = claudeProxyAuthMarker;
     env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5";
     env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
     settings.env = env;
 
     const nextText = `${JSON.stringify(settings, null, 2)}\n`;
-    if (nextText !== existingText) {
+    const settingsChanged = nextText !== existingText;
+    if (settingsChanged) {
       ensureDir(path.dirname(settingsPath));
       backupIfExists(settingsPath);
       writeTextFilePrivate(settingsPath, nextText, 0o600);
     }
+    const gatewayModelCache = await refreshClaudeGatewayModelCache(codexHome);
 
     return {
       configured: true,
-      changed: nextText !== existingText,
+      changed: settingsChanged || gatewayModelCache.changed,
       settingsPath,
       baseUrl: env.ANTHROPIC_BASE_URL,
       removedModelOverrides,
-      removedDiscoverySuppression
+      removedDiscoverySuppression,
+      gatewayModelCache
     };
   }
 
@@ -193,13 +264,18 @@ export function createClientConfigService({ providerProxy, accountService, claud
     }
 
     if (target === "all" || target === "claude") {
-      const result = configureClaudeCodeClient(codexHome);
+      const result = await configureClaudeCodeClient(codexHome);
       process.stdout.write(`Claude Code: ${result.changed ? "configured" : "already configured"} at ${result.baseUrl}.\n`);
       if (result.removedModelOverrides.length > 0) {
         process.stdout.write(`Claude Code: removed stale model overrides: ${result.removedModelOverrides.join(", ")}.\n`);
       }
       if (result.removedDiscoverySuppression) {
         process.stdout.write("Claude Code: removed CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 so gateway models can appear in /model.\n");
+      }
+      if (result.gatewayModelCache.refreshed) {
+        process.stdout.write(`Claude Code: ${result.gatewayModelCache.changed ? "cached" : "already cached"} ${result.gatewayModelCache.count} VSLLM gateway model(s).\n`);
+      } else {
+        process.stderr.write(`Claude Code: could not refresh VSLLM gateway models (${result.gatewayModelCache.error}).\n`);
       }
     }
     return true;

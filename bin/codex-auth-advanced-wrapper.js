@@ -35,7 +35,7 @@ const launchAgentLabel = "com.mouaadsk.codex-auth-advanced.manager";
 const providerProxyHost = process.env.CODEX_AUTH_ADVANCED_PROXY_HOST || "127.0.0.1";
 const providerProxyPort = Number(process.env.CODEX_AUTH_ADVANCED_PROXY_PORT || 47778);
 const providerProxyPrefix = "/_codex-auth-advanced";
-const claudeProxyAuthMarker = "codex-auth-advanced-local-proxy";
+const officialAnthropicBaseUrl = process.env.CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL || "https://api.anthropic.com";
 const vsllmTransientUsageLimitMaxRetries = 1;
 const vsllmTransientUsageLimitRetryDelayMs = 500;
 const modelCapacityMaxRetries = 3;
@@ -58,7 +58,8 @@ const providerProxy = createProviderProxy({
   vsllmTransientUsageLimitMaxRetries,
   vsllmTransientUsageLimitRetryDelayMs,
   modelCapacityMaxRetries,
-  modelCapacityRetryBaseDelayMs
+  modelCapacityRetryBaseDelayMs,
+  officialAnthropicBaseUrl
 });
 accountService = createAccountService({ providerProxy, chatgptCodexBaseUrl });
 const {
@@ -67,8 +68,7 @@ const {
 } = accountService;
 const clientConfigService = createClientConfigService({
   providerProxy,
-  accountService,
-  claudeProxyAuthMarker
+  accountService
 });
 const {
   ensureAllActiveAccountConfigs,

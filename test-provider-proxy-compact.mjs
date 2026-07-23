@@ -75,6 +75,7 @@ const usageTotalsByBearer = new Map([
   ["Bearer vsllm-secret", 28.097534],
   ["Bearer vsllm-2-secret", 96.242272]
 ]);
+const officialAnthropicPathPrefix = "/official-anthropic";
 const upstream = http.createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -105,17 +106,35 @@ const upstream = http.createServer(async (req, res) => {
     }));
     return;
   }
+  if (req.method === "GET" && req.url.startsWith(`${officialAnthropicPathPrefix}/v1/models`)) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      data: [
+        { id: "claude-fable-5", display_name: "Claude Fable 5", owned_by: "anthropic", max_input_tokens: 200000, max_tokens: 32000 },
+        { id: "claude-sonnet-5", display_name: "Claude Sonnet 5", owned_by: "anthropic", max_input_tokens: 200000, max_tokens: 32000 }
+      ]
+    }));
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/v1/models")) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       data: [
-        { id: "claude-fable-5", display_name: "Claude Fable 5" },
-        { id: "claude-fake-5", display_name: "Claude Fake 5" },
-        { id: "kimi-k3", display_name: "Kimi K3" },
-        { id: "grok-4.5", display_name: "Grok 4.5" },
-        { id: "gpt-5.5", display_name: "GPT 5.5" }
+        { id: "claude-fable-5", display_name: "Claude Fable 5", supported_endpoint_types: ["anthropic"] },
+        { id: "claude-fake-5", display_name: "Claude Fake 5", supported_endpoint_types: ["anthropic"] },
+        { id: "kimi-k3", display_name: "Kimi K3", supported_endpoint_types: ["anthropic"] },
+        { id: "grok-4.5", display_name: "Grok 4.5", supported_endpoint_types: ["openai", "openai-response"] },
+        { id: "gpt-5.5", display_name: "GPT 5.5", supported_endpoint_types: ["openai", "anthropic"] }
       ]
     }));
+    return;
+  }
+  if (req.method === "POST" && req.url.startsWith(`${officialAnthropicPathPrefix}/v1/messages`)) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache"
+    });
+    res.end(claudeSseBody);
     return;
   }
   if (req.method === "POST" && req.url.startsWith("/v1/messages")) {
@@ -310,6 +329,10 @@ function waitForChildExit(child, timeoutMs = 3000) {
 
 function proxyGroupId(home) {
   return Buffer.from(path.resolve(home), "utf8").toString("base64url");
+}
+
+function vsllmClaudeGatewayModelId(model, suffix = "") {
+  return `claude-vsllm-${Buffer.from(model, "utf8").toString("base64url")}${suffix}`;
 }
 
 function writeAccount({
@@ -576,7 +599,8 @@ function runWrapper(args) {
         ...process.env,
         HOME: tempRoot,
         CODEX_HOME: codexHome,
-        CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort)
+        CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort),
+        CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL: `${upstreamBaseUrl}${officialAnthropicPathPrefix}`
       },
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -615,6 +639,7 @@ const proxy = spawn(process.execPath, [wrapper, "proxy", "serve"], {
     CODEX_HOME: codexHome,
     CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort),
     CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL: upstreamBaseUrl,
+    CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL: `${upstreamBaseUrl}${officialAnthropicPathPrefix}`,
     CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS: "5"
   },
   stdio: ["ignore", "pipe", "pipe"]
@@ -725,13 +750,13 @@ try {
     ...body,
     model: "gpt-5.2"
   };
-  const vsllmSelectableModelVariants = [
+  const vsllmModelMappings = [
     ["gpt-5.6-sol", "gpt-5.6-sol", "ultra"],
-    ["gpt-5.6-sol-pro20x", "gpt-5.6-sol-pro20x", "ultra"],
+    ["gpt-5.6-sol-pro20x", "gpt-5.6-sol", "ultra"],
     ["gpt-5.6-terra", "gpt-5.6-terra", "ultra"],
-    ["gpt-5.6-terra-pro20x", "gpt-5.6-terra-pro20x", "ultra"],
+    ["gpt-5.6-terra-pro20x", "gpt-5.6-terra", "ultra"],
     ["gpt-5.6-luna", "gpt-5.6-luna", "max"],
-    ["gpt-5.6-luna-pro20x", "gpt-5.6-luna-pro20x", "max"]
+    ["gpt-5.6-luna-pro20x", "gpt-5.6-luna", "max"]
   ];
 
   setActive("apikey-vsllm");
@@ -741,7 +766,7 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.5-pro20x",
+    expectedModel: "gpt-5.5",
     expectedReasoningEffort: "xhigh"
   });
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
@@ -779,7 +804,7 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.5-pro20x-openai-compact"
+    expectedModel: "gpt-5.5-openai-compact"
   });
   assertCompactResponseTextContent("vsllm compact aliased response", aliasedCompactRes);
 
@@ -794,17 +819,17 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.5-pro20x-openai-compact"
+    expectedModel: "gpt-5.5-openai-compact"
   });
   assertRequestAt(beforeAliasedVsllmFallback + 1, {
     label: "vsllm compact alias fallback",
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: false,
-    expectedModel: "gpt-5.5-pro20x-openai-compact"
+    expectedModel: "gpt-5.5-openai-compact"
   });
 
-  for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmSelectableModelVariants) {
+  for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmModelMappings) {
     const aliasBody = {
       ...body,
       model: inputModel,
@@ -859,9 +884,12 @@ try {
   }
 
   const claudeModelRoutes = [
-    { inputModel: "fable", expectedModel: "claude-fake-5", wireApi: "anthropic" },
-    { inputModel: "fable-5", expectedModel: "claude-fake-5", wireApi: "anthropic" },
-    { inputModel: "claude-fable-5", expectedModel: "claude-fake-5", wireApi: "anthropic" },
+    { inputModel: vsllmClaudeGatewayModelId("claude-fable-5"), expectedModel: "claude-fable-5", wireApi: "anthropic" },
+    { inputModel: vsllmClaudeGatewayModelId("claude-fake-5"), expectedModel: "claude-fake-5", wireApi: "anthropic" },
+    { inputModel: vsllmClaudeGatewayModelId("gpt-5.5"), expectedModel: "gpt-5.5", wireApi: "anthropic" },
+    { inputModel: vsllmClaudeGatewayModelId("kimi-k3", "[1m]"), expectedModel: "kimi-k3", wireApi: "anthropic" },
+    { inputModel: vsllmClaudeGatewayModelId("grok-4.5", "[1m]"), expectedModel: "grok-4.5", wireApi: "responses" },
+    { inputModel: "claude-fake-5", expectedModel: "claude-fake-5", wireApi: "anthropic" },
     { inputModel: "grok-4.5[1m]", expectedModel: "grok-4.5", wireApi: "responses" },
     { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3", wireApi: "anthropic" },
     { inputModel: "claude-fable-5-dd-3k-imik", expectedModel: "kimi-k3", wireApi: "anthropic" },
@@ -944,6 +972,37 @@ try {
     }
   }
 
+  const beforeOfficialClaudeRequest = upstreamRequests.length;
+  const officialClaudeResponse = await proxyRawRequest(proxyPort, "/v1/messages?beta=true", {
+    model: "claude-fable-5",
+    max_tokens: 256,
+    stream: true,
+    messages: [{ role: "user", content: "Reply with the official model." }]
+  }, {
+    authorization: "Bearer official-oauth",
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "test-beta-2026-07-17",
+    "x-claude-code-session-id": "official-session",
+    "x-claude-code-agent-id": "official-agent"
+  });
+  if (officialClaudeResponse.status !== 200 || await officialClaudeResponse.text() !== claudeSseBody) {
+    throw new Error("official Claude request did not preserve the Anthropic Messages response");
+  }
+  if (upstreamRequests.length !== beforeOfficialClaudeRequest + 1) {
+    throw new Error("official Claude request should make exactly one upstream request");
+  }
+  const officialClaudeRequest = upstreamRequests.at(-1);
+  if (officialClaudeRequest?.url !== `${officialAnthropicPathPrefix}/v1/messages?beta=true`
+    || officialClaudeRequest.authorization !== "Bearer official-oauth"
+    || officialClaudeRequest.apiKey !== undefined
+    || officialClaudeRequest.anthropicVersion !== "2023-06-01"
+    || officialClaudeRequest.anthropicBeta !== "test-beta-2026-07-17"
+    || officialClaudeRequest.claudeSessionId !== "official-session"
+    || officialClaudeRequest.claudeAgentId !== "official-agent"
+    || JSON.parse(officialClaudeRequest.bodyText).model !== "claude-fable-5") {
+    throw new Error(`official Claude request did not preserve OAuth routing: ${JSON.stringify(officialClaudeRequest)}`);
+  }
+
   const beforeClaudeCountTokens = upstreamRequests.length;
   const countTokensResponse = await proxyRawRequest(proxyPort, "/v1/messages/count_tokens?beta=true", {
     model: "claude-fable-5-dd-5.4-korg[1m]",
@@ -996,18 +1055,33 @@ try {
     throw new Error(`Claude gateway model discovery failed with ${modelsResponse.status}: ${await modelsResponse.text()}`);
   }
   const models = await modelsResponse.json();
-  const kimiModel = models.data?.find((model) => model.id === "claude-fable-5-dd-3k-imik[1m]");
-  const grokModel = models.data?.find((model) => model.id === "claude-fable-5-dd-5.4-korg[1m]");
+  const officialFableModel = models.data?.find((model) => model.id === "claude-fable-5");
+  const officialSonnetModel = models.data?.find((model) => model.id === "claude-sonnet-5");
+  const vsllmFableModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("claude-fable-5"));
+  const fakeModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("claude-fake-5"));
+  const kimiModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("kimi-k3", "[1m]"));
+  const grokModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("grok-4.5", "[1m]"));
+  const gptModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("gpt-5.5"));
   if (models.has_more !== false
-    || kimiModel?.display_name !== "kimi-k3"
+    || officialFableModel?.display_name !== "Claude Fable 5"
+    || officialSonnetModel?.display_name !== "Claude Sonnet 5"
+    || vsllmFableModel?.display_name !== "VSLLM: claude-fable-5"
+    || fakeModel?.display_name !== "VSLLM: claude-fake-5"
+    || kimiModel?.display_name !== "VSLLM: kimi-k3"
     || kimiModel?.max_input_tokens !== 1000000
-    || grokModel?.display_name !== "grok-4.5"
+    || grokModel?.display_name !== "VSLLM: grok-4.5"
     || grokModel?.max_input_tokens !== 1000000
-    || models.data?.length !== 2) {
-    throw new Error(`Claude gateway model discovery did not expose the independent VSLLM models: ${JSON.stringify(models)}`);
+    || gptModel?.display_name !== "VSLLM: gpt-5.5"
+    || models.data?.length !== 7) {
+    throw new Error(`Claude gateway model discovery did not merge official and VSLLM models: ${JSON.stringify(models)}`);
   }
-  if (upstreamRequests.length !== beforeClaudeModelsRequest) {
-    throw new Error("Claude gateway model discovery should be served locally without waiting for VSLLM");
+  const discoveryRequests = upstreamRequests.slice(beforeClaudeModelsRequest);
+  const vsllmDiscoveryRequest = discoveryRequests.find((request) => request.url === "/v1/models?limit=1000");
+  const officialDiscoveryRequest = discoveryRequests.find((request) => request.url === `${officialAnthropicPathPrefix}/v1/models?limit=1000`);
+  if (discoveryRequests.length !== 2
+    || vsllmDiscoveryRequest?.authorization !== "Bearer vsllm-secret"
+    || officialDiscoveryRequest?.authorization !== "Bearer local-claude-marker") {
+    throw new Error(`Claude gateway discovery used incorrect provider authentication: ${JSON.stringify(discoveryRequests)}`);
   }
 
   const plainModelsResponse = await fetch(`http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${proxyGroupId(codexHome)}/v1/models?limit=1000`, {
@@ -1291,7 +1365,7 @@ try {
     expectedModel: "gpt-5.6-terra"
   });
   const tcdmxClaudeResponse = await proxyRawRequest(proxyPort, "/v1/messages", {
-    model: "claude-fable-5",
+    model: vsllmClaudeGatewayModelId("claude-fable-5"),
     max_tokens: 64,
     stream: true,
     messages: [{ role: "user", content: "test" }]
@@ -1300,7 +1374,7 @@ try {
   });
   await tcdmxClaudeResponse.text();
   assertLatestRequest({
-    label: "tcdmx Claude model untouched",
+    label: "tcdmx VSLLM Claude Fable model",
     bearer: "tcdmx-secret",
     acceptEncoding: "identity",
     expectedModel: "claude-fable-5"

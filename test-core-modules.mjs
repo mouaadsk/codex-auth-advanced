@@ -16,7 +16,7 @@ import {
 } from "./src/codex-config.mjs";
 import {
   augmentedCodexModelCatalog,
-  vsllmCodexModelVariants
+  vsllmCodexModelSlugs
 } from "./src/codex-model-catalog.mjs";
 import {
   accountAuthPath,
@@ -33,6 +33,8 @@ import {
   apiProviderExhaustionReason,
   apiProviderTransientRetryReason,
   encodedClaudeGatewayModelId,
+  encodedVsllmClaudeGatewayModelId,
+  isVsllmClaudeGatewayModelId,
   parseVsllmSubscriptionSelf,
   remappedProxyRequestModel,
   resolvedClaudeGatewayModelId,
@@ -113,27 +115,24 @@ try {
   );
 
   const baseCatalog = {
-    models: vsllmCodexModelVariants.map(({ normal }, index) => ({
-      slug: normal,
-      display_name: normal.replace("gpt-", "GPT-").replaceAll("-", " "),
+    models: vsllmCodexModelSlugs.map((slug, index) => ({
+      slug,
+      display_name: slug.replace("gpt-", "GPT-").replaceAll("-", " "),
       description: `base model ${index}`,
       supported_reasoning_levels: [{ effort: index === 2 ? "max" : "ultra" }],
       model_messages: { instructions_template: `instructions ${index}` },
       visibility: "list"
-    }))
+    })).concat({
+      slug: "gpt-5.6-sol-pro20x",
+      display_name: "Retired Sol Pro20x",
+      supported_reasoning_levels: [{ effort: "ultra" }]
+    })
   };
   const augmentedCatalog = augmentedCodexModelCatalog(baseCatalog);
   assert.deepEqual(
     augmentedCatalog.models.map(({ slug }) => slug),
-    vsllmCodexModelVariants.flatMap(({ normal, pro20x }) => [normal, pro20x])
+    vsllmCodexModelSlugs
   );
-  for (const { normal, pro20x } of vsllmCodexModelVariants) {
-    const baseModel = augmentedCatalog.models.find(({ slug }) => slug === normal);
-    const pro20xModel = augmentedCatalog.models.find(({ slug }) => slug === pro20x);
-    assert.deepEqual(pro20xModel.supported_reasoning_levels, baseModel.supported_reasoning_levels);
-    assert.deepEqual(pro20xModel.model_messages, baseModel.model_messages);
-    assert.equal(pro20xModel.availability_nux, null);
-  }
 
   const generated = defaultApiKeyConfig("https://vsllm.example/v1", sourceToml, "openai");
   assert.match(generated, /^model = "gpt-5\.6-sol"$/m);
@@ -188,11 +187,19 @@ try {
   );
   assert.equal(
     remappedProxyRequestModel("gpt-5.6-terra-pro20x", { account: vsllmAccount }),
-    null
+    "gpt-5.6-terra"
   );
   assert.equal(
     remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }, { compact: true }),
-    "gpt-5.5-pro20x-openai-compact"
+    "gpt-5.5-openai-compact"
+  );
+  assert.equal(
+    remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }),
+    "gpt-5.5"
+  );
+  assert.equal(
+    remappedProxyRequestModel("gpt-5.5-pro20x", { account: vsllmAccount }, { compact: true }),
+    "gpt-5.5-openai-compact"
   );
   assert.equal(
     remappedProxyRequestModel("grok-4.5[1m]", { account: vsllmAccount }),
@@ -204,6 +211,12 @@ try {
   );
   assert.equal(encodedClaudeGatewayModelId("kimi-k3"), "claude-fable-5-dd-3k-imik");
   assert.equal(encodedClaudeGatewayModelId("grok-4.5"), "claude-fable-5-dd-5.4-korg");
+  const namespacedVsllmFable = encodedVsllmClaudeGatewayModelId("claude-fable-5");
+  assert.match(namespacedVsllmFable, /^claude-vsllm-/);
+  assert.equal(resolvedClaudeGatewayModelId(namespacedVsllmFable), "claude-fable-5");
+  assert.equal(isVsllmClaudeGatewayModelId(namespacedVsllmFable), true);
+  assert.equal(isVsllmClaudeGatewayModelId("claude-fable-5"), false);
+  assert.equal(isVsllmClaudeGatewayModelId("claude-fake-5"), true);
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik"), "kimi-k3");
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik[1m]"), "kimi-k3[1m]");
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-5.4-korg[1m]"), "grok-4.5[1m]");
@@ -244,7 +257,7 @@ try {
   const rewrittenJson = JSON.parse(rewrittenCompact.body.toString("utf8"));
   assert.equal(rewrittenCompact.rewritten, true);
   assert.equal(rewrittenCompact.decoded, true);
-  assert.equal(rewrittenJson.model, "gpt-5.5-pro20x-openai-compact");
+  assert.equal(rewrittenJson.model, "gpt-5.5-openai-compact");
   assert.equal(rewrittenJson.client_metadata, undefined);
   assert.equal(rewrittenJson.reasoning.effort, "xhigh");
 

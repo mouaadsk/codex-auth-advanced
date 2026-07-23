@@ -9,7 +9,8 @@ import zlib from "node:zlib";
 import { readClonedResponseBody } from "./provider-client.mjs";
 import {
   claudeGatewayModelsResponse,
-  isClaudeGatewayModelsRequest
+  isClaudeGatewayModelsRequest,
+  isVsllmClaudeGatewayModel
 } from "./claude-gateway.mjs";
 import {
   createClaudeResponsesSseTransformStream,
@@ -49,8 +50,11 @@ export function createProviderProxy(options) {
   const vsllmTransientUsageLimitRetryDelayMs = options.vsllmTransientUsageLimitRetryDelayMs;
   const modelCapacityMaxRetries = options.modelCapacityMaxRetries;
   const modelCapacityRetryBaseDelayMs = options.modelCapacityRetryBaseDelayMs;
+  const officialAnthropicBaseUrl = String(options.officialAnthropicBaseUrl || "https://api.anthropic.com").replace(/\/+$/, "");
 
   const chatgptCloudflareCookies = new Map();
+  const claudeGatewayCatalogCache = new Map();
+  const claudeGatewayCatalogCacheTtlMs = 5 * 60 * 1000;
   let providerProxyServer = null;
   let providerProxyStartedAtMs = null;
   let providerProxyRestartRequested = false;
@@ -200,6 +204,68 @@ export function createProviderProxy(options) {
       : activeApiProxyTarget(route.codexHome);
     if (target.error) return target;
     return proxyRequestTargetUrl(req, route.codexHome, target, route.pathPrefix);
+  }
+
+  function officialAnthropicTargetForProxyRequest(req, route) {
+    return proxyRequestTargetUrl(req, route.codexHome, {
+      upstreamBaseUrl: officialAnthropicBaseUrl,
+      officialAnthropic: true
+    }, route.pathPrefix);
+  }
+
+  function isClaudeMessagesTarget(target) {
+    try {
+      const pathname = new URL(target?.url || "").pathname.replace(/\/$/, "");
+      return pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/messages/count_tokens");
+    } catch {
+      return false;
+    }
+  }
+
+  function isOfficialClaudeModel(model) {
+    const normalized = String(model || "").trim().toLowerCase().replace(/\[1m\]$/i, "");
+    if (!normalized || isVsllmClaudeGatewayModel(model)) return false;
+    return /^(claude|anthropic)-/.test(normalized)
+      || ["default", "best", "fable", "fable-5", "opus", "sonnet", "haiku", "opusplan"].includes(normalized);
+  }
+
+  async function modelsFromProvider(req, target) {
+    try {
+      const response = await fetchProviderTarget(req, target, undefined, { timeout: 5000 });
+      if (!response.ok) return null;
+      const body = await response.json();
+      return Array.isArray(body?.data) ? body.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function claudeGatewayCatalogForRequest(req, target, route) {
+    const cacheKey = target.account?.account_key || target.upstreamBaseUrl || target.url;
+    const cached = claudeGatewayCatalogCache.get(cacheKey);
+    if (cached?.complete && Date.now() - cached.createdAtMs < claudeGatewayCatalogCacheTtlMs) {
+      return cached.catalog;
+    }
+
+    const officialTarget = officialAnthropicTargetForProxyRequest(req, route);
+    const [vsllmModels, officialModels] = await Promise.all([
+      modelsFromProvider(req, target),
+      modelsFromProvider(req, officialTarget)
+    ]);
+    const catalog = claudeGatewayModelsResponse({
+      vsllmModels: vsllmModels ?? cached?.vsllmModels ?? [],
+      officialModels: officialModels ?? cached?.officialModels ?? []
+    });
+    if (vsllmModels != null || officialModels != null) {
+      claudeGatewayCatalogCache.set(cacheKey, {
+        createdAtMs: Date.now(),
+        complete: vsllmModels != null && officialModels != null,
+        catalog,
+        vsllmModels: vsllmModels ?? cached?.vsllmModels ?? [],
+        officialModels: officialModels ?? cached?.officialModels ?? []
+      });
+    }
+    return catalog;
   }
 
   function providerProxyRouteFromIncoming(incoming) {
@@ -365,7 +431,9 @@ export function createProviderProxy(options) {
       if (lower === "proxy-authenticate" || lower === "proxy-authorization" || lower === "proxy-connection" || lower === "te" || lower === "trailer" || lower === "transfer-encoding") continue;
       if (!websocket && (lower === "connection" || lower === "upgrade")) continue;
       if (lower === "accept-encoding" && websocket) continue;
-      if (!target.chatgpt) {
+      if (target.officialAnthropic) {
+        if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-") || (!websocket && lower.startsWith("sec-"))) continue;
+      } else if (!target.chatgpt) {
         if (lower === "authorization" || lower === "x-api-key") continue;
         if (lower === "cookie" || lower === "x-authorization" || lower === "referer" || lower === "origin" || lower.startsWith("oai-") || (!websocket && lower.startsWith("sec-"))) continue;
         if (target.claudeResponsesBridge && (lower.startsWith("anthropic-") || lower.startsWith("x-stainless-"))) continue;
@@ -383,7 +451,7 @@ export function createProviderProxy(options) {
       out.accept = "text/event-stream, application/json";
     }
 
-    if (!target.chatgpt) {
+    if (!target.chatgpt && !target.officialAnthropic) {
       out.authorization = `Bearer ${target.apiKey}`;
     } else if (target.accessToken) {
       out.authorization = `Bearer ${target.accessToken}`;
@@ -610,7 +678,7 @@ export function createProviderProxy(options) {
 
     try {
       if ((req.method || "GET") === "GET" && isClaudeGatewayModelsRequest(target, req.headers)) {
-        const catalog = claudeGatewayModelsResponse();
+        const catalog = await claudeGatewayCatalogForRequest(req, target, route);
         res.writeHead(200, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(catalog)
@@ -618,7 +686,6 @@ export function createProviderProxy(options) {
         res.end(catalog);
         return;
       }
-      console.log(`[Proxy Request] ${req.method} ${req.url} -> target: ${target.url}`);
       let body = await readProxyRequestBody(req);
       let upstream = null;
       const attemptedAccountKeys = new Set();
@@ -638,6 +705,9 @@ export function createProviderProxy(options) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = true;
       }
+      if (isClaudeMessagesTarget(target) && isOfficialClaudeModel(rewrittenBody.originalModel)) {
+        target = officialAnthropicTargetForProxyRequest(req, route);
+      }
       claudeResponsesBridge = prepareClaudeResponsesBridge(target, body);
       if (claudeResponsesBridge?.kind === "count_tokens") {
         const responseBody = Buffer.from(JSON.stringify({ input_tokens: claudeResponsesBridge.inputTokens }), "utf8");
@@ -656,6 +726,14 @@ export function createProviderProxy(options) {
       }
       while (true) {
         if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
+        const targetLabel = target.officialAnthropic
+          ? "official Anthropic OAuth"
+          : target.account?.alias
+            ? `account ${target.account.alias}`
+            : target.chatgpt
+              ? "ChatGPT account"
+              : "API provider";
+        console.log(`[Proxy Request] ${req.method} ${req.url} -> ${targetLabel}: ${target.url}`);
 
         let fetchFailed = false;
         let fetchError = null;
@@ -669,7 +747,7 @@ export function createProviderProxy(options) {
           fetchError = err;
         }
 
-        if (target.chatgpt && !fetchFailed) {
+        if ((target.chatgpt || target.officialAnthropic) && !fetchFailed) {
           captureChatgptCloudflareCookies(upstream.headers);
           break;
         }
