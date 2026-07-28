@@ -213,6 +213,20 @@ export function providerOriginFromModelsEndpoint(endpoint) {
   return normalizeProviderOrigin(endpoint);
 }
 
+const vsllmProviderOrigins = new Set([
+  "https://vsllm.com",
+  "https://api.vsllm.com"
+]);
+
+// VSLLM serves its New API dashboard on both official hostnames.
+export function providerDashboardOriginMatchesModelsEndpoint(modelsEndpoint, dashboardOrigin) {
+  const modelsOrigin = providerOriginFromModelsEndpoint(modelsEndpoint);
+  const normalizedDashboardOrigin = normalizeProviderOrigin(dashboardOrigin);
+  if (!modelsOrigin || !normalizedDashboardOrigin) return false;
+  if (modelsOrigin === normalizedDashboardOrigin) return true;
+  return vsllmProviderOrigins.has(modelsOrigin) && vsllmProviderOrigins.has(normalizedDashboardOrigin);
+}
+
 function providerDashboardRequestHeaders(credential) {
   return {
     Accept: "application/json",
@@ -256,8 +270,7 @@ async function fetchVsllmSubscriptionUsage(entry) {
   if (!credential || !isVsllmApiAccount(entry.account, entry.endpoint)) {
     return { configured: false, subscription: null };
   }
-  const endpointOrigin = providerOriginFromModelsEndpoint(entry.endpoint);
-  if (endpointOrigin !== normalizeProviderOrigin(credential.origin)) {
+  if (!providerDashboardOriginMatchesModelsEndpoint(entry.endpoint, credential.origin)) {
     return { configured: true, subscription: null };
   }
   const result = await fetchProviderDashboardJson(credential, "/api/subscription/self");

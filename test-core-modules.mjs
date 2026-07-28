@@ -28,7 +28,11 @@ import {
   writeJsonFile,
   writeTextFilePrivate
 } from "./src/storage.mjs";
-import { modelsEndpointFromBaseUrl, normalizeProviderOrigin } from "./src/provider-client.mjs";
+import {
+  modelsEndpointFromBaseUrl,
+  normalizeProviderOrigin,
+  providerDashboardOriginMatchesModelsEndpoint
+} from "./src/provider-client.mjs";
 import {
   apiProviderExhaustionReason,
   apiProviderTransientRetryReason,
@@ -48,6 +52,7 @@ import {
 import { createProviderProxy } from "./src/provider-proxy.mjs";
 import { createAccountService } from "./src/account-service.mjs";
 import { createClientConfigService } from "./src/client-config.mjs";
+import { createCliService } from "./src/cli-service.mjs";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-advanced-core-"));
 
@@ -139,6 +144,18 @@ try {
   assert.match(generated, /^model_context_window = 320000$/m);
   assert.equal(parseTomlString('"gpt-5.6-sol"'), "gpt-5.6-sol");
   assert.equal(inferApiKeyTemplateName({ alias: "my tcdmx account" }), "tcdmx");
+  assert.equal(
+    providerDashboardOriginMatchesModelsEndpoint("https://api.vsllm.com/v1/models", "https://vsllm.com"),
+    true
+  );
+  assert.equal(
+    providerDashboardOriginMatchesModelsEndpoint("https://vsllm.com/v1/models", "https://api.vsllm.com"),
+    true
+  );
+  assert.equal(
+    providerDashboardOriginMatchesModelsEndpoint("https://api.example.com/v1/models", "https://example.com"),
+    false
+  );
 
   const nowSeconds = 2_000_000;
   const subscription = parseVsllmSubscriptionSelf({
@@ -419,6 +436,43 @@ try {
   assert.equal(configured.configured, true);
   assert.match(readTextFile(path.join(serviceHome, "config.toml")), /^model_provider = "openai"$/m);
   assert.match(readTextFile(path.join(serviceHome, "config.toml")), /openai_base_url = "http:\/\/127\.0\.0\.1:47778\//);
+
+  writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
+    active_account_key: exhaustedAccount.account_key,
+    auto_switch: { enabled: true },
+    accounts: [activeAccount, exhaustedAccount, fallbackAccount]
+  });
+  const daemonEvents = [];
+  const daemonAccountService = {
+    ...accountService,
+    loadManagedGroups: () => [{ name: "default", codexHome: serviceHome }],
+    loadManagedRegistryRecords: () => [],
+    loadApiKeyAccountsForManagedList: () => [],
+    switchToStoredAccount: async (codexHome, account) => {
+      daemonEvents.push({ kind: "switch", codexHome, accountKey: account.account_key });
+    }
+  };
+  const daemonCliService = createCliService({
+    providerProxy: proxy,
+    accountService: daemonAccountService,
+    clientConfigService: {
+      ensureAllActiveAccountConfigs: () => {},
+      ensureProviderProxyForActiveApiAccounts: async () => {
+        daemonEvents.push({ kind: "ensure-proxy" });
+      }
+    },
+    writeManagerPidFile: () => {},
+    removeManagerPidFile: () => {},
+    ensureAutoSwitchManagerRunning: () => {},
+    stopAutoSwitchManager: () => {},
+    childEnvForArgv: () => process.env,
+    exitFromChild: () => {}
+  });
+  assert.equal(await daemonCliService.maybeHandleDaemon(["daemon", "--once"]), true);
+  assert.deepEqual(daemonEvents, [
+    { kind: "ensure-proxy" },
+    { kind: "switch", codexHome: serviceHome, accountKey: fallbackAccount.account_key }
+  ]);
 
   process.stdout.write("core storage, config, provider, proxy, account, and client modules ok\n");
 } finally {

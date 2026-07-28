@@ -370,14 +370,14 @@ if (await maybeHandleAutoConfig(argv)) {
   process.exit(0);
 }
 
+if (await maybeHandleDaemon(argv)) {
+  process.exit(0);
+}
+
 syncMissingApiKeyConfigsAllGroups();
 
 if (!apiSpendLimitImportInfo) {
   await syncApiKeySpendLimits();
-}
-
-if (await maybeHandleDaemon(argv)) {
-  process.exit(0);
 }
 
 if (await maybeHandleStoredListLive(argv)) {

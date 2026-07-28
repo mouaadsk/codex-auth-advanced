@@ -533,6 +533,8 @@ The setup command:
 - Links the dashboard identity to the matching stable API account key.
 - Stores the access token only in a private credential file.
 
+For VSLLM, `https://vsllm.com` and `https://api.vsllm.com` are treated as the same official provider identity. A dashboard credential stored for either hostname refreshes the subscription state for model requests sent through the other.
+
 Use `--account <selector>` only if masked-key matching finds multiple local candidates. Use `--origin <url>` for another New API deployment. `--stdin` and `CODEX_AUTH_ADVANCED_VSLLM_ACCESS_TOKEN` are available for non-interactive automation, but the hidden prompt is preferred.
 
 ### Subscription Availability Rules

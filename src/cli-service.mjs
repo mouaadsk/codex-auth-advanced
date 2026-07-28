@@ -10,7 +10,7 @@ import {
   modelsEndpointFromBaseUrl,
   normalizeProviderOrigin,
   providerDashboardCredentialPath,
-  providerOriginFromModelsEndpoint,
+  providerDashboardOriginMatchesModelsEndpoint,
   readBaseUrl
 } from "./provider-client.mjs";
 import {
@@ -91,7 +91,10 @@ export function createCliService({
     firstUsableSwitchCandidate,
     autoSwitchEnabled
   } = accountService;
-  const { ensureAllActiveAccountConfigs } = clientConfigService;
+  const {
+    ensureAllActiveAccountConfigs,
+    ensureProviderProxyForActiveApiAccounts
+  } = clientConfigService;
 
   async function maybeHandleProviderProxy(argv) {
     const command = argv[0] === "proxy"
@@ -723,7 +726,12 @@ export function createCliService({
       process.exit(0);
     });
     while (true) {
-      await runAutoSwitchCycle();
+      try {
+        await runAutoSwitchCycle();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[Auto-switch] cycle failed: ${message}`);
+      }
       sleep(30000);
     }
   }
@@ -1065,7 +1073,7 @@ export function createCliService({
 
   function matchingDashboardApiEntries(codexHome, credential, maskedKeys) {
     return loadApiKeyAccountsFromCodexHome("default", codexHome).filter((entry) => {
-      if (providerOriginFromModelsEndpoint(entry.endpoint) !== normalizeProviderOrigin(credential.origin)) return false;
+      if (!providerDashboardOriginMatchesModelsEndpoint(entry.endpoint, credential.origin)) return false;
       const masked = maskedNewApiTokenKey(entry.apiKey);
       return masked && maskedKeys.has(masked);
     });
