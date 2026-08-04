@@ -16,6 +16,7 @@ fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
 const upstreamRequests = [];
 const compactFailures = [];
 const responseFailures = [];
+const claudeCompactionFailures = [];
 const claudeSseBody = [
   "event: message_start",
   `data: ${JSON.stringify({
@@ -138,6 +139,44 @@ const upstream = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "POST" && req.url.startsWith("/v1/messages")) {
+    let parsedMessagesBody = null;
+    try {
+      parsedMessagesBody = JSON.parse(bodyText);
+    } catch {
+      parsedMessagesBody = null;
+    }
+    const lastMessage = Array.isArray(parsedMessagesBody?.messages)
+      ? parsedMessagesBody.messages[parsedMessagesBody.messages.length - 1]
+      : null;
+    const lastContentText = typeof lastMessage?.content === "string"
+      ? lastMessage.content
+      : (Array.isArray(lastMessage?.content) ? lastMessage.content : []).map((part) => String(part?.text ?? "")).join("\n");
+    const isCompactionPrompt = lastMessage?.role === "user"
+      && /detailed summary of the conversation/i.test(lastContentText);
+    if (isCompactionPrompt) {
+      const failure = claudeCompactionFailures.shift();
+      if (failure === "cloudflare_timeout") {
+        res.writeHead(524, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          title: "Error 524: A timeout occurred",
+          status: 524,
+          detail: "The origin web server did not return a complete response within the 120-second Proxy Read Timeout window.",
+          error_code: 524
+        }));
+        return;
+      }
+      if (failure === "unreachable") {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "chat completions also down", code: "service_unavailable" } }));
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache"
+      });
+      res.end(claudeSseBody);
+      return;
+    }
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache"
@@ -184,6 +223,12 @@ const upstream = http.createServer(async (req, res) => {
       ]
     }));
   } else if (req.url.endsWith("/chat/completions")) {
+    if (claudeCompactionFailures[0] === "unreachable") {
+      claudeCompactionFailures.shift();
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "chat completions also down", code: "service_unavailable" } }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       choices: [
@@ -249,6 +294,20 @@ const upstream = http.createServer(async (req, res) => {
     }
     if (responseFailure === "delayed_completed") {
       await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    if (responseFailure === "stall_stream") {
+      // Mimic the VSLLM silent-origin failure: immediate SSE headers, then
+      // nothing. Requires a streaming request body to reach the watchdog
+      // (non-streaming requests only get the header bound).
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.flushHeaders();
+      res.socket.on("error", () => {});
+      return;
+    }
+    if (responseFailure === "stall_headers") {
+      // Worse variant: never even send response headers.
+      res.socket.on("error", () => {});
+      return;
     }
     let parsedBody = null;
     try {
@@ -640,7 +699,8 @@ const proxy = spawn(process.execPath, [wrapper, "proxy", "serve"], {
     CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort),
     CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL: upstreamBaseUrl,
     CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL: `${upstreamBaseUrl}${officialAnthropicPathPrefix}`,
-    CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS: "5"
+    CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS: "5",
+    CODEX_AUTH_ADVANCED_STREAM_STALL_WATCHDOG_MS: "400"
   },
   stdio: ["ignore", "pipe", "pipe"]
 });
@@ -826,7 +886,7 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: false,
-    expectedModel: "gpt-5.5-openai-compact"
+    expectedModel: "gpt-5.2"
   });
 
   for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmModelMappings) {
@@ -878,7 +938,7 @@ try {
       bearer: "vsllm-secret",
       acceptEncoding: "identity",
       expectEncryptedContent: false,
-      expectedModel,
+      expectedModel: inputModel,
       expectedReasoningEffort
     });
   }
@@ -1001,6 +1061,104 @@ try {
     || officialClaudeRequest.claudeAgentId !== "official-agent"
     || JSON.parse(officialClaudeRequest.bodyText).model !== "claude-fable-5") {
     throw new Error(`official Claude request did not preserve OAuth routing: ${JSON.stringify(officialClaudeRequest)}`);
+  }
+
+  const claudeCompactionBody = {
+    model: "kimi-k3",
+    max_tokens: 4096,
+    stream: true,
+    system: [{ type: "text", text: "You are Claude Code." }],
+    messages: [
+      {
+        role: "user",
+        content: "Your task is to create a detailed summary of the conversation so far, paying special attention to the user's explicit requests and your previous actions.\n\n<conversation>user: hello\nassistant: hi there</conversation>"
+      }
+    ]
+  };
+
+  const beforeClaudeCompactSuccess = upstreamRequests.length;
+  const claudeCompactSuccess = await proxyRawRequest(proxyPort, "/v1/messages", claudeCompactionBody, {
+    "anthropic-version": "2023-06-01"
+  });
+  const claudeCompactSuccessText = await claudeCompactSuccess.text();
+  if (claudeCompactSuccess.status !== 200 || claudeCompactSuccessText !== claudeSseBody) {
+    throw new Error(`Claude compaction normal request should pass through untouched, got ${claudeCompactSuccess.status}: ${claudeCompactSuccessText}`);
+  }
+  if (upstreamRequests.length !== beforeClaudeCompactSuccess + 1
+    || !upstreamRequests.at(-1)?.url.startsWith("/v1/messages")) {
+    throw new Error(`Claude compaction normal request should make exactly one /v1/messages upstream request, got ${JSON.stringify(upstreamRequests.at(-1))}`);
+  }
+
+  claudeCompactionFailures.push("cloudflare_timeout");
+  const beforeClaudeCompactFallback = upstreamRequests.length;
+  const claudeCompactFallback = await proxyRawRequest(proxyPort, "/v1/messages", claudeCompactionBody, {
+    "anthropic-version": "2023-06-01"
+  });
+  const claudeCompactFallbackText = await claudeCompactFallback.text();
+  if (claudeCompactFallback.status !== 200) {
+    throw new Error(`Claude compaction fallback should return 200, got ${claudeCompactFallback.status}: ${claudeCompactFallbackText}`);
+  }
+  if (!claudeCompactFallback.headers.get("content-type")?.includes("text/event-stream")) {
+    throw new Error(`Claude compaction fallback should be SSE, got content-type ${claudeCompactFallback.headers.get("content-type")}`);
+  }
+  if (!claudeCompactFallbackText.includes("event: message_start")
+    || !claudeCompactFallbackText.includes('"type":"text_delta","text":"compacted message text"')
+    || !claudeCompactFallbackText.includes('"stop_reason":"end_turn"')
+    || !claudeCompactFallbackText.includes("event: message_stop")) {
+    throw new Error(`Claude compaction fallback SSE is malformed:\n${claudeCompactFallbackText}`);
+  }
+  if (claudeCompactFallbackText.includes('"model":"kimi-k3"') !== true) {
+    throw new Error(`Claude compaction fallback should echo the request model, got:\n${claudeCompactFallbackText}`);
+  }
+  if (upstreamRequests.length !== beforeClaudeCompactFallback + 2) {
+    throw new Error(`Claude compaction fallback should make 2 upstream requests (/v1/messages 524 then /chat/completions), got ${upstreamRequests.length - beforeClaudeCompactFallback}`);
+  }
+  assertRequestAt(beforeClaudeCompactFallback, { label: "claude compaction first attempt", bearer: "vsllm-secret", acceptEncoding: "identity" });
+  const claudeCompactFallbackReq = upstreamRequests.at(-1);
+  if (!claudeCompactFallbackReq?.url.endsWith("/chat/completions")) {
+    throw new Error(`Claude compaction fallback should use chat completions, got url: ${claudeCompactFallbackReq?.url}`);
+  }
+  const claudeCompactFallbackReqBody = JSON.parse(claudeCompactFallbackReq.bodyText);
+  if (claudeCompactFallbackReqBody.model !== "kimi-k3") {
+    throw new Error(`Claude compaction fallback should keep model kimi-k3, got ${claudeCompactFallbackReq.bodyText}`);
+  }
+  if (claudeCompactFallbackReqBody.stream === true) {
+    throw new Error(`Claude compaction fallback should use non-streaming chat completions, got ${claudeCompactFallbackReq.bodyText}`);
+  }
+  if (claudeCompactFallbackReqBody.messages?.[0]?.content?.includes("detailed summary of the conversation") !== true) {
+    throw new Error(`Claude compaction fallback should forward the transcript text, got ${claudeCompactFallbackReq.bodyText}`);
+  }
+
+  claudeCompactionFailures.push("cloudflare_timeout", "unreachable");
+  const beforeClaudeCompactDummy = upstreamRequests.length;
+  const claudeCompactDummy = await proxyRawRequest(proxyPort, "/v1/messages", claudeCompactionBody, {
+    "anthropic-version": "2023-06-01"
+  });
+  const claudeCompactDummyText = await claudeCompactDummy.text();
+  if (claudeCompactDummy.status !== 200
+    || !claudeCompactDummyText.includes("COMPACTION FALLBACK WARNING")
+    || !claudeCompactDummyText.includes("event: message_stop")) {
+    throw new Error(`Claude compaction dummy fallback should return a warning SSE message, got ${claudeCompactDummy.status}:\n${claudeCompactDummyText}`);
+  }
+  if (upstreamRequests.length !== beforeClaudeCompactDummy + 2) {
+    throw new Error(`Claude compaction dummy path should attempt /v1/messages then /chat/completions, got ${upstreamRequests.length - beforeClaudeCompactDummy} upstream requests`);
+  }
+
+  const beforeClaudeNormal = upstreamRequests.length;
+  const claudeNormalResponse = await proxyRawRequest(proxyPort, "/v1/messages", {
+    model: "kimi-k3",
+    max_tokens: 64,
+    stream: true,
+    messages: [{ role: "user", content: "Reply with ok." }]
+  }, {
+    "anthropic-version": "2023-06-01"
+  });
+  const claudeNormalText = await claudeNormalResponse.text();
+  if (claudeNormalResponse.status !== 200 || claudeNormalText !== claudeSseBody) {
+    throw new Error(`normal Claude request should pass through untouched, got ${claudeNormalResponse.status}: ${claudeNormalText}`);
+  }
+  if (upstreamRequests.length !== beforeClaudeNormal + 1) {
+    throw new Error(`normal Claude request should make exactly one upstream request, got ${upstreamRequests.length - beforeClaudeNormal}`);
   }
 
   const beforeClaudeCountTokens = upstreamRequests.length;
@@ -1437,6 +1595,47 @@ try {
   assertLatestRequest({ label: "business responses", bearer: "business-token", expectEncryptedContent: true });
 
   setActive("apikey-openai");
+
+  responseFailures.push("stall_stream");
+  const stallStart = Date.now();
+  const stallResponse = await proxyRawRequest(proxyPort, "/responses", { ...body, stream: true });
+  const stallBody = await stallResponse.text();
+  const stallElapsedMs = Date.now() - stallStart;
+  if (!stallBody.includes("codex_auth_advanced_stream_stall")) {
+    throw new Error(`expected the stall watchdog to emit an SSE error event, got: ${stallBody.slice(0, 300)}`);
+  }
+  if (!stallBody.includes("event: error")) {
+    throw new Error(`expected the stall watchdog payload as an SSE error event, got: ${stallBody.slice(0, 300)}`);
+  }
+  if (stallResponse.status !== 200 && stallResponse.status !== 502) {
+    throw new Error(`expected the stalled stream to surface as 200 (SSE error event) or 502, got ${stallResponse.status}`);
+  }
+  if (stallElapsedMs < 350 || stallElapsedMs > 5000) {
+    throw new Error(`expected the stall watchdog to fail fast (~400ms), took ${stallElapsedMs}ms`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  responseFailures.push("stall_headers");
+  const headerStallStart = Date.now();
+  const headerStallResponse = await proxyRawRequest(proxyPort, "/responses", { ...body, stream: true });
+  const headerStallElapsedMs = Date.now() - headerStallStart;
+  if (headerStallResponse.status !== 524) {
+    throw new Error(`expected a header stall to surface as 524 after the headers watchdog, got ${headerStallResponse.status}: ${await headerStallResponse.text()}`);
+  }
+  const headerStallBody = await headerStallResponse.text();
+  if (!headerStallBody.includes("codex_auth_advanced_stream_stall")) {
+    throw new Error(`expected the headers stall payload to carry the stall type, got: ${headerStallBody.slice(0, 300)}`);
+  }
+  if (headerStallElapsedMs < 350 || headerStallElapsedMs > 5000) {
+    throw new Error(`expected the header stall to fail fast (~400ms), took ${headerStallElapsedMs}ms`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const healthyAfterStall = await proxyRequest(proxyPort, "/responses", body);
+  if (healthyAfterStall?.type !== "response.completed") {
+    throw new Error(`expected the stream after a stall to behave normally, got ${JSON.stringify(healthyAfterStall)}`);
+  }
+
   responseFailures.push("delayed_completed");
   const beforeGracefulRestartRequest = upstreamRequests.length;
   const inFlightResponse = proxyRequest(proxyPort, "/responses", body);

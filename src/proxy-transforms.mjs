@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Transform } from "node:stream";
 import zlib from "node:zlib";
 import {
@@ -202,6 +203,15 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
   if (mappedModel && parsed.model !== mappedModel) {
     parsed.model = mappedModel;
     rewritten = true;
+  }
+
+  if (Array.isArray(parsed?.tools)) {
+    for (const tool of parsed.tools) {
+      if (tool && tool.model === "gpt-image-2-codex") {
+        tool.model = "gpt-image-2";
+        rewritten = true;
+      }
+    }
   }
 
   if (!rewritten) {
@@ -411,6 +421,52 @@ export function isCompactProxyTarget(target) {
   }
 }
 
+// Claude Code sends /compact as a plain POST /v1/messages request whose only
+// user message asks the model to summarize the conversation. There is no
+// dedicated endpoint, so detection has to be content-based.
+const claudeCompactionPromptMarkers = [
+  "detailed summary of the conversation",
+  "summary of the conversation so far",
+  "summarize the conversation so far",
+  "summarize this conversation",
+  "compact this conversation",
+  "conversation so far, paying special attention"
+];
+
+function claudeCompactionMarkerInText(text) {
+  const lower = String(text || "").toLowerCase();
+  return claudeCompactionPromptMarkers.some((marker) => lower.includes(marker));
+}
+
+function claudeCompactionMarkerInContent(content) {
+  if (typeof content === "string") return claudeCompactionMarkerInText(content);
+  if (!Array.isArray(content)) return false;
+  return content.some((part) => {
+    if (typeof part === "string") return claudeCompactionMarkerInText(part);
+    if (!part || typeof part !== "object") return false;
+    if (part.type !== undefined && part.type !== "text" && part.type !== "input_text") return false;
+    return claudeCompactionMarkerInText(part.text ?? part.content);
+  });
+}
+
+export function isClaudeCompactionPayload(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+  if (messages.length === 0) return false;
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage?.role !== "user") return false;
+  return claudeCompactionMarkerInContent(lastMessage.content);
+}
+
+export function isClaudeMessagesCompactionTarget(target, parsed) {
+  if (!isClaudeCompactionPayload(parsed)) return false;
+  try {
+    return new URL(target?.url || "").pathname.replace(/\/$/, "").endsWith("/v1/messages");
+  } catch {
+    return false;
+  }
+}
+
 export function repairProviderProxyBodyPlaintext(target, body, headers = {}, options = {}) {
   if (!target.repairInvalidEncryptedContent || !isCompactProxyTarget(target)) {
     return { body, repaired: false };
@@ -536,6 +592,42 @@ function normalizeCompactionContentPart(part, role = "assistant") {
   return part;
 }
 
+// Codex's remote compaction v2 parser accepts EXACTLY ONE compaction output
+// item. Providers sometimes return extras (reasoning items, empty phantom
+// messages) alongside the summary — e.g. VSLLM's compact endpoint returning
+// [reasoning, message], which Codex rejects with "expected exactly one
+// compaction output item, got 0 from 2". Pick the single best message item
+// (the last one carrying non-empty text) and drop everything else.
+function compactionMessageText(item) {
+  if (!item || typeof item !== "object" || item.type !== "message") return "";
+  if (typeof item.content === "string") return item.content;
+  if (!Array.isArray(item.content)) return "";
+  return item.content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      return typeof part.text === "string"
+        ? part.text
+        : typeof part.content === "string"
+          ? part.content
+          : "";
+    })
+    .join("");
+}
+
+function selectSingleCompactionOutputItem(items) {
+  if (!Array.isArray(items)) return items;
+  const messages = items.filter((item) => item && typeof item === "object" && item.type === "message");
+  const withText = messages.filter((item) => compactionMessageText(item).trim().length > 0);
+  const chosen = withText.length > 0
+    ? withText[withText.length - 1]
+    : messages.length > 0
+      ? messages[messages.length - 1]
+      : null;
+  if (!chosen) return items.filter((item) => item && typeof item === "object");
+  return [chosen];
+}
+
 function normalizeCompactionMessageContent(item) {
   if (!item || typeof item !== "object" || item.type !== "message") return;
   const role = typeof item.role === "string" ? item.role : "assistant";
@@ -560,6 +652,18 @@ export function normalizeCompactionResponse(value) {
   if (value.output && !value.messages) {
     value.messages = value.output;
   }
+  const sourceItems = Array.isArray(value.output)
+    ? value.output
+    : Array.isArray(value.messages)
+      ? value.messages
+      : null;
+  if (sourceItems) {
+    // Codex requires exactly one compaction output item; collapse extras
+    // (reasoning items, empty messages) before normalizing content parts.
+    const single = selectSingleCompactionOutputItem(sourceItems);
+    value.output = single;
+    value.messages = single;
+  }
   for (const items of [value.messages, value.output]) {
     if (!Array.isArray(items)) continue;
     for (const item of items) {
@@ -568,9 +672,43 @@ export function normalizeCompactionResponse(value) {
   }
 }
 
-export async function runLocalCompactionFallback(target, body, headers, alreadyDecoded, sanitizeRequestHeaders) {
+function compactionCompletionsUrl(target) {
+  try {
+    const url = new URL(target.url);
+    const pathname = url.pathname
+      .replace(/\/responses\/compact\/?$/, "/chat/completions")
+      .replace(/\/v1\/messages\/?$/, "/chat/completions");
+    if (pathname === url.pathname) return null;
+    url.pathname = pathname;
+    url.search = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+// Claude Code compaction: the full transcript plus the summarization
+// request arrive as one (large) user message. Forward it verbatim — do NOT
+// truncate — so the upstream model summarizes the complete conversation.
+function claudeCompactionTranscriptText(parsed) {
+  const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+  const lastMessage = messages[messages.length - 1];
+  const text = typeof lastMessage?.content === "string"
+    ? lastMessage.content
+    : (Array.isArray(lastMessage?.content) ? lastMessage.content : [])
+      .filter((part) => part && typeof part === "object" && (part.type === "text" || part.type === "input_text" || part.type === undefined))
+      .map((part) => String(part.text ?? part.content ?? ""))
+      .join("\n");
+  return text.trim() ? text : null;
+}
+
+export async function runLocalCompactionFallback(target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {}) {
   const startTime = Date.now();
-  const completionsUrl = target.url.replace(/\/responses\/compact\/?$/, "/chat/completions");
+  const completionsUrl = compactionCompletionsUrl(target);
+  if (!completionsUrl) {
+    console.error(`[Proxy Local Compaction] Cannot derive a chat completions endpoint from ${target?.url}`);
+    return null;
+  }
   console.log(`[Proxy Local Compaction] Starting local compaction fallback using completions on ${completionsUrl}...`);
 
   const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
@@ -582,46 +720,98 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     return null;
   }
 
-  const inputItems = parsed.input || [];
-  const processedItems = [];
-  if (inputItems.length <= 25) {
-    processedItems.push(...inputItems);
-  } else {
-    processedItems.push(...inputItems.slice(0, 5));
-    processedItems.push(...inputItems.slice(-15));
+  const claudeFormat = isClaudeMessagesCompactionTarget(target, parsed);
+  const authHeaders = sanitizeRequestHeaders(headers, target, {
+    omitContentEncoding: true
+  });
+  const reasoningEffort = parsed?.reasoning?.effort ?? parsed?.reasoning_effort;
+  const applyReasoningEffort = (completionBody) => {
+    if (isVsllmApiAccount(target?.account, target?.upstreamBaseUrl || target?.url || "") && typeof reasoningEffort === "string" && reasoningEffort.trim()) {
+      completionBody.reasoning_effort = reasoningEffort.trim();
+    }
+    return completionBody;
+  };
+
+  // Codex /responses/compact path: the native compact endpoint failed, so we
+  // re-summarize via chat completions. A dedicated compact model id is the
+  // wrong choice here — it was sized for the small condensed payload, not the
+  // full conversation — so reuse the request's own model. Prefer the
+  // pre-rewrite original model (the proxy body may already have been remapped
+  // to the compact-specific id), falling back to the non-compact remap only
+  // when the request omitted a model.
+  const fallbackModel = typeof options.originalModel === "string" && options.originalModel.trim()
+    ? options.originalModel.trim()
+    : typeof parsed?.model === "string" && parsed.model.trim()
+      ? parsed.model.trim()
+      : remappedProxyRequestModel(parsed?.model || "gpt-5.5", target, { compact: false }) || "gpt-5.5";
+
+  // Claude path: send the complete, untruncated transcript for summarization.
+  if (claudeFormat) {
+    const transcript = claudeCompactionTranscriptText(parsed);
+    if (!transcript) {
+      console.error(`[Proxy Local Compaction] Claude compaction request had no transcript text.`);
+      return null;
+    }
+    const completionBody = applyReasoningEffort({
+      model: fallbackModel,
+      stream: false,
+      messages: [{ role: "user", content: transcript }]
+    });
+    try {
+      const res = await fetch(completionsUrl, {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(completionBody),
+        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+      });
+      if (res.status !== 200) {
+        console.error(`[Proxy Local Compaction] completions endpoint failed with status: ${res.status}`);
+        return null;
+      }
+      const summaryText = await readChatCompletionSummary(res);
+      if (!summaryText.trim()) {
+        console.error(`[Proxy Local Compaction] completions endpoint returned an empty summary.`);
+        return null;
+      }
+      console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
+      return claudeMessagesCompactionResponse(summaryText, parsed?.model);
+    } catch (err) {
+      console.error(`[Proxy Local Compaction] Fallback failed with error:`, err);
+      return null;
+    }
   }
 
+  // Codex /responses/compact path: the native compact endpoint failed, so we
+  // re-summarize via chat completions. Send the FULL conversation — no item
+  // dropping, no per-item truncation — so the summary reflects everything.
+  const inputItems = Array.isArray(parsed.input) ? parsed.input : [];
+
   let conversationText = "";
-  for (const item of processedItems) {
+  for (const item of inputItems) {
     if (item.type === "message") {
       const role = item.role || "unknown";
       const parts = [];
       if (Array.isArray(item.content)) {
         for (const part of item.content) {
           if (part && typeof part.text === "string") {
-            let text = part.text;
-            if (text.length > 3000) {
-              text = text.slice(0, 3000) + "\n\n... [TRUNCATED] ...";
-            }
-            parts.push(text);
+            parts.push(part.text);
+          } else if (part && typeof part === "object" && typeof part.content === "string") {
+            parts.push(part.content);
+          } else if (typeof part === "string") {
+            parts.push(part);
           }
         }
       } else if (typeof item.content === "string") {
-        let text = item.content;
-        if (text.length > 3000) {
-          text = text.slice(0, 3000) + "\n\n... [TRUNCATED] ...";
-        }
-        parts.push(text);
+        parts.push(item.content);
       }
       conversationText += `[${role}]: ${parts.join("\n")}\n\n`;
     } else if (item.type === "function_call") {
       conversationText += `[assistant called function]: ${item.name} with arguments ${item.arguments}\n\n`;
     } else if (item.type === "function_call_output") {
-      let outStr = item.output || "";
-      if (outStr.length > 2000) {
-        outStr = outStr.slice(0, 2000) + "\n\n... [TRUNCATED] ...";
-      }
-      conversationText += `[function output]: ${outStr}\n\n`;
+      conversationText += `[function output]: ${item.output ?? ""}\n\n`;
     }
   }
 
@@ -637,24 +827,13 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
 
   const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
 
-  const authHeaders = sanitizeRequestHeaders(headers, target, {
-    omitContentEncoding: true
-  });
-  const fallbackModel = remappedProxyRequestModel(parsed.model || "gpt-5.5", target, {
-    compact: true
-  }) || parsed.model || "gpt-5.5";
-
-  const completionBody = {
+  const completionBody = applyReasoningEffort({
     model: fallbackModel,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
     ]
-  };
-  const reasoningEffort = parsed?.reasoning?.effort ?? parsed?.reasoning_effort;
-  if (isVsllmApiAccount(target?.account, target?.upstreamBaseUrl || target?.url || "") && typeof reasoningEffort === "string" && reasoningEffort.trim()) {
-    completionBody.reasoning_effort = reasoningEffort.trim();
-  }
+  });
 
   try {
     const res = await fetch(completionsUrl, {
@@ -679,6 +858,10 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
     }
 
     console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
+
+    if (claudeFormat) {
+      return claudeMessagesCompactionResponse(summaryText, parsed?.model);
+    }
 
     const compactedMessage = compactTextMessage(summaryText);
     const compactionResponse = {
@@ -715,4 +898,72 @@ export function dummyCompactionResponse(errorMsg) {
       "content-type": "application/json; charset=utf-8"
     })
   });
+}
+
+function claudeMessagesJsonResponse(body, extraHeaders = {}) {
+  const responseBody = Buffer.from(JSON.stringify(body), "utf8");
+  return new Response(responseBody, {
+    status: 200,
+    headers: new Headers({
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(responseBody.length),
+      ...extraHeaders
+    })
+  });
+}
+
+// Claude Code's streaming HTTP client must see SSE framing (event:/data:
+// pairs terminated by [DONE]) or it keeps waiting on the stream, so the
+// summary is emitted as a complete Anthropic Messages SSE sequence.
+export function claudeMessagesCompactionResponse(summaryText, model) {
+  const messageId = `msg_compact_${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+  const resolvedModel = typeof model === "string" && model.trim() ? model.trim() : "unknown";
+  const messageStart = {
+    type: "message_start",
+    message: {
+      id: messageId,
+      type: "message",
+      role: "assistant",
+      model: resolvedModel,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 }
+    }
+  };
+  const textDelta = {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "text_delta", text: String(summaryText || "") }
+  };
+  const messageDelta = {
+    type: "message_delta",
+    delta: { stop_reason: "end_turn", stop_sequence: null },
+    usage: { output_tokens: 0 }
+  };
+  const events = [
+    ["message_start", messageStart],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+    ["content_block_delta", textDelta],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", messageDelta],
+    ["message_stop", { type: "message_stop" }]
+  ];
+  let sse = "";
+  for (const [event, payload] of events) {
+    sse += `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  }
+  sse += "data: [DONE]\n\n";
+  return new Response(sse, {
+    status: 200,
+    headers: new Headers({
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache"
+    })
+  });
+}
+
+export function dummyClaudeCompactionResponse(errorMsg, model) {
+  const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a dummy placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
+  return claudeMessagesCompactionResponse(summaryText, model);
 }

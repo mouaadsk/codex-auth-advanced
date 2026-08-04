@@ -26,7 +26,9 @@ import {
 import {
   createSseResponseTransformStream,
   createStreamDiagnostics,
+  dummyClaudeCompactionResponse,
   dummyCompactionResponse,
+  isClaudeMessagesCompactionTarget,
   isCompactProxyTarget,
   isResponsesProxyTarget,
   repairProviderProxyBodyPlaintext,
@@ -50,6 +52,13 @@ export function createProviderProxy(options) {
   const vsllmTransientUsageLimitRetryDelayMs = options.vsllmTransientUsageLimitRetryDelayMs;
   const modelCapacityMaxRetries = options.modelCapacityMaxRetries;
   const modelCapacityRetryBaseDelayMs = options.modelCapacityRetryBaseDelayMs;
+  // Watchdog for silent origins (e.g. VSLLM models that accept a request then
+  // stream nothing — not even PING keep-alives). If an SSE stream produces no
+  // upstream bytes for this long, we terminate it with an SSE error event so
+  // clients fail fast instead of hanging for minutes. Chunks we synthesize
+  // locally (e.g. SSE transform heartbeats) do NOT reset the timer — only real
+  // upstream bytes prove the origin is alive.
+  const streamStallWatchdogMs = Math.max(0, Number(options.streamStallWatchdogMs) || 0);
   const officialAnthropicBaseUrl = String(options.officialAnthropicBaseUrl || "https://api.anthropic.com").replace(/\/+$/, "");
 
   const chatgptCloudflareCookies = new Map();
@@ -477,9 +486,16 @@ export function createProviderProxy(options) {
 
   async function fetchProviderTarget(req, target, body, options = {}) {
     const timeoutMs = Number(options.timeout);
-    const signal = Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-      ? AbortSignal.timeout(timeoutMs)
-      : undefined;
+    let signal;
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      signal = AbortSignal.timeout(timeoutMs);
+    } else if (options.streaming === true && streamStallWatchdogMs > 0) {
+      // No abort-based headers timeout here: AbortSignal.timeout stays armed
+      // after headers arrive and would abort HEALTHY long streams at the
+      // deadline (undici aborts the body, not just the headers phase). The
+      // per-chunk stall watchdog downstream covers both phases — it arms
+      // before the fetch resolves and fires on silence either way.
+    }
     const headers = sanitizeProxyRequestHeaders(req.headers, target, {
       omitContentEncoding: options.omitContentEncoding === true
     });
@@ -688,13 +704,45 @@ export function createProviderProxy(options) {
       }
       let body = await readProxyRequestBody(req);
       let upstream = null;
+      let stallHeadersTimer = null;
+      const stallHeadersDeadlineMs = streamStallWatchdogMs;
+      const armStallHeadersWatchdog = () => {
+        if (!(stallHeadersDeadlineMs > 0) || stallHeadersTimer) return;
+        stallHeadersTimer = setTimeout(() => {
+          if (upstream || res.writableEnded) return;
+          console.warn(`[Proxy Stream] ${req.url} stalled: no upstream response headers for ${stallHeadersDeadlineMs}ms; failing fast.`);
+          if (!res.headersSent) {
+            const stallBody = JSON.stringify({
+              error: {
+                message: `[codex-auth-advanced] Upstream stalled: no response headers for ${stallHeadersDeadlineMs}ms. Failing fast instead of hanging; retry the request.`,
+                type: "codex_auth_advanced_stream_stall"
+              }
+            });
+            res.writeHead(524, { "content-type": "application/json", "content-length": Buffer.byteLength(stallBody) });
+            res.end(stallBody);
+          } else {
+            res.destroy();
+          }
+        }, stallHeadersDeadlineMs);
+        stallHeadersTimer.unref?.();
+      };
+      const clearStallHeadersWatchdog = () => {
+        if (stallHeadersTimer) {
+          clearTimeout(stallHeadersTimer);
+          stallHeadersTimer = null;
+        }
+      };
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
       const modelCapacityRetries = new Map();
       let bodyAlreadyDecoded = false;
       let triedPlaintextCompactRepair = false;
       let claudeResponsesBridge = null;
+      let claudeMessagesCompaction = false;
+      let claudeCompactionModel = null;
+      let originalRequestModel = null;
       const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
+      originalRequestModel = rewrittenBody.originalModel;
       if (rewrittenBody.rewritten) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = rewrittenBody.decoded === true;
@@ -705,10 +753,24 @@ export function createProviderProxy(options) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = true;
       }
+      // The bridge only applies to VSLLM targets, so prepare it before any
+      // switch to the official Anthropic OAuth target below; an official
+      // target can never match the bridge's VSLLM guard.
+      claudeResponsesBridge = prepareClaudeResponsesBridge(target, body);
       if (isClaudeMessagesTarget(target) && isOfficialClaudeModel(rewrittenBody.originalModel)) {
         target = officialAnthropicTargetForProxyRequest(req, route);
+      } else if (!target.chatgpt && !target.officialAnthropic && claudeResponsesBridge?.kind !== "responses") {
+        // Claude Code /compact is a plain /v1/messages request; detect it by
+        // content so a hung upstream can degrade to a local summary instead
+        // of surfacing a raw 524.
+        try {
+          const parsedBody = JSON.parse(body.toString("utf8"));
+          claudeMessagesCompaction = isClaudeMessagesCompactionTarget(target, parsedBody);
+          claudeCompactionModel = typeof parsedBody?.model === "string" ? parsedBody.model : null;
+        } catch {
+          claudeMessagesCompaction = false;
+        }
       }
-      claudeResponsesBridge = prepareClaudeResponsesBridge(target, body);
       if (claudeResponsesBridge?.kind === "count_tokens") {
         const responseBody = Buffer.from(JSON.stringify({ input_tokens: claudeResponsesBridge.inputTokens }), "utf8");
         res.writeHead(200, {
@@ -718,6 +780,17 @@ export function createProviderProxy(options) {
         res.end(responseBody);
         return;
       }
+      const requestIsStreaming = (() => {
+        if (!body) return false;
+        try {
+          const parsed = bodyAlreadyDecoded
+            ? (Buffer.isBuffer(body) ? JSON.parse(body.toString("utf8")) : body)
+            : JSON.parse(body.toString("utf8"));
+          return parsed?.stream === true;
+        } catch {
+          return false;
+        }
+      })();
       if (claudeResponsesBridge?.kind === "responses") {
         target = claudeResponsesBridge.target;
         body = claudeResponsesBridge.body;
@@ -737,15 +810,18 @@ export function createProviderProxy(options) {
 
         let fetchFailed = false;
         let fetchError = null;
+        if (requestIsStreaming) armStallHeadersWatchdog();
         try {
           upstream = await fetchProviderTarget(req, target, body, {
             omitContentEncoding: bodyAlreadyDecoded,
-            timeout: (isCompactProxyTarget(target) && !target.chatgpt) ? 15000 : undefined
+            timeout: (isCompactProxyTarget(target) && !target.chatgpt) ? 15000 : undefined,
+            streaming: requestIsStreaming
           });
         } catch (err) {
           fetchFailed = true;
           fetchError = err;
         }
+        if (!requestIsStreaming) clearStallHeadersWatchdog();
 
         if ((target.chatgpt || target.officialAnthropic) && !fetchFailed) {
           captureChatgptCloudflareCookies(upstream.headers);
@@ -759,11 +835,31 @@ export function createProviderProxy(options) {
             body,
             req.headers,
             bodyAlreadyDecoded,
-            sanitizeProxyRequestHeaders
+            sanitizeProxyRequestHeaders,
+            { originalModel: originalRequestModel }
           );
           if (!localCompacted) {
             console.warn(`[Proxy] Local compaction fallback failed during error handler. Generating dummy placeholder...`);
             localCompacted = dummyCompactionResponse(fetchError?.message || `Upstream status ${upstream?.status}`);
+          }
+          if (localCompacted) {
+            upstream = localCompacted;
+            break;
+          }
+        }
+
+        if (claudeMessagesCompaction && (fetchFailed || [502, 503, 504, 524].includes(upstream.status))) {
+          console.log(`[Proxy] Claude compaction request failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
+          let localCompacted = await runLocalCompactionFallback(
+            target,
+            body,
+            req.headers,
+            bodyAlreadyDecoded,
+            sanitizeProxyRequestHeaders
+          );
+          if (!localCompacted) {
+            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler. Generating dummy placeholder...`);
+            localCompacted = dummyClaudeCompactionResponse(fetchError?.message || `Upstream status ${upstream?.status}`, claudeCompactionModel);
           }
           if (localCompacted) {
             upstream = localCompacted;
@@ -872,8 +968,21 @@ export function createProviderProxy(options) {
         return;
       }
       res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
+      // Send headers NOW: while the origin is stalled the piped stream never
+      // produces data, and a queued writeHead would sit behind it — along with
+      // anything the stall watchdog tries to write later.
+      if (contentType.includes("event-stream")) res.flushHeaders();
+      clearStallHeadersWatchdog();
       const contentEncoding = String(upstream.headers.get("content-encoding") || "").toLowerCase();
-      let responseStream = Readable.fromWeb(upstream.body).on("error", () => res.destroy());
+      let responseStream = Readable.fromWeb(upstream.body);
+      const watchdogStallTarget = responseStream;
+      // The stall watchdog destroys the upstream source when the origin goes
+      // silent; that 'error' is expected and must not nuke the client
+      // response (the watchdog writes its own terminal SSE event first).
+      let stallWatchdogFired = false;
+      responseStream.on("error", () => {
+        if (!stallWatchdogFired) res.destroy();
+      });
       if (contentEncoding === "gzip" || contentEncoding === "x-gzip") {
         responseStream = responseStream.pipe(zlib.createGunzip());
       } else if (contentEncoding === "deflate") {
@@ -882,6 +991,7 @@ export function createProviderProxy(options) {
         responseStream = responseStream.pipe(zlib.createBrotliDecompress());
       }
       const shouldTransformOpenAiResponse = claudeResponsesBridge?.kind !== "responses"
+        && !claudeMessagesCompaction
         && !target.chatgpt
         && (isCompactProxyTarget(target) || isResponsesProxyTarget(target));
       const diagnostics = !target.chatgpt && isResponsesProxyTarget(target)
@@ -908,8 +1018,82 @@ export function createProviderProxy(options) {
         if (!res.writableEnded) finishDiagnostics("client_close");
       });
       res.on("error", () => finishDiagnostics("response_error"));
+      if (streamStallWatchdogMs > 0
+        && upstream.status >= 200
+        && upstream.status < 300
+        && contentType.includes("event-stream")) {
+        const stallLabel = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+        const stallErrorPayload = JSON.stringify({
+          error: {
+            message: `[codex-auth-advanced] Upstream stream from ${stallLabel} stalled: no data received for ${streamStallWatchdogMs}ms. Failing fast instead of hanging; retry the request.`,
+            type: "codex_auth_advanced_stream_stall"
+          }
+        });
+        const writeStallErrorEvent = () => {
+          // Downstream transform streams (compaction/bridge) re-serialize
+          // `data:` lines as JSON, so write the terminal event straight to the
+          // client socket before tearing the pipeline down.
+          try {
+            res.write(`event: error\ndata: ${stallErrorPayload}\n\n`);
+          } catch {
+            // Response may already be closing; nothing else to write.
+          }
+        };
+        let stallTimer = null;
+        let stallFired = false;
+        const clearStallWatchdog = () => {
+          if (stallTimer) {
+            clearTimeout(stallTimer);
+            stallTimer = null;
+          }
+        };
+        const fireStallWatchdog = () => {
+          if (stallFired || res.writableEnded) return;
+          stallFired = true;
+          stallWatchdogFired = true;
+          console.warn(`[Proxy Stream] ${req.url} stalled: no upstream bytes for ${streamStallWatchdogMs}ms; terminating with SSE error.`);
+          finishDiagnostics("upstream_stall");
+          const stallEventText = `event: error\ndata: ${stallErrorPayload}\n\n`;
+          // Write the SSE error event as a raw HTTP chunk directly to the
+          // socket, then the terminal zero-length chunk. The response stream
+          // pipeline is backpressured by the stalled source and cannot be
+          // relied on to flush res.write() calls. Headers were flushed at
+          // writeHead time, so raw chunks here are framed correctly.
+          const stallChunk = `${Buffer.byteLength(stallEventText).toString(16)}\r\n${stallEventText}\r\n`;
+          try {
+            res.socket?.write(stallChunk);
+          } catch {
+            // Socket may already be closing; nothing else to write.
+          }
+          watchdogStallTarget.destroy();
+          // Defer the socket close until Node's write path has actually moved
+          // the raw chunk out — res.socket.end() immediately after destroy()
+          // can race the pipeline's cork/uncork and silently drop our bytes.
+          setImmediate(() => {
+            try {
+              res.socket?.end();
+            } catch {
+              // Socket already closed.
+            }
+          });
+        };
+        const armStallWatchdog = () => {
+          clearStallWatchdog();
+          stallTimer = setTimeout(fireStallWatchdog, streamStallWatchdogMs);
+          stallTimer.unref?.();
+        };
+        // Re-arm on raw upstream bytes; piped transforms emit no 'data' while
+        // paused, but the raw source does whenever the origin actually sends.
+        watchdogStallTarget.on("data", armStallWatchdog);
+        responseStream.on("data", armStallWatchdog);
+        responseStream.on("end", clearStallWatchdog);
+        responseStream.on("close", clearStallWatchdog);
+        res.on("close", clearStallWatchdog);
+        armStallWatchdog();
+      }
       responseStream.pipe(res);
     } catch (error) {
+      clearStallHeadersWatchdog();
       console.error(`[Proxy Error] ${req.url} failed:`, error);
       writeProxyError(res, 502, `Provider proxy request failed: ${error?.message || error}`);
     }

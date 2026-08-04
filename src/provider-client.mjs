@@ -213,10 +213,22 @@ export function providerOriginFromModelsEndpoint(endpoint) {
   return normalizeProviderOrigin(endpoint);
 }
 
+// vsllm.com is the primary origin; api.vsllm.com is the newer alias. Both
+// resolve to the same New API backend, but vsllm.com is the canonical host.
 const vsllmProviderOrigins = new Set([
   "https://vsllm.com",
   "https://api.vsllm.com"
 ]);
+
+const vsllmPrimaryProviderOrigin = "https://vsllm.com";
+
+// Normalize a VSLLM origin (either hostname) to the primary vsllm.com host so
+// dashboard credential lookups and refreshes use one canonical origin.
+export function canonicalizeVsllmProviderOrigin(origin) {
+  const normalized = normalizeProviderOrigin(origin);
+  if (!normalized) return normalized;
+  return vsllmProviderOrigins.has(normalized) ? vsllmPrimaryProviderOrigin : normalized;
+}
 
 // VSLLM serves its New API dashboard on both official hostnames.
 export function providerDashboardOriginMatchesModelsEndpoint(modelsEndpoint, dashboardOrigin) {
@@ -238,7 +250,7 @@ function providerDashboardRequestHeaders(credential) {
 }
 
 export async function fetchProviderDashboardJson(credential, pathname, options = {}) {
-  const origin = normalizeProviderOrigin(credential?.origin);
+  const origin = canonicalizeVsllmProviderOrigin(credential?.origin);
   if (!origin) return { status: null, body: null, error: "invalid_provider_origin" };
   const url = new URL(pathname, `${origin}/`).toString();
   try {

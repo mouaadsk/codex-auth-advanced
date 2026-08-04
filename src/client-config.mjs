@@ -200,8 +200,9 @@ export function createClientConfigService({ providerProxy, accountService }) {
     if (env.ANTHROPIC_DEFAULT_OPUS_MODEL === "grok-4.5") delete env.ANTHROPIC_DEFAULT_OPUS_MODEL;
     const removedDiscoverySuppression = String(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "") === "1";
     if (removedDiscoverySuppression) delete env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
+    if (!env.ANTHROPIC_API_KEY && !env.ANTHROPIC_AUTH_TOKEN) {
+      env.ANTHROPIC_API_KEY = "codex-auth-advanced";
+    }
     env.ANTHROPIC_BASE_URL = providerProxyBaseUrl(codexHome);
     env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5";
     env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";

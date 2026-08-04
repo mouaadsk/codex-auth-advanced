@@ -29,6 +29,7 @@ import {
   writeTextFilePrivate
 } from "./src/storage.mjs";
 import {
+  canonicalizeVsllmProviderOrigin,
   modelsEndpointFromBaseUrl,
   normalizeProviderOrigin,
   providerDashboardOriginMatchesModelsEndpoint
@@ -156,6 +157,10 @@ try {
     providerDashboardOriginMatchesModelsEndpoint("https://api.example.com/v1/models", "https://example.com"),
     false
   );
+  assert.equal(canonicalizeVsllmProviderOrigin("https://api.vsllm.com"), "https://vsllm.com");
+  assert.equal(canonicalizeVsllmProviderOrigin("https://vsllm.com"), "https://vsllm.com");
+  assert.equal(canonicalizeVsllmProviderOrigin("https://api.vsllm.com/v1/models"), "https://vsllm.com");
+  assert.equal(canonicalizeVsllmProviderOrigin("https://api.example.com"), "https://api.example.com");
 
   const nowSeconds = 2_000_000;
   const subscription = parseVsllmSubscriptionSelf({
@@ -306,6 +311,33 @@ try {
   assert.equal(compactResponse.type, "response.compaction");
   assert.equal(compactResponse.output, compactResponse.messages);
   assert.deepEqual(compactResponse.messages[0].content, [{ type: "output_text", text: "summary" }]);
+
+  // Codex remote compaction v2 requires exactly one output item; reasoning
+  // items and empty phantom messages must be collapsed away.
+  const noisyCompactResponse = {
+    object: "response.compaction",
+    output: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: "thinking..." }] },
+      { type: "message", role: "assistant", content: [] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "the real summary" }] }
+    ]
+  };
+  normalizeCompactionResponse(noisyCompactResponse);
+  assert.equal(noisyCompactResponse.output.length, 1);
+  assert.equal(noisyCompactResponse.output, noisyCompactResponse.messages);
+  assert.equal(noisyCompactResponse.output[0].type, "message");
+  assert.deepEqual(noisyCompactResponse.output[0].content, [{ type: "output_text", text: "the real summary" }]);
+
+  const stringContentNoisy = {
+    type: "response.compaction",
+    messages: [
+      { type: "message", role: "assistant", content: "" },
+      { type: "message", role: "assistant", content: "plain string summary" }
+    ]
+  };
+  normalizeCompactionResponse(stringContentNoisy);
+  assert.equal(stringContentNoisy.output.length, 1);
+  assert.deepEqual(stringContentNoisy.output[0].content, [{ type: "output_text", text: "plain string summary" }]);
 
   const proxy = createProviderProxy({
     host: "127.0.0.1",

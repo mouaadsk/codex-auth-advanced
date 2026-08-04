@@ -44,6 +44,15 @@ const modelCapacityRetryBaseDelayMs = Number.isFinite(configuredModelCapacityRet
   && configuredModelCapacityRetryBaseDelayMs >= 0
   ? configuredModelCapacityRetryBaseDelayMs
   : 1000;
+// Fail fast when a provider accepts an SSE request then goes silent (observed
+// with VSLLM gpt-5.6-sol on large contexts: no bytes, no PINGs, client hangs
+// until its own 5-minute SSE idle timeout). 90s is comfortably above the
+// slowest healthy first-byte times we measured (~30s); 0 disables.
+const configuredStreamStallWatchdogMs = Number(process.env.CODEX_AUTH_ADVANCED_STREAM_STALL_WATCHDOG_MS);
+const streamStallWatchdogMs = Number.isFinite(configuredStreamStallWatchdogMs)
+  && configuredStreamStallWatchdogMs >= 0
+  ? configuredStreamStallWatchdogMs
+  : 90000;
 const chatgptCodexBaseUrl = process.env.CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api/codex";
 let accountService = null;
 const providerProxy = createProviderProxy({
@@ -59,6 +68,7 @@ const providerProxy = createProviderProxy({
   vsllmTransientUsageLimitRetryDelayMs,
   modelCapacityMaxRetries,
   modelCapacityRetryBaseDelayMs,
+  streamStallWatchdogMs,
   officialAnthropicBaseUrl
 });
 accountService = createAccountService({ providerProxy, chatgptCodexBaseUrl });

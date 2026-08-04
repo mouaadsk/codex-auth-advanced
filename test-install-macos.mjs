@@ -264,8 +264,8 @@ if (claudeSettings.env.ANTHROPIC_BASE_URL !== expectedBaseUrl
   || claudeSettings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY !== "1") {
   throw new Error(`Claude proxy settings are incomplete: ${JSON.stringify(claudeSettings.env)}`);
 }
-if (claudeSettings.env.ANTHROPIC_API_KEY != null || claudeSettings.env.ANTHROPIC_AUTH_TOKEN != null) {
-  throw new Error("Claude settings retained an authentication override that would prevent OAuth passthrough");
+if (!claudeSettings.env.ANTHROPIC_API_KEY && !claudeSettings.env.ANTHROPIC_AUTH_TOKEN) {
+  throw new Error(`Claude settings missing fallback ANTHROPIC_API_KEY: ${JSON.stringify(claudeSettings.env)}`);
 }
 for (const stale of [
   "ANTHROPIC_MODEL",

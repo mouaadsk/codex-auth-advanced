@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { apiKeyTemplate, defaultApiKeyConfig } from "./codex-config.mjs";
 import {
+  canonicalizeVsllmProviderOrigin,
   checkApiKeyAccount,
   fetchApiKeyCosts,
   fetchApiKeyHealth,
@@ -1129,7 +1130,7 @@ export function createCliService({
     const credential = {
       schema_version: 1,
       provider: "vsllm",
-      origin: options.origin,
+      origin: canonicalizeVsllmProviderOrigin(options.origin),
       user_id: options.userId,
       alias: options.alias || `vsllm-user-${options.userId}`,
       access_token: accessToken
