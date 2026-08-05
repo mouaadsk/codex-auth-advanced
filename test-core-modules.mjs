@@ -29,6 +29,7 @@ import {
   writeTextFilePrivate
 } from "./src/storage.mjs";
 import {
+  canonicalizeVsllmProviderBaseUrl,
   canonicalizeVsllmProviderOrigin,
   modelsEndpointFromBaseUrl,
   normalizeProviderOrigin,
@@ -161,6 +162,9 @@ try {
   assert.equal(canonicalizeVsllmProviderOrigin("https://vsllm.com"), "https://vsllm.com");
   assert.equal(canonicalizeVsllmProviderOrigin("https://api.vsllm.com/v1/models"), "https://vsllm.com");
   assert.equal(canonicalizeVsllmProviderOrigin("https://api.example.com"), "https://api.example.com");
+  assert.equal(canonicalizeVsllmProviderBaseUrl("https://api.vsllm.com/v1"), "https://vsllm.com/v1");
+  assert.equal(canonicalizeVsllmProviderBaseUrl("https://vsllm.com/v1/"), "https://vsllm.com/v1");
+  assert.equal(canonicalizeVsllmProviderBaseUrl("https://api.example.com/v1"), "https://api.example.com/v1");
 
   const nowSeconds = 2_000_000;
   const subscription = parseVsllmSubscriptionSelf({
@@ -194,6 +198,18 @@ try {
   assert.equal(
     apiProviderTransientRetryReason(503, { error: { code: "server_is_overloaded" } }, vsllmAccount),
     "model_capacity"
+  );
+  assert.equal(
+    apiProviderTransientRetryReason(403, { error: { message: "IP access denied by API-Key restriction" } }, vsllmAccount),
+    "api_key_restriction"
+  );
+  assert.equal(
+    apiProviderTransientRetryReason(403, { error: { message: "Access denied by API-Key restrictions" } }, vsllmAccount),
+    "api_key_restriction"
+  );
+  assert.equal(
+    apiProviderTransientRetryReason(403, { error: { message: "Access denied by API-Key restrictions" } }, { alias: "other-provider" }),
+    null
   );
   assert.equal(
     apiProviderExhaustionReason(403, { error: { message: "insufficient balance" } }, vsllmAccount),
@@ -251,6 +267,7 @@ try {
   }, 107, 480, nowSeconds);
   assert.equal(rolling.spend, 12);
   assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com"), "https://vsllm.com/v1/models");
+  assert.equal(modelsEndpointFromBaseUrl("https://api.vsllm.com/v1"), "https://vsllm.com/v1/models");
   assert.equal(normalizeProviderOrigin("https://vsllm.com/v1/models"), "https://vsllm.com");
 
   const compactTarget = {
@@ -425,7 +442,7 @@ try {
     'model_provider = "OpenAI"',
     "",
     "[model_providers.OpenAI]",
-    'base_url = "https://vsllm.com/v1"',
+    'base_url = "https://api.vsllm.com/v1"',
     'wire_api = "responses"',
     ""
   ].join("\n"));

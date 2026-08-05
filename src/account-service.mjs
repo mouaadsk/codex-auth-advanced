@@ -8,6 +8,7 @@ import {
   upsertOpenAiProviderConfig
 } from "./codex-config.mjs";
 import {
+  canonicalizeVsllmProviderBaseUrl,
   modelsEndpointFromBaseUrl,
   readBaseUrl,
   readProviderDashboardCredential
@@ -176,7 +177,7 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
   function upstreamBaseFromAccountConfig(codexHome, accountKey) {
     const baseUrl = readBaseUrl(accountConfigPath(codexHome, accountKey));
     if (!baseUrl || isProviderProxyBaseUrl(baseUrl)) return null;
-    return String(baseUrl).trim().replace(/\/+$/, "");
+    return canonicalizeVsllmProviderBaseUrl(baseUrl).replace(/\/+$/, "");
   }
 
   function apiProxyTargetForAccount(codexHome, account) {
@@ -516,4 +517,3 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     autoSwitchEnabled
   };
 }
-

@@ -83,7 +83,9 @@ function readConfigBaseUrls(configPath) {
 }
 
 export function modelsEndpointFromBaseUrl(baseUrl) {
-  const cleaned = String(baseUrl || "https://api.openai.com/v1").trim().replace(/\/+$/, "");
+  const cleaned = canonicalizeVsllmProviderBaseUrl(
+    String(baseUrl || "https://api.openai.com/v1").trim()
+  ).replace(/\/+$/, "");
   if (!cleaned) return "https://api.openai.com/v1/models";
   if (cleaned.endsWith("/models")) return cleaned;
   if (cleaned.endsWith("/v1")) return `${cleaned}/models`;
@@ -221,6 +223,21 @@ const vsllmProviderOrigins = new Set([
 ]);
 
 const vsllmPrimaryProviderOrigin = "https://vsllm.com";
+
+// Keep any API path while moving requests off the Cloudflare alias that has
+// intermittently returned 524s and API-key restriction errors.
+export function canonicalizeVsllmProviderBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return raw;
+  try {
+    const parsed = new URL(raw);
+    if (!vsllmProviderOrigins.has(parsed.origin)) return raw;
+    const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+    return `${vsllmPrimaryProviderOrigin}${pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return raw;
+  }
+}
 
 // Normalize a VSLLM origin (either hostname) to the primary vsllm.com host so
 // dashboard credential lookups and refreshes use one canonical origin.

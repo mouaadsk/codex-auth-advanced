@@ -11,12 +11,17 @@ const wrapper = path.join(repoRoot, "bin", "codex-auth-advanced.js");
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-advanced-compact-"));
 const codexHome = path.join(tempRoot, "codex-home");
 const accountsDir = path.join(codexHome, "accounts");
+const fakeBinDir = path.join(tempRoot, "bin");
 fs.mkdirSync(accountsDir, { recursive: true, mode: 0o700 });
+fs.mkdirSync(fakeBinDir, { recursive: true, mode: 0o700 });
+fs.writeFileSync(path.join(fakeBinDir, "launchctl"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
 
 const upstreamRequests = [];
 const compactFailures = [];
 const responseFailures = [];
 const claudeCompactionFailures = [];
+const claudeMessageFailures = [];
+let headerStallConnectionCloseCount = 0;
 const claudeSseBody = [
   "event: message_start",
   `data: ${JSON.stringify({
@@ -177,6 +182,17 @@ const upstream = http.createServer(async (req, res) => {
       res.end(claudeSseBody);
       return;
     }
+    const messageFailure = claudeMessageFailures.shift();
+    if (messageFailure === "api_key_ip_restriction") {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "IP access denied by API-Key restriction",
+          code: "forbidden"
+        }
+      }));
+      return;
+    }
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache"
@@ -305,8 +321,20 @@ const upstream = http.createServer(async (req, res) => {
       return;
     }
     if (responseFailure === "stall_headers") {
-      // Worse variant: never even send response headers.
+      // Close after the proxy watchdog has already fired. The previous proxy
+      // implementation tried to write a second response when this delayed
+      // rejection arrived and crashed with ERR_HTTP_HEADERS_SENT.
       res.socket.on("error", () => {});
+      res.once("close", () => {
+        headerStallConnectionCloseCount += 1;
+      });
+      setTimeout(() => {
+        if (!res.destroyed) res.destroy(new Error("delayed stalled-origin close"));
+      }, 650).unref?.();
+      return;
+    }
+    if (responseFailure === "network_error") {
+      res.destroy(new Error("simulated upstream connection reset"));
       return;
     }
     let parsedBody = null;
@@ -657,6 +685,7 @@ function runWrapper(args) {
       env: {
         ...process.env,
         HOME: tempRoot,
+        PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
         CODEX_HOME: codexHome,
         CODEX_AUTH_ADVANCED_PROXY_PORT: String(proxyPort),
         CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL: `${upstreamBaseUrl}${officialAnthropicPathPrefix}`
@@ -1161,6 +1190,59 @@ try {
     throw new Error(`normal Claude request should make exactly one upstream request, got ${upstreamRequests.length - beforeClaudeNormal}`);
   }
 
+  const restrictionFailoverAccounts = autoConfigRegistry.accounts
+    .filter((account) => ["apikey-vsllm", "apikey-vsllm-2"].includes(account.account_key))
+    .map((account) => JSON.parse(JSON.stringify(account)));
+  const restrictionFailoverVsllm2 = restrictionFailoverAccounts.find((account) => account.account_key === "apikey-vsllm-2");
+  restrictionFailoverVsllm2.api_spend = {
+    ...(restrictionFailoverVsllm2.api_spend || {}),
+    spend_usd: 10,
+    exhausted: false
+  };
+  restrictionFailoverVsllm2.last_usage = {
+    primary: { used_percent: 18, window_minutes: 480, resets_at: nowSeconds + 480 * 60 },
+    secondary: { used_percent: 18, window_minutes: 480, resets_at: nowSeconds + 480 * 60 }
+  };
+  delete restrictionFailoverVsllm2.api_exhausted_reason;
+  accounts.splice(0, accounts.length, ...restrictionFailoverAccounts);
+  setActive("apikey-vsllm", true);
+  claudeMessageFailures.push("api_key_ip_restriction");
+  const beforeRestrictionFailover = upstreamRequests.length;
+  const restrictionFailoverResponse = await proxyRawRequest(proxyPort, "/v1/messages", {
+    model: "kimi-k3",
+    max_tokens: 64,
+    stream: true,
+    messages: [{ role: "user", content: "Retry an account-specific API-key restriction." }]
+  }, {
+    "anthropic-version": "2023-06-01"
+  });
+  const restrictionFailoverText = await restrictionFailoverResponse.text();
+  if (restrictionFailoverResponse.status !== 200 || restrictionFailoverText !== claudeSseBody) {
+    throw new Error(`VSLLM API-key restriction should fail over transparently, got ${restrictionFailoverResponse.status}: ${restrictionFailoverText}`);
+  }
+  if (upstreamRequests.length !== beforeRestrictionFailover + 2) {
+    throw new Error(`VSLLM API-key restriction should make one attempt per account, got ${upstreamRequests.length - beforeRestrictionFailover}`);
+  }
+  assertRequestAt(beforeRestrictionFailover, {
+    label: "VSLLM API-key restriction first account",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectedModel: "kimi-k3"
+  });
+  assertRequestAt(beforeRestrictionFailover + 1, {
+    label: "VSLLM API-key restriction fallback account",
+    bearer: "vsllm-2-secret",
+    acceptEncoding: "identity",
+    expectedModel: "kimi-k3"
+  });
+  const restrictionFailoverRegistry = readRegistry();
+  if (restrictionFailoverRegistry.active_account_key !== "apikey-vsllm"
+    || restrictionFailoverRegistry.accounts.some((account) => account.api_spend?.exhausted === true)) {
+    throw new Error(`transient API-key restriction should not persist a switch or exhaust an account: ${JSON.stringify(restrictionFailoverRegistry)}`);
+  }
+  accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
+  setActive("apikey-vsllm");
+
   const beforeClaudeCountTokens = upstreamRequests.length;
   const countTokensResponse = await proxyRawRequest(proxyPort, "/v1/messages/count_tokens?beta=true", {
     model: "claude-fable-5-dd-5.4-korg[1m]",
@@ -1594,6 +1676,82 @@ try {
   await proxyRequest(proxyPort, "/responses", body);
   assertLatestRequest({ label: "business responses", bearer: "business-token", expectEncryptedContent: true });
 
+  const headerFailoverAccounts = autoConfigRegistry.accounts
+    .filter((account) => ["apikey-vsllm", "apikey-vsllm-2"].includes(account.account_key))
+    .map((account) => JSON.parse(JSON.stringify(account)));
+  const headerFailoverVsllm2 = headerFailoverAccounts.find((account) => account.account_key === "apikey-vsllm-2");
+  headerFailoverVsllm2.api_spend = {
+    ...(headerFailoverVsllm2.api_spend || {}),
+    spend_usd: 10,
+    exhausted: false
+  };
+  headerFailoverVsllm2.last_usage = {
+    primary: { used_percent: 18, window_minutes: 480, resets_at: nowSeconds + 480 * 60 },
+    secondary: { used_percent: 18, window_minutes: 480, resets_at: nowSeconds + 480 * 60 }
+  };
+  delete headerFailoverVsllm2.api_exhausted_reason;
+  accounts.splice(0, accounts.length, ...headerFailoverAccounts);
+  setActive("apikey-vsllm", true);
+  responseFailures.push("network_error");
+  const beforeNetworkFailover = upstreamRequests.length;
+  const networkFailoverResponse = await proxyRequest(proxyPort, "/responses", { ...body, stream: true });
+  if (networkFailoverResponse?.type !== "response.completed") {
+    throw new Error(`network failure should fail over to the second account, got ${JSON.stringify(networkFailoverResponse)}`);
+  }
+  if (upstreamRequests.length !== beforeNetworkFailover + 2) {
+    throw new Error(`network failure should make one attempt per account, got ${upstreamRequests.length - beforeNetworkFailover}`);
+  }
+  assertRequestAt(beforeNetworkFailover, {
+    label: "network failure first account",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true
+  });
+  assertRequestAt(beforeNetworkFailover + 1, {
+    label: "network failure fallback account",
+    bearer: "vsllm-2-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true
+  });
+
+  responseFailures.push("stall_headers");
+  const beforeHeaderFailover = upstreamRequests.length;
+  const headerCloseCountBeforeFailover = headerStallConnectionCloseCount;
+  const headerFailoverStart = Date.now();
+  const headerFailoverResponse = await proxyRequest(proxyPort, "/responses", { ...body, stream: true });
+  const headerFailoverElapsedMs = Date.now() - headerFailoverStart;
+  if (headerFailoverResponse?.type !== "response.completed") {
+    throw new Error(`header stall should fail over to the second account, got ${JSON.stringify(headerFailoverResponse)}`);
+  }
+  if (upstreamRequests.length !== beforeHeaderFailover + 2) {
+    throw new Error(`header stall should make one attempt per account, got ${upstreamRequests.length - beforeHeaderFailover}`);
+  }
+  assertRequestAt(beforeHeaderFailover, {
+    label: "header stall first account",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true
+  });
+  assertRequestAt(beforeHeaderFailover + 1, {
+    label: "header stall fallback account",
+    bearer: "vsllm-2-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true
+  });
+  if (headerFailoverElapsedMs < 350 || headerFailoverElapsedMs > 5000) {
+    throw new Error(`expected header-stall failover after the ~400ms watchdog, took ${headerFailoverElapsedMs}ms`);
+  }
+  for (let i = 0; i < 20 && headerStallConnectionCloseCount === headerCloseCountBeforeFailover; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (headerStallConnectionCloseCount <= headerCloseCountBeforeFailover) {
+    throw new Error("header watchdog should abort the stalled upstream connection before retrying");
+  }
+  if (proxy.exitCode !== null || !(await readProxyHealth(proxyPort))) {
+    throw new Error("proxy should remain healthy after aborting and failing over a header-stalled request");
+  }
+
+  accounts.splice(0, accounts.length, ...autoConfigRegistry.accounts);
   setActive("apikey-openai");
 
   responseFailures.push("stall_stream");
@@ -1629,7 +1787,10 @@ try {
   if (headerStallElapsedMs < 350 || headerStallElapsedMs > 5000) {
     throw new Error(`expected the header stall to fail fast (~400ms), took ${headerStallElapsedMs}ms`);
   }
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  if (proxy.exitCode !== null || !(await readProxyHealth(proxyPort))) {
+    throw new Error("proxy should remain healthy after the stalled upstream closes after the 524 response");
+  }
 
   const healthyAfterStall = await proxyRequest(proxyPort, "/responses", body);
   if (healthyAfterStall?.type !== "response.completed") {

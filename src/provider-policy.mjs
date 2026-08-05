@@ -231,6 +231,13 @@ function isVsllmTransientUsageLimitBody(body) {
   );
 }
 
+function isVsllmApiKeyRestrictionBody(body) {
+  return responseBodyMatches(
+    body,
+    /(?:ip\s+)?access denied by api[- ]?key restrictions?/i
+  );
+}
+
 function isModelCapacityBody(body) {
   return responseBodyMatches(
     body,
@@ -267,7 +274,9 @@ function shouldTrustProviderBalanceExhaustion(account) {
 
 export function apiProviderTransientRetryReason(status, body, account = null) {
   if (status === 503 && isModelCapacityBody(body)) return "model_capacity";
-  if (!isVsllmApiAccount(account) || apiAccountRollingLimitReached(account)) return null;
+  if (!isVsllmApiAccount(account)) return null;
+  if (status === 403 && isVsllmApiKeyRestrictionBody(body)) return "api_key_restriction";
+  if (apiAccountRollingLimitReached(account)) return null;
   if (isInvalidApiKeyBody(body) || isNoActiveSubscriptionBody(body)) return null;
   if (status === 429 || isVsllmTransientUsageLimitBody(body)) return "vsllm_usage_limit";
   return null;

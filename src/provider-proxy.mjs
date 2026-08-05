@@ -38,6 +38,7 @@ import {
 import { ensureDir, userHome } from "./storage.mjs";
 
 const providerProxyScriptPath = fileURLToPath(new URL("../bin/codex-auth-advanced.js", import.meta.url));
+const upstreamHeaderStallErrorCode = "CODEX_AUTH_ADVANCED_UPSTREAM_HEADER_STALL";
 
 export function createProviderProxy(options) {
   const providerProxyHost = options.host;
@@ -180,7 +181,7 @@ export function createProviderProxy(options) {
   }
 
   function isTransientApiFailureStatus(status) {
-    return status === 502 || status === 503 || status === 504;
+    return status === 502 || status === 503 || status === 504 || status === 524;
   }
 
   function proxyRequestTargetUrl(req, codexHome, target, routePath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`) {
@@ -409,12 +410,22 @@ export function createProviderProxy(options) {
   }
 
   function writeProxyError(res, status, message) {
+    if (res.destroyed || res.writableEnded) return false;
+    if (res.headersSent) {
+      try {
+        res.end();
+      } catch {
+        // The response is already closing; avoid a second writeHead attempt.
+      }
+      return false;
+    }
     const body = JSON.stringify({ error: { message, type: "codex_auth_advanced_proxy" } });
     res.writeHead(status, {
       "content-type": "application/json",
       "content-length": Buffer.byteLength(body)
     });
     res.end(body);
+    return true;
   }
 
   function writeProxySocketError(socket, status, message) {
@@ -486,28 +497,85 @@ export function createProviderProxy(options) {
 
   async function fetchProviderTarget(req, target, body, options = {}) {
     const timeoutMs = Number(options.timeout);
-    let signal;
-    if (Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-      signal = AbortSignal.timeout(timeoutMs);
-    } else if (options.streaming === true && streamStallWatchdogMs > 0) {
-      // No abort-based headers timeout here: AbortSignal.timeout stays armed
-      // after headers arrive and would abort HEALTHY long streams at the
-      // deadline (undici aborts the body, not just the headers phase). The
-      // per-chunk stall watchdog downstream covers both phases — it arms
-      // before the fetch resolves and fires on silence either way.
+    const timeoutSignal = Number.isFinite(timeoutMs)
+      && timeoutMs > 0
+      && typeof AbortSignal !== "undefined"
+      && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(timeoutMs)
+      : null;
+    const headerStallController = options.streaming === true && streamStallWatchdogMs > 0
+      ? new AbortController()
+      : null;
+    let headerStallTriggered = false;
+    let headerStallTimer = null;
+    if (headerStallController) {
+      headerStallTimer = setTimeout(() => {
+        headerStallTriggered = true;
+        headerStallController.abort();
+      }, streamStallWatchdogMs);
+      headerStallTimer.unref?.();
     }
+    const signals = [timeoutSignal, headerStallController?.signal].filter(Boolean);
+    const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
     const headers = sanitizeProxyRequestHeaders(req.headers, target, {
       omitContentEncoding: options.omitContentEncoding === true
     });
     if (body != null) {
       headers["content-length"] = String(Buffer.byteLength(body));
     }
-    return fetch(target.url, {
-      method: req.method,
-      headers,
-      body,
-      duplex: body == null ? undefined : "half",
-      signal
+    try {
+      return await fetch(target.url, {
+        method: req.method,
+        headers,
+        body,
+        duplex: body == null ? undefined : "half",
+        signal
+      });
+    } catch (error) {
+      if (headerStallTriggered) {
+        const stallError = new Error(`Upstream sent no response headers for ${streamStallWatchdogMs}ms.`);
+        stallError.code = upstreamHeaderStallErrorCode;
+        stallError.cause = error;
+        throw stallError;
+      }
+      throw error;
+    } finally {
+      if (headerStallTimer) clearTimeout(headerStallTimer);
+    }
+  }
+
+  function upstreamHeaderStallResponse(target) {
+    const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+    const body = JSON.stringify({
+      error: {
+        message: `[codex-auth-advanced] Upstream ${label} stalled: no response headers for ${streamStallWatchdogMs}ms. Failing over or returning promptly instead of hanging.`,
+        type: "codex_auth_advanced_stream_stall"
+      }
+    });
+    return new Response(body, {
+      status: 524,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(body))
+      }
+    });
+  }
+
+  function upstreamFetchFailureResponse(target, error) {
+    const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+    const detail = error?.cause?.code || error?.code || error?.message || String(error);
+    const body = JSON.stringify({
+      error: {
+        message: `[codex-auth-advanced] Upstream request to ${label} failed before a response (${detail}).`,
+        type: "codex_auth_advanced_upstream_fetch"
+      }
+    });
+    return new Response(body, {
+      status: 502,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(body))
+      }
     });
   }
 
@@ -704,34 +772,6 @@ export function createProviderProxy(options) {
       }
       let body = await readProxyRequestBody(req);
       let upstream = null;
-      let stallHeadersTimer = null;
-      const stallHeadersDeadlineMs = streamStallWatchdogMs;
-      const armStallHeadersWatchdog = () => {
-        if (!(stallHeadersDeadlineMs > 0) || stallHeadersTimer) return;
-        stallHeadersTimer = setTimeout(() => {
-          if (upstream || res.writableEnded) return;
-          console.warn(`[Proxy Stream] ${req.url} stalled: no upstream response headers for ${stallHeadersDeadlineMs}ms; failing fast.`);
-          if (!res.headersSent) {
-            const stallBody = JSON.stringify({
-              error: {
-                message: `[codex-auth-advanced] Upstream stalled: no response headers for ${stallHeadersDeadlineMs}ms. Failing fast instead of hanging; retry the request.`,
-                type: "codex_auth_advanced_stream_stall"
-              }
-            });
-            res.writeHead(524, { "content-type": "application/json", "content-length": Buffer.byteLength(stallBody) });
-            res.end(stallBody);
-          } else {
-            res.destroy();
-          }
-        }, stallHeadersDeadlineMs);
-        stallHeadersTimer.unref?.();
-      };
-      const clearStallHeadersWatchdog = () => {
-        if (stallHeadersTimer) {
-          clearTimeout(stallHeadersTimer);
-          stallHeadersTimer = null;
-        }
-      };
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
       const modelCapacityRetries = new Map();
@@ -810,7 +850,6 @@ export function createProviderProxy(options) {
 
         let fetchFailed = false;
         let fetchError = null;
-        if (requestIsStreaming) armStallHeadersWatchdog();
         try {
           upstream = await fetchProviderTarget(req, target, body, {
             omitContentEncoding: bodyAlreadyDecoded,
@@ -818,10 +857,17 @@ export function createProviderProxy(options) {
             streaming: requestIsStreaming
           });
         } catch (err) {
-          fetchFailed = true;
           fetchError = err;
+          if (err?.code === upstreamHeaderStallErrorCode) {
+            console.warn(`[Proxy Stream] ${req.url} stalled before upstream headers on ${targetLabel}; treating it as a transient 524.`);
+            upstream = upstreamHeaderStallResponse(target);
+          } else if (!target.chatgpt && !target.officialAnthropic) {
+            console.warn(`[Proxy] ${req.url} failed before upstream headers on ${targetLabel}; treating it as a transient 502 (${err?.cause?.code || err?.code || err?.message || err}).`);
+            upstream = upstreamFetchFailureResponse(target, err);
+          } else {
+            fetchFailed = true;
+          }
         }
-        if (!requestIsStreaming) clearStallHeadersWatchdog();
 
         if ((target.chatgpt || target.officialAnthropic) && !fetchFailed) {
           captureChatgptCloudflareCookies(upstream.headers);
@@ -972,7 +1018,6 @@ export function createProviderProxy(options) {
       // produces data, and a queued writeHead would sit behind it — along with
       // anything the stall watchdog tries to write later.
       if (contentType.includes("event-stream")) res.flushHeaders();
-      clearStallHeadersWatchdog();
       const contentEncoding = String(upstream.headers.get("content-encoding") || "").toLowerCase();
       let responseStream = Readable.fromWeb(upstream.body);
       const watchdogStallTarget = responseStream;
@@ -1093,7 +1138,6 @@ export function createProviderProxy(options) {
       }
       responseStream.pipe(res);
     } catch (error) {
-      clearStallHeadersWatchdog();
       console.error(`[Proxy Error] ${req.url} failed:`, error);
       writeProxyError(res, 502, `Provider proxy request failed: ${error?.message || error}`);
     }
