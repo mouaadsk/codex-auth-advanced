@@ -32,6 +32,29 @@ function assertModelCatalog(catalog, source) {
   return catalog;
 }
 
+function isVsllmCodexModelSlug(slug) {
+  return vsllmCodexModelSlugs.includes(slug) || retiredVsllmPro20xSlugs.has(slug);
+}
+
+// VSLLM's gpt-5.6-* backends intermittently fail on Codex 0.147's responses-lite
+// wire shape (tools embedded as an input[0] "additional_tools" namespace item,
+// top-level tools omitted): affected turns come back claiming no callable tools
+// exist. The classic Responses shape (top-level tools array) works on every
+// backend node, so pin these models to direct tool mode until VSLLM reliably
+// supports responses-lite. To re-test: build a catalog variant with
+// tool_mode "code_mode_only" + use_responses_lite true, then run
+//   codex exec --model gpt-5.6-sol --config model_catalog_json=<variant> \
+//     "Use your exec tool to run: echo hi"
+// repeatedly and confirm every run produces a function_call.
+function overrideVsllmCodexModel(model) {
+  return {
+    ...model,
+    tool_mode: "direct",
+    use_responses_lite: false,
+    multi_agent_version: "v1"
+  };
+}
+
 export function augmentedCodexModelCatalog(catalog) {
   const source = assertModelCatalog(catalog, "The source catalog");
   const found = new Set();
@@ -39,7 +62,8 @@ export function augmentedCodexModelCatalog(catalog) {
 
   for (const model of source.models) {
     if (!model || typeof model.slug !== "string" || retiredVsllmPro20xSlugs.has(model.slug)) continue;
-    models.push(model);
+    const next = isVsllmCodexModelSlug(model.slug) ? overrideVsllmCodexModel(model) : model;
+    models.push(next);
     if (vsllmCodexModelSlugs.includes(model.slug)) found.add(model.slug);
   }
 
