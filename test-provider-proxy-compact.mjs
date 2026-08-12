@@ -510,6 +510,15 @@ async function proxyRequest(port, suffix, body) {
   return response.json();
 }
 
+function parseSseDataEvents(bodyText) {
+  return bodyText
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice(6).trim())
+    .filter((data) => data && data !== "[DONE]")
+    .map((data) => JSON.parse(data));
+}
+
 async function proxyGzipRequest(port, suffix, body) {
   const response = await fetch(`http://127.0.0.1:${port}/_codex-auth-advanced/${proxyGroupId(codexHome)}${suffix}`, {
     method: "POST",
@@ -858,6 +867,115 @@ try {
     expectedModel: "gpt-5.5",
     expectedReasoningEffort: "xhigh"
   });
+
+  const remoteCompactionV2Body = {
+    model: "gpt-5.6-sol",
+    stream: true,
+    reasoning: {
+      effort: "ultra",
+      summary: "auto"
+    },
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "compaction",
+        compaction: {
+          implementation: "responses_compaction_v2",
+          trigger: "manual"
+        }
+      })
+    },
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "important prior context" }]
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "prior answer" }]
+      },
+      { type: "compaction_trigger" }
+    ]
+  };
+  const beforeRemoteCompactionV2 = upstreamRequests.length;
+  const remoteCompactionV2 = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+  const remoteCompactionV2Text = await remoteCompactionV2.text();
+  if (remoteCompactionV2.status !== 200) {
+    throw new Error(`remote compaction v2 should return 200, got ${remoteCompactionV2.status}:\n${remoteCompactionV2Text}`);
+  }
+  if (!String(remoteCompactionV2.headers.get("content-type") || "").includes("text/event-stream")) {
+    throw new Error(`remote compaction v2 should return SSE, got ${remoteCompactionV2.headers.get("content-type")}`);
+  }
+  if (upstreamRequests.length !== beforeRemoteCompactionV2 + 1) {
+    throw new Error(`remote compaction v2 should make one provider-compatible summarization request, got ${upstreamRequests.length - beforeRemoteCompactionV2}`);
+  }
+  const remoteCompactionFallbackRequest = upstreamRequests.at(-1);
+  if (!remoteCompactionFallbackRequest?.url.endsWith("/chat/completions")) {
+    throw new Error(`remote compaction v2 should use chat completions, got ${remoteCompactionFallbackRequest?.url}`);
+  }
+  const remoteCompactionFallbackBody = JSON.parse(remoteCompactionFallbackRequest.bodyText);
+  if (remoteCompactionFallbackBody.model !== "gpt-5.6-sol") {
+    throw new Error(`remote compaction v2 should preserve the selected model, got ${remoteCompactionFallbackRequest.bodyText}`);
+  }
+  if (remoteCompactionFallbackBody.reasoning_effort !== "ultra") {
+    throw new Error(`remote compaction v2 should preserve Codex reasoning effort, got ${remoteCompactionFallbackRequest.bodyText}`);
+  }
+  const remoteCompactionFallbackSerialized = JSON.stringify(remoteCompactionFallbackBody);
+  if (!remoteCompactionFallbackSerialized.includes("important prior context")
+    || !remoteCompactionFallbackSerialized.includes("prior answer")
+    || remoteCompactionFallbackSerialized.includes("compaction_trigger")) {
+    throw new Error(`remote compaction v2 should summarize the readable conversation without forwarding its trigger, got ${remoteCompactionFallbackRequest.bodyText}`);
+  }
+  const remoteCompactionV2Events = parseSseDataEvents(remoteCompactionV2Text);
+  const remoteCompactionOutputEvents = remoteCompactionV2Events.filter((event) => event.type === "response.output_item.done");
+  const remoteCompactionCompletedEvents = remoteCompactionV2Events.filter((event) => event.type === "response.completed");
+  if (remoteCompactionOutputEvents.length !== 1
+    || remoteCompactionOutputEvents[0]?.item?.type !== "compaction"
+    || !String(remoteCompactionOutputEvents[0]?.item?.encrypted_content || "").startsWith("codex-auth-advanced:remote-compaction-v2:")) {
+    throw new Error(`remote compaction v2 should emit exactly one tagged compaction item, got:\n${remoteCompactionV2Text}`);
+  }
+  if (remoteCompactionCompletedEvents.length !== 1
+    || !String(remoteCompactionCompletedEvents[0]?.response?.id || "").startsWith("resp_compact_")) {
+    throw new Error(`remote compaction v2 should emit one response.completed event, got:\n${remoteCompactionV2Text}`);
+  }
+
+  const beforeCompactedFollowUp = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", {
+    model: "gpt-5.6-sol",
+    input: [
+      remoteCompactionOutputEvents[0].item,
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "continue after compaction" }]
+      }
+    ]
+  });
+  if (upstreamRequests.length !== beforeCompactedFollowUp + 1) {
+    throw new Error(`a post-compaction turn should make one normal responses request, got ${upstreamRequests.length - beforeCompactedFollowUp}`);
+  }
+  const compactedFollowUpBody = JSON.parse(upstreamRequests.at(-1).bodyText);
+  const compactedFollowUpSerialized = JSON.stringify(compactedFollowUpBody);
+  const expandedSummary = compactedFollowUpBody.input?.find((item) => item.type === "message" && item.role === "developer");
+  if (compactedFollowUpSerialized.includes("codex-auth-advanced:remote-compaction-v2:")
+    || compactedFollowUpBody.input?.some((item) => item.type === "compaction")
+    || !JSON.stringify(expandedSummary).includes("compacted message text")) {
+    throw new Error(`a proxy-generated compaction item should expand into readable provider context, got ${upstreamRequests.at(-1).bodyText}`);
+  }
+
+  claudeCompactionFailures.push("unreachable");
+  const beforeRemoteCompactionDummy = upstreamRequests.length;
+  const remoteCompactionDummy = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+  const remoteCompactionDummyText = await remoteCompactionDummy.text();
+  const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
+  if (remoteCompactionDummy.status !== 200
+    || upstreamRequests.length !== beforeRemoteCompactionDummy + 1
+    || remoteCompactionDummyEvents.filter((event) => event.type === "response.output_item.done" && event.item?.type === "compaction").length !== 1
+    || remoteCompactionDummyEvents.filter((event) => event.type === "response.completed").length !== 1) {
+    throw new Error(`remote compaction v2 failure should still return a protocol-compatible terminal stream, got:\n${remoteCompactionDummyText}`);
+  }
+
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
   const latestReq = upstreamRequests.at(-1);
   if (!latestReq || !latestReq.url.endsWith("/responses/compact")) {

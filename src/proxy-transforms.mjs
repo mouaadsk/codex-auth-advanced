@@ -8,6 +8,88 @@ import {
 } from "./provider-policy.mjs";
 
 const dropProxyJsonValue = Symbol("dropProxyJsonValue");
+const remoteCompactionV2SummaryPrefix = "codex-auth-advanced:remote-compaction-v2:";
+
+function isPlainObject(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function decodeRemoteCompactionV2Summary(value) {
+  if (typeof value !== "string" || !value.startsWith(remoteCompactionV2SummaryPrefix)) return null;
+  try {
+    const summary = Buffer.from(value.slice(remoteCompactionV2SummaryPrefix.length), "base64url").toString("utf8");
+    return summary.trim() ? summary : null;
+  } catch {
+    return null;
+  }
+}
+
+function encodeRemoteCompactionV2Summary(summary) {
+  return `${remoteCompactionV2SummaryPrefix}${Buffer.from(String(summary || ""), "utf8").toString("base64url")}`;
+}
+
+function remoteCompactionV2SummaryMessage(summary) {
+  return {
+    type: "message",
+    role: "developer",
+    content: [{
+      type: "input_text",
+      text: `Context summary from an earlier compaction:\n\n${summary}`
+    }]
+  };
+}
+
+// A remote-v2 compaction item is opaque to Codex, but VSLLM cannot decrypt
+// OpenAI's encrypted representation. Convert only summaries synthesized by
+// this proxy back into normal context before they reach the provider.
+function expandRemoteCompactionV2Summaries(parsed) {
+  if (!Array.isArray(parsed?.input)) return false;
+  let changed = false;
+  parsed.input = parsed.input.map((item) => {
+    const summary = item?.type === "compaction"
+      ? decodeRemoteCompactionV2Summary(item.encrypted_content)
+      : null;
+    if (!summary) return item;
+    changed = true;
+    return remoteCompactionV2SummaryMessage(summary);
+  });
+  return changed;
+}
+
+function parseTurnMetadata(value) {
+  if (isPlainObject(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasRemoteCompactionV2Metadata(parsed, headers) {
+  const metadataValues = [
+    parsed?.client_metadata?.["x-codex-turn-metadata"],
+    parsed?.client_metadata?.x_codex_turn_metadata,
+    headers?.["x-codex-turn-metadata"],
+    headers?.["X-Codex-Turn-Metadata"]
+  ];
+  return metadataValues.some((value) => {
+    const metadata = parseTurnMetadata(value);
+    return metadata?.request_kind === "compaction"
+      && metadata?.compaction?.implementation === "responses_compaction_v2";
+  });
+}
+
+// Codex sends remote compaction v2 through the ordinary /responses endpoint.
+// The explicit input control is the canonical marker; the metadata check keeps
+// the proxy compatible with equivalent future request layouts.
+export function isCodexRemoteCompactionV2Request(target, parsed, headers = {}) {
+  if (!isResponsesProxyTarget(target) || !isPlainObject(parsed)) return false;
+  const hasTrigger = Array.isArray(parsed.input)
+    && parsed.input.some((item) => item?.type === "compaction_trigger");
+  return hasTrigger || hasRemoteCompactionV2Metadata(parsed, headers);
+}
 
 function isEncryptedContentKey(key) {
   return String(key || "").replaceAll(/[_-]/g, "").toLowerCase() === "encryptedcontent";
@@ -172,7 +254,14 @@ export function decodeProxyJsonBody(body, headers, { alreadyDecoded = false } = 
 
 export function rewriteProviderProxyRequestBody(target, body, headers = {}, options = {}) {
   if (!body || !Buffer.isBuffer(body) || body.length === 0) {
-    return { body, rewritten: false, decoded: false, decodeFailed: false, originalModel: null };
+    return {
+      body,
+      rewritten: false,
+      decoded: false,
+      decodeFailed: false,
+      originalModel: null,
+      remoteCompactionV2: false
+    };
   }
 
   const decoded = decodeProxyJsonBody(body, headers, options);
@@ -180,12 +269,23 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
   try {
     parsed = JSON.parse(decoded.body.toString("utf8"));
   } catch {
-    return { body, rewritten: false, decoded: decoded.decoded, decodeFailed: decoded.decodeFailed, originalModel: null };
+    return {
+      body,
+      rewritten: false,
+      decoded: decoded.decoded,
+      decodeFailed: decoded.decodeFailed,
+      originalModel: null,
+      remoteCompactionV2: false
+    };
   }
 
   const originalModel = typeof parsed?.model === "string" ? parsed.model : null;
+  const remoteCompactionV2 = isCodexRemoteCompactionV2Request(target, parsed, headers);
 
   let rewritten = false;
+  if (expandRemoteCompactionV2Summaries(parsed)) {
+    rewritten = true;
+  }
   if (isCompactProxyTarget(target) && parsed && parsed.client_metadata !== undefined) {
     delete parsed.client_metadata;
     rewritten = true;
@@ -220,7 +320,8 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
       rewritten: false,
       decoded: decoded.decoded,
       decodeFailed: decoded.decodeFailed,
-      originalModel
+      originalModel,
+      remoteCompactionV2
     };
   }
 
@@ -229,7 +330,8 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
     rewritten: true,
     decoded: true,
     decodeFailed: decoded.decodeFailed,
-    originalModel
+    originalModel,
+    remoteCompactionV2
   };
 }
 
@@ -658,8 +760,8 @@ export function normalizeCompactionResponse(value) {
       ? value.messages
       : null;
   if (sourceItems) {
-    // Codex requires exactly one compaction output item; collapse extras
-    // (reasoning items, empty messages) before normalizing content parts.
+    // The legacy /responses/compact response carries one condensed message;
+    // collapse provider-added reasoning and empty message items around it.
     const single = selectSingleCompactionOutputItem(sourceItems);
     value.output = single;
     value.messages = single;
@@ -677,6 +779,7 @@ function compactionCompletionsUrl(target) {
     const url = new URL(target.url);
     const pathname = url.pathname
       .replace(/\/responses\/compact\/?$/, "/chat/completions")
+      .replace(/\/responses\/?$/, "/chat/completions")
       .replace(/\/v1\/messages\/?$/, "/chat/completions");
     if (pathname === url.pathname) return null;
     url.pathname = pathname;
@@ -685,6 +788,43 @@ function compactionCompletionsUrl(target) {
   } catch {
     return null;
   }
+}
+
+// Remote compaction v2 is streamed through /responses. Codex accepts exactly
+// one output item with type "compaction" and then a response.completed event.
+// The encrypted-content field is opaque to Codex; locally-generated summaries
+// are tagged so the proxy can expand them into provider-readable context on a
+// later request.
+export function remoteCompactionV2Response(summaryText) {
+  const responseId = `resp_compact_${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+  const compactionItem = {
+    type: "compaction",
+    encrypted_content: encodeRemoteCompactionV2Summary(summaryText)
+  };
+  const events = [
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: compactionItem
+    },
+    {
+      type: "response.completed",
+      response: {
+        id: responseId,
+        object: "response",
+        status: "completed",
+        output: [compactionItem]
+      }
+    }
+  ];
+  const body = events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+  return new Response(body, {
+    status: 200,
+    headers: new Headers({
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache"
+    })
+  });
 }
 
 // Claude Code compaction: the full transcript plus the summarization
@@ -721,6 +861,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   }
 
   const claudeFormat = isClaudeMessagesCompactionTarget(target, parsed);
+  const remoteCompactionV2 = options.remoteCompactionV2 === true;
   const authHeaders = sanitizeRequestHeaders(headers, target, {
     omitContentEncoding: true
   });
@@ -808,6 +949,9 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         parts.push(item.content);
       }
       conversationText += `[${role}]: ${parts.join("\n")}\n\n`;
+    } else if (item.type === "compaction") {
+      const summary = decodeRemoteCompactionV2Summary(item.encrypted_content);
+      if (summary) conversationText += `[earlier compacted context]: ${summary}\n\n`;
     } else if (item.type === "function_call") {
       conversationText += `[assistant called function]: ${item.name} with arguments ${item.arguments}\n\n`;
     } else if (item.type === "function_call_output") {
@@ -863,6 +1007,10 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
       return claudeMessagesCompactionResponse(summaryText, parsed?.model);
     }
 
+    if (remoteCompactionV2) {
+      return remoteCompactionV2Response(summaryText);
+    }
+
     const compactedMessage = compactTextMessage(summaryText);
     const compactionResponse = {
       type: "response.compaction",
@@ -898,6 +1046,11 @@ export function dummyCompactionResponse(errorMsg) {
       "content-type": "application/json; charset=utf-8"
     })
   });
+}
+
+export function dummyRemoteCompactionV2Response(errorMsg) {
+  const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
+  return remoteCompactionV2Response(summaryText);
 }
 
 function claudeMessagesJsonResponse(body, extraHeaders = {}) {

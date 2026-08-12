@@ -28,6 +28,7 @@ import {
   createStreamDiagnostics,
   dummyClaudeCompactionResponse,
   dummyCompactionResponse,
+  dummyRemoteCompactionV2Response,
   isClaudeMessagesCompactionTarget,
   isCompactProxyTarget,
   isResponsesProxyTarget,
@@ -783,6 +784,7 @@ export function createProviderProxy(options) {
       let originalRequestModel = null;
       const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
       originalRequestModel = rewrittenBody.originalModel;
+      const remoteCompactionV2 = rewrittenBody.remoteCompactionV2 === true;
       if (rewrittenBody.rewritten) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = rewrittenBody.decoded === true;
@@ -847,6 +849,30 @@ export function createProviderProxy(options) {
               ? "ChatGPT account"
               : "API provider";
         console.log(`[Proxy Request] ${req.method} ${req.url} -> ${targetLabel}: ${target.url}`);
+
+        if (remoteCompactionV2
+          && !target.chatgpt
+          && !target.officialAnthropic
+          && claudeResponsesBridge?.kind !== "responses") {
+          console.log("[Proxy] Codex remote compaction v2 detected; generating a provider-compatible local summary.");
+          let localCompacted = await runLocalCompactionFallback(
+            target,
+            body,
+            req.headers,
+            bodyAlreadyDecoded,
+            sanitizeProxyRequestHeaders,
+            {
+              originalModel: originalRequestModel,
+              remoteCompactionV2: true
+            }
+          );
+          if (!localCompacted) {
+            console.warn("[Proxy] Remote compaction v2 fallback failed. Generating a protocol-compatible placeholder.");
+            localCompacted = dummyRemoteCompactionV2Response("Provider-compatible summarization failed");
+          }
+          upstream = localCompacted;
+          break;
+        }
 
         let fetchFailed = false;
         let fetchError = null;
