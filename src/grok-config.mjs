@@ -9,14 +9,41 @@ export const grokVsllmManagedModels = Object.freeze([
   {
     pickerId: "vsllm-grok-45",
     upstreamModel: "grok-4.5",
-    name: "VSLLM Grok 4.5"
+    name: "VSLLM Grok 4.5",
+    reasoningEfforts: ["low", "medium", "high"],
+    defaultReasoningEffort: "high"
   },
   {
     pickerId: "vsllm-grok-46",
     upstreamModel: "grok-4.6",
-    name: "VSLLM Grok 4.6"
+    name: "VSLLM Grok 4.6",
+    reasoningEfforts: ["low", "medium", "high", "xhigh"],
+    defaultReasoningEffort: "high"
   }
 ]);
+
+function grokReasoningEffortLabel(effort) {
+  switch (effort) {
+    case "low": return "Low";
+    case "medium": return "Medium";
+    case "high": return "High";
+    case "xhigh": return "X-High";
+    default: return effort;
+  }
+}
+
+function appendGrokReasoningEffortToml(lines, model) {
+  lines.push("supports_reasoning_effort = true");
+  lines.push(`reasoning_effort = ${JSON.stringify(model.defaultReasoningEffort)}`);
+  for (const effort of model.reasoningEfforts) {
+    lines.push(`[[model.${model.pickerId}.reasoning_efforts]]`);
+    lines.push(`id = ${JSON.stringify(effort)}`);
+    lines.push(`value = ${JSON.stringify(effort)}`);
+    lines.push(`label = ${JSON.stringify(grokReasoningEffortLabel(effort))}`);
+    lines.push(`default = ${effort === model.defaultReasoningEffort}`);
+    lines.push("");
+  }
+}
 
 const legacyManagedGrokSections = new Set([
   grokVsllmProviderSection,
@@ -59,6 +86,7 @@ export function managedGrokConfigSections(baseUrl) {
       "max_completion_tokens = 65536",
       ""
     );
+    appendGrokReasoningEffortToml(lines, model);
   }
   return lines.join("\n").trimEnd();
 }

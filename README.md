@@ -474,7 +474,7 @@ model_provider = "vsllm"
 model = "grok-4.6"
 ```
 
-Grok Build uses the OpenAI Responses API directly, so no Claude Messages bridge is required. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`.
+Grok Build uses the OpenAI Responses API directly, so no Claude Messages bridge is required. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models.
 
 Use `/model vsllm-grok-46` or `grok -m vsllm-grok-46` after configuration. The marker `api_key` is not sent upstream; the local proxy replaces it with the stored VSLLM account key.
 

@@ -326,7 +326,11 @@ for (const expected of [
   "[model.vsllm-grok-45]",
   'model = "grok-4.5"',
   "[model.vsllm-grok-46]",
-  'model = "grok-4.6"'
+  'model = "grok-4.6"',
+  "supports_reasoning_effort = true",
+  'reasoning_effort = "high"',
+  "[[model.vsllm-grok-46.reasoning_efforts]]",
+  'value = "xhigh"'
 ]) {
   if (!grokConfig.includes(expected)) throw new Error(`Grok config is missing ${expected}:\n${grokConfig}`);
 }

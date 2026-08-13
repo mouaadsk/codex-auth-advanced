@@ -286,6 +286,9 @@ try {
   assert.match(grokConfigured, /\[model\.vsllm-grok-46\]/);
   assert.match(grokConfigured, /model = "grok-4.6"/);
   assert.match(grokConfigured, /\[cli\]/);
+  assert.match(grokConfigured, /supports_reasoning_effort = true/);
+  assert.match(grokConfigured, /\[\[model\.vsllm-grok-46\.reasoning_efforts\]\]/);
+  assert.match(grokConfigured, /value = "xhigh"/);
   assert.doesNotMatch(grokConfigured, /\[model\.vsllm-grok-4\.5\]/);
   const grokReconfigured = upsertGrokVsllmProxyConfig(grokConfigured, `${grokProxyRoot}-updated`);
   assert.match(grokReconfigured, /test-group-updated\/v1"/);
