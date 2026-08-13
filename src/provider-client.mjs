@@ -215,45 +215,32 @@ export function providerOriginFromModelsEndpoint(endpoint) {
   return normalizeProviderOrigin(endpoint);
 }
 
-// vsllm.com is the primary origin; api.vsllm.com is the newer alias. Both
-// resolve to the same New API backend, but vsllm.com is the canonical host.
-const vsllmProviderOrigins = new Set([
-  "https://vsllm.com",
-  "https://api.vsllm.com"
-]);
+const vsllmProviderOrigin = "https://vsllm.com";
 
-const vsllmPrimaryProviderOrigin = "https://vsllm.com";
-
-// Keep any API path while moving requests off the Cloudflare alias that has
-// intermittently returned 524s and API-key restriction errors.
 export function canonicalizeVsllmProviderBaseUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return raw;
   try {
     const parsed = new URL(raw);
-    if (!vsllmProviderOrigins.has(parsed.origin)) return raw;
+    if (parsed.origin !== vsllmProviderOrigin) return raw;
     const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
-    return `${vsllmPrimaryProviderOrigin}${pathname}${parsed.search}${parsed.hash}`;
+    return `${vsllmProviderOrigin}${pathname}${parsed.search}${parsed.hash}`;
   } catch {
     return raw;
   }
 }
 
-// Normalize a VSLLM origin (either hostname) to the primary vsllm.com host so
-// dashboard credential lookups and refreshes use one canonical origin.
 export function canonicalizeVsllmProviderOrigin(origin) {
   const normalized = normalizeProviderOrigin(origin);
   if (!normalized) return normalized;
-  return vsllmProviderOrigins.has(normalized) ? vsllmPrimaryProviderOrigin : normalized;
+  return normalized === vsllmProviderOrigin ? vsllmProviderOrigin : normalized;
 }
 
-// VSLLM serves its New API dashboard on both official hostnames.
 export function providerDashboardOriginMatchesModelsEndpoint(modelsEndpoint, dashboardOrigin) {
   const modelsOrigin = providerOriginFromModelsEndpoint(modelsEndpoint);
   const normalizedDashboardOrigin = normalizeProviderOrigin(dashboardOrigin);
   if (!modelsOrigin || !normalizedDashboardOrigin) return false;
-  if (modelsOrigin === normalizedDashboardOrigin) return true;
-  return vsllmProviderOrigins.has(modelsOrigin) && vsllmProviderOrigins.has(normalizedDashboardOrigin);
+  return modelsOrigin === normalizedDashboardOrigin;
 }
 
 function providerDashboardRequestHeaders(credential) {

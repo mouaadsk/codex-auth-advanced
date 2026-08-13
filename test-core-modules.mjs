@@ -147,22 +147,19 @@ try {
   assert.equal(parseTomlString('"gpt-5.6-sol"'), "gpt-5.6-sol");
   assert.equal(inferApiKeyTemplateName({ alias: "my tcdmx account" }), "tcdmx");
   assert.equal(
-    providerDashboardOriginMatchesModelsEndpoint("https://api.vsllm.com/v1/models", "https://vsllm.com"),
+    providerDashboardOriginMatchesModelsEndpoint("https://vsllm.com/v1/models", "https://vsllm.com"),
     true
   );
   assert.equal(
-    providerDashboardOriginMatchesModelsEndpoint("https://vsllm.com/v1/models", "https://api.vsllm.com"),
-    true
+    providerDashboardOriginMatchesModelsEndpoint("https://vsllm.com/v1/models", "https://api.example.com"),
+    false
   );
   assert.equal(
     providerDashboardOriginMatchesModelsEndpoint("https://api.example.com/v1/models", "https://example.com"),
     false
   );
-  assert.equal(canonicalizeVsllmProviderOrigin("https://api.vsllm.com"), "https://vsllm.com");
   assert.equal(canonicalizeVsllmProviderOrigin("https://vsllm.com"), "https://vsllm.com");
-  assert.equal(canonicalizeVsllmProviderOrigin("https://api.vsllm.com/v1/models"), "https://vsllm.com");
   assert.equal(canonicalizeVsllmProviderOrigin("https://api.example.com"), "https://api.example.com");
-  assert.equal(canonicalizeVsllmProviderBaseUrl("https://api.vsllm.com/v1"), "https://vsllm.com/v1");
   assert.equal(canonicalizeVsllmProviderBaseUrl("https://vsllm.com/v1/"), "https://vsllm.com/v1");
   assert.equal(canonicalizeVsllmProviderBaseUrl("https://api.example.com/v1"), "https://api.example.com/v1");
 
@@ -267,7 +264,7 @@ try {
   }, 107, 480, nowSeconds);
   assert.equal(rolling.spend, 12);
   assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com"), "https://vsllm.com/v1/models");
-  assert.equal(modelsEndpointFromBaseUrl("https://api.vsllm.com/v1"), "https://vsllm.com/v1/models");
+  assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com/v1"), "https://vsllm.com/v1/models");
   assert.equal(normalizeProviderOrigin("https://vsllm.com/v1/models"), "https://vsllm.com");
 
   const compactTarget = {
@@ -442,7 +439,7 @@ try {
     'model_provider = "OpenAI"',
     "",
     "[model_providers.OpenAI]",
-    'base_url = "https://api.vsllm.com/v1"',
+    'base_url = "https://vsllm.com/v1"',
     'wire_api = "responses"',
     ""
   ].join("\n"));
