@@ -4,7 +4,8 @@ const claudeVsllmGatewayModelPrefix = "claude-vsllm-";
 const legacyVsllmClaudeGatewayModelIds = new Set([
   "claude-fake-5",
   "kimi-k3",
-  "grok-4.5"
+  "grok-4.5",
+  "grok-4.6"
 ]);
 
 function reversedModelId(value) {
@@ -404,6 +405,7 @@ function remappedVsllmModel(model, { compact = false } = {}) {
   const aliases = {
     "kimi-k3[1m]": "kimi-k3",
     "grok-4.5[1m]": "grok-4.5",
+    "grok-4.6[1m]": "grok-4.6",
     "gpt-5.5-pro20x-openai-compact": "gpt-5.5-openai-compact",
     "gpt-5.6-sol-pro20x": "gpt-5.6-sol",
     "gpt-5.6-terra-pro20x": "gpt-5.6-terra",

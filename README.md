@@ -81,7 +81,7 @@ ChatGPT account switches normally require restarting the Codex client so it relo
 | `src/proxy-transforms.mjs` | Request rewriting, compressed JSON decoding, encrypted-content repair, SSE normalization, and compact fallback. |
 | `src/provider-proxy.mjs` | Route parsing, pinned/default targeting, HTTP/WebSocket transport, failover orchestration, streaming, and graceful lifecycle. |
 | `src/account-service.mjs` | Registry loading, account selection, target resolution, exhaustion mutation, and account activation. |
-| `src/client-config.mjs` | Codex and Claude Code configuration through the local proxy. |
+| `src/client-config.mjs` | Codex, Claude Code, and Grok Build configuration through the local proxy. |
 | `src/cli-service.mjs` | Wrapper-owned account, usage, dashboard, auto-switch, list, and proxy commands. |
 | `src/manager-service.mjs` | Background manager lifecycle, macOS LaunchAgent handling, and status augmentation. |
 
@@ -285,9 +285,10 @@ For normal operations, prefer the lifecycle scripts described in [Operations](#o
 
 | Command | Purpose |
 | --- | --- |
-| `configure [all]` | Configure Codex and Claude Code; `all` is the default when omitted. |
+| `configure [all]` | Configure Codex, Claude Code, and Grok Build; `all` is the default when omitted. |
 | `configure codex` | Point Codex at the default proxy route for its active API-key account. |
 | `configure claude` | Merge the Claude Code gateway settings and independent VSLLM model discovery into `~/.claude/settings.json`. |
+| `configure grok` | Merge VSLLM Grok 4.5/4.6 Responses routes into `~/.grok/config.toml`. |
 
 ## Account Storage
 
@@ -398,6 +399,7 @@ codex-auth-advanced configure
 codex-auth-advanced configure all
 codex-auth-advanced configure codex
 codex-auth-advanced configure claude
+codex-auth-advanced configure grok
 ```
 
 The macOS installer configures both installed clients and the launchd service:
@@ -433,8 +435,9 @@ The picker merges two live catalogs without replacing either one:
 | `VSLLM: claude-fake-5` | VSLLM `claude-fake-5` using the stored VSLLM API key |
 | `VSLLM: kimi-k3` | VSLLM `kimi-k3` using the native Anthropic Messages endpoint |
 | `VSLLM: grok-4.5` | VSLLM `grok-4.5` through the Responses bridge |
+| `VSLLM: grok-4.6` | VSLLM `grok-4.6` through the Responses bridge |
 
-Official Claude Code entries remain first-party picker choices and use Claude Code OAuth. The cache contains only VSLLM entries, built from every live `/v1/models` item whose `supported_endpoint_types` includes `anthropic`; the bridge also adds VSLLM's Responses-only `grok-4.5`. This is data-driven, so running `configure claude` refreshes newly available Anthropic-compatible VSLLM models without maintaining a static allowlist.
+Official Claude Code entries remain first-party picker choices and use Claude Code OAuth. The cache contains only VSLLM entries, built from every live `/v1/models` item whose `supported_endpoint_types` includes `anthropic`; the bridge also adds VSLLM's Responses-only `grok-4.5` and `grok-4.6`. This is data-driven, so running `configure claude` refreshes newly available Anthropic-compatible VSLLM models without maintaining a static allowlist.
 
 Claude Code only accepts discovered IDs beginning with `claude` or `anthropic`, so each VSLLM picker choice has a reversible internal `claude-vsllm-...` ID while its display name remains `VSLLM: <actual-model-id>`. That namespace is what lets official and VSLLM versions of Fable coexist. Kimi K3 and Grok 4.5 retain a `[1m]` suffix so Claude Code budgets their 1M context windows; the suffix is removed before forwarding upstream.
 
@@ -445,6 +448,35 @@ For bridged models, `/v1/messages/count_tokens` is estimated locally so context 
 The bridge architecture is informed by the MIT-licensed [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) Claude-to-Codex translator. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 Do not restore `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` if the independent gateway models must remain visible in `/model`.
+
+## Grok Build
+
+Configure Grok Build after installation or whenever the VSLLM proxy route changes:
+
+```shell
+codex-auth-advanced configure grok
+```
+
+The command backs up an existing `~/.grok/config.toml`, preserves unrelated settings, and merges managed VSLLM entries:
+
+```toml
+[model_providers.vsllm]
+base_url = "<default codex-auth-advanced proxy route>/v1"
+api_key = "local-codex-auth-advanced"
+api_backend = "responses"
+
+[model.vsllm-grok-45]
+model_provider = "vsllm"
+model = "grok-4.5"
+
+[model.vsllm-grok-46]
+model_provider = "vsllm"
+model = "grok-4.6"
+```
+
+Grok Build uses the OpenAI Responses API directly, so no Claude Messages bridge is required. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`.
+
+Use `/model vsllm-grok-46` or `grok -m vsllm-grok-46` after configuration. The marker `api_key` is not sent upstream; the local proxy replaces it with the stored VSLLM account key.
 
 ## VSLLM Integration
 
@@ -470,6 +502,7 @@ Claude model routing is separate from the Codex table:
 | `VSLLM: claude-fake-5` | VSLLM `claude-fake-5` | VSLLM `/v1/messages` |
 | `VSLLM: kimi-k3` | VSLLM `kimi-k3` | VSLLM `/v1/messages` |
 | `VSLLM: grok-4.5` | VSLLM `grok-4.5` | VSLLM `/v1/responses` through the Claude bridge |
+| `VSLLM: grok-4.6` | VSLLM `grok-4.6` | VSLLM `/v1/responses` through the Claude bridge |
 
 The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
 

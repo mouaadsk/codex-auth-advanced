@@ -10,6 +10,12 @@ const claudeGatewayResponseBridgeModels = new Map([
     maxInputTokens: 1000000,
     maxTokens: 65536,
     description: "through VSLLM's OpenAI Responses compatibility bridge"
+  }],
+  ["grok-4.6", {
+    contextSuffix: "[1m]",
+    maxInputTokens: 1000000,
+    maxTokens: 65536,
+    description: "through VSLLM's OpenAI Responses compatibility bridge"
   }]
 ]);
 

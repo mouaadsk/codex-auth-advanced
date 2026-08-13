@@ -130,6 +130,7 @@ const upstream = http.createServer(async (req, res) => {
         { id: "claude-fake-5", display_name: "Claude Fake 5", supported_endpoint_types: ["anthropic"] },
         { id: "kimi-k3", display_name: "Kimi K3", supported_endpoint_types: ["anthropic"] },
         { id: "grok-4.5", display_name: "Grok 4.5", supported_endpoint_types: ["openai", "openai-response"] },
+        { id: "grok-4.6", display_name: "Grok 4.6", supported_endpoint_types: ["openai"] },
         { id: "gpt-5.5", display_name: "GPT 5.5", supported_endpoint_types: ["openai", "anthropic"] }
       ]
     }));
@@ -344,7 +345,7 @@ const upstream = http.createServer(async (req, res) => {
       parsedBody = null;
     }
     if (req.url.endsWith("/responses")
-      && parsedBody?.model === "grok-4.5"
+      && (parsedBody?.model === "grok-4.5" || parsedBody?.model === "grok-4.6")
       && Array.isArray(parsedBody?.input)) {
       if (parsedBody.stream === true) {
         res.writeHead(200, { "content-type": "text/event-stream" });
@@ -1096,13 +1097,17 @@ try {
     { inputModel: vsllmClaudeGatewayModelId("gpt-5.5"), expectedModel: "gpt-5.5", wireApi: "anthropic" },
     { inputModel: vsllmClaudeGatewayModelId("kimi-k3", "[1m]"), expectedModel: "kimi-k3", wireApi: "anthropic" },
     { inputModel: vsllmClaudeGatewayModelId("grok-4.5", "[1m]"), expectedModel: "grok-4.5", wireApi: "responses" },
+    { inputModel: vsllmClaudeGatewayModelId("grok-4.6", "[1m]"), expectedModel: "grok-4.6", wireApi: "responses" },
     { inputModel: "claude-fake-5", expectedModel: "claude-fake-5", wireApi: "anthropic" },
     { inputModel: "grok-4.5[1m]", expectedModel: "grok-4.5", wireApi: "responses" },
+    { inputModel: "grok-4.6[1m]", expectedModel: "grok-4.6", wireApi: "responses" },
     { inputModel: "kimi-k3[1m]", expectedModel: "kimi-k3", wireApi: "anthropic" },
     { inputModel: "claude-fable-5-dd-3k-imik", expectedModel: "kimi-k3", wireApi: "anthropic" },
     { inputModel: "claude-fable-5-dd-3k-imik[1m]", expectedModel: "kimi-k3", wireApi: "anthropic" },
     { inputModel: "claude-fable-5-dd-5.4-korg", expectedModel: "grok-4.5", wireApi: "responses" },
-    { inputModel: "claude-fable-5-dd-5.4-korg[1m]", expectedModel: "grok-4.5", wireApi: "responses" }
+    { inputModel: "claude-fable-5-dd-5.4-korg[1m]", expectedModel: "grok-4.5", wireApi: "responses" },
+    { inputModel: "claude-fable-5-dd-6.4-korg", expectedModel: "grok-4.6", wireApi: "responses" },
+    { inputModel: "claude-fable-5-dd-6.4-korg[1m]", expectedModel: "grok-4.6", wireApi: "responses" }
   ];
   for (const { inputModel, expectedModel, wireApi } of claudeModelRoutes) {
     const beforeClaudeRequest = upstreamRequests.length;
@@ -1419,6 +1424,7 @@ try {
   const fakeModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("claude-fake-5"));
   const kimiModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("kimi-k3", "[1m]"));
   const grokModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("grok-4.5", "[1m]"));
+  const grok46Model = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("grok-4.6", "[1m]"));
   const gptModel = models.data?.find((model) => model.id === vsllmClaudeGatewayModelId("gpt-5.5"));
   if (models.has_more !== false
     || officialFableModel?.display_name !== "Claude Fable 5"
@@ -1429,8 +1435,10 @@ try {
     || kimiModel?.max_input_tokens !== 1000000
     || grokModel?.display_name !== "VSLLM: grok-4.5"
     || grokModel?.max_input_tokens !== 1000000
+    || grok46Model?.display_name !== "VSLLM: grok-4.6"
+    || grok46Model?.max_input_tokens !== 1000000
     || gptModel?.display_name !== "VSLLM: gpt-5.5"
-    || models.data?.length !== 7) {
+    || models.data?.length !== 8) {
     throw new Error(`Claude gateway model discovery did not merge official and VSLLM models: ${JSON.stringify(models)}`);
   }
   const discoveryRequests = upstreamRequests.slice(beforeClaudeModelsRequest);

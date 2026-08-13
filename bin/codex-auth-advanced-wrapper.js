@@ -241,7 +241,7 @@ function maybePrintPreviewVersion(argv) {
 }
 
 function patchTopLevelHelp(output) {
-  const command = "  configure [all|codex|claude]                                                  Configure Codex and/or Claude Code to use the local proxy";
+  const command = "  configure [all|codex|claude|grok]                                              Configure Codex, Claude Code, and/or Grok Build to use the local proxy";
   if (output.includes(command)) return output;
   const notes = "\nNotes:\n";
   if (output.includes(notes)) return output.replace(notes, `${command}\n${notes}`);

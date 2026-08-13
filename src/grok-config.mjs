@@ -1,0 +1,75 @@
+import path from "node:path";
+import { removeTomlTopLevelKeyAndSection } from "./codex-config.mjs";
+import { userHome } from "./storage.mjs";
+
+export const grokVsllmProviderSection = "model_providers.vsllm";
+export const grokProxyApiKeyMarker = "local-codex-auth-advanced";
+
+export const grokVsllmManagedModels = Object.freeze([
+  {
+    pickerId: "vsllm-grok-45",
+    upstreamModel: "grok-4.5",
+    name: "VSLLM Grok 4.5"
+  },
+  {
+    pickerId: "vsllm-grok-46",
+    upstreamModel: "grok-4.6",
+    name: "VSLLM Grok 4.6"
+  }
+]);
+
+const legacyManagedGrokSections = new Set([
+  grokVsllmProviderSection,
+  ...grokVsllmManagedModels.map(({ pickerId }) => `model.${pickerId}`),
+  "model.vsllm-grok-4.5",
+  "model.vsllm-grok-4.6"
+]);
+
+export function defaultGrokHome() {
+  const configured = String(process.env.GROK_HOME || "").trim();
+  return configured || path.join(userHome(), ".grok");
+}
+
+export function grokConfigPath(grokHome = defaultGrokHome()) {
+  return path.join(grokHome, "config.toml");
+}
+
+export function grokProxyBaseUrl(providerProxyBaseUrl) {
+  const base = String(providerProxyBaseUrl || "").trim().replace(/\/+$/, "");
+  return `${base}/v1`;
+}
+
+export function managedGrokConfigSections(baseUrl) {
+  const proxyBaseUrl = grokProxyBaseUrl(baseUrl);
+  const lines = [
+    `[${grokVsllmProviderSection}]`,
+    `base_url = ${JSON.stringify(proxyBaseUrl)}`,
+    `api_key = ${JSON.stringify(grokProxyApiKeyMarker)}`,
+    'api_backend = "responses"',
+    ""
+  ];
+  for (const model of grokVsllmManagedModels) {
+    lines.push(
+      `[model.${model.pickerId}]`,
+      'model_provider = "vsllm"',
+      `model = ${JSON.stringify(model.upstreamModel)}`,
+      `name = ${JSON.stringify(model.name)}`,
+      `description = ${JSON.stringify(`${model.upstreamModel} through codex-auth-advanced proxy`)}`,
+      "context_window = 1000000",
+      "max_completion_tokens = 65536",
+      ""
+    );
+  }
+  return lines.join("\n").trimEnd();
+}
+
+export function upsertGrokVsllmProxyConfig(toml, baseUrl) {
+  const withoutManaged = removeTomlTopLevelKeyAndSection(
+    String(toml || ""),
+    new Set(),
+    legacyManagedGrokSections
+  ).trimEnd();
+  const managed = managedGrokConfigSections(baseUrl);
+  if (!withoutManaged) return `${managed}\n`;
+  return `${withoutManaged}\n\n${managed}\n`;
+}

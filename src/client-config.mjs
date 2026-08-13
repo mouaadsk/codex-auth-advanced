@@ -2,6 +2,13 @@ import path from "node:path";
 import { upsertModelCatalogConfig } from "./codex-config.mjs";
 import { ensureCodexAuthAdvancedModelCatalog } from "./codex-model-catalog.mjs";
 import {
+  defaultGrokHome,
+  grokConfigPath,
+  grokProxyBaseUrl,
+  grokVsllmManagedModels,
+  upsertGrokVsllmProxyConfig
+} from "./grok-config.mjs";
+import {
   encodedClaudeGatewayModelId,
   encodedVsllmClaudeGatewayModelId
 } from "./provider-policy.mjs";
@@ -143,6 +150,30 @@ export function createClientConfigService({ providerProxy, accountService }) {
       || normalized.startsWith("anthropic-");
   }
 
+  function configureGrokBuildClient(codexHome, options = {}) {
+    const configPath = grokConfigPath(options.grokHome);
+    const existingText = readTextFile(configPath);
+    const baseUrl = providerProxyBaseUrl(codexHome);
+    const nextText = upsertGrokVsllmProxyConfig(existingText, baseUrl);
+    const changed = nextText !== existingText;
+    if (changed) {
+      ensureDir(path.dirname(configPath));
+      if (options.backup === true) backupIfExists(configPath);
+      writeTextFilePrivate(configPath, nextText, 0o600);
+    }
+    return {
+      configured: true,
+      changed,
+      configPath,
+      baseUrl: grokProxyBaseUrl(baseUrl),
+      models: grokVsllmManagedModels.map(({ pickerId, upstreamModel, name }) => ({
+        pickerId,
+        upstreamModel,
+        name
+      }))
+    };
+  }
+
   async function configureClaudeCodeClient(codexHome) {
     const settingsPath = claudeSettingsPath();
     const existingText = readTextFile(settingsPath);
@@ -235,18 +266,19 @@ export function createClientConfigService({ providerProxy, accountService }) {
     const args = direct ? argv.slice(1) : argv.slice(2);
     if (args[0] === "--help" || args[0] === "-h") {
       process.stdout.write([
-        "Usage: codex-auth-advanced configure [all|codex|claude]",
+        "Usage: codex-auth-advanced configure [all|codex|claude|grok]",
         "",
-        "  all      Configure Codex and Claude Code (default).",
+        "  all      Configure Codex, Claude Code, and Grok Build (default).",
         "  codex    Configure Codex to use the active account through the local proxy.",
         "  claude   Configure Claude Code to use the Anthropic gateway and Fable route.",
+        "  grok     Configure Grok Build with VSLLM Grok models through the local proxy.",
         ""
       ].join("\n"));
       return true;
     }
     const target = args[0] || "all";
-    if (args.length > 1 || !["all", "codex", "claude"].includes(target)) {
-      console.error("Usage: codex-auth-advanced configure [all|codex|claude]");
+    if (args.length > 1 || !["all", "codex", "claude", "grok"].includes(target)) {
+      console.error("Usage: codex-auth-advanced configure [all|codex|claude|grok]");
       process.exit(1);
     }
 
@@ -279,6 +311,12 @@ export function createClientConfigService({ providerProxy, accountService }) {
         process.stderr.write(`Claude Code: could not refresh VSLLM gateway models (${result.gatewayModelCache.error}).\n`);
       }
     }
+
+    if (target === "all" || target === "grok") {
+      const result = configureGrokBuildClient(codexHome, { backup: true, grokHome: defaultGrokHome() });
+      process.stdout.write(`Grok Build: ${result.changed ? "configured" : "already configured"} at ${result.baseUrl}.\n`);
+      process.stdout.write(`Grok Build: ${result.models.map(({ pickerId }) => pickerId).join(", ")}.\n`);
+    }
     return true;
   }
 
@@ -296,6 +334,7 @@ export function createClientConfigService({ providerProxy, accountService }) {
     ensureActiveAccountConfig,
     ensureAllActiveAccountConfigs,
     configureClaudeCodeClient,
+    configureGrokBuildClient,
     maybeHandleClientConfigure,
     ensureProviderProxyForActiveApiAccounts
   };

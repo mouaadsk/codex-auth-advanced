@@ -21,7 +21,7 @@ function usage() {
   process.stdout.write([
     "Usage: ./scripts/install.zsh [--dry-run] [--skip-link] [--skip-service-load]",
     "",
-    "Installs the local CLI link, configures installed Codex and Claude Code clients,",
+    "Installs the local CLI link, configures installed Codex, Claude Code, and Grok Build clients,",
     "and registers a per-user macOS LaunchAgent for the provider proxy.",
     ""
   ].join("\n"));
@@ -170,15 +170,20 @@ function writeLaunchAgent(home, dryRun) {
 
 function configureClient(name, home, options) {
   const executable = findExecutable(name);
+  const labels = {
+    codex: "Codex",
+    claude: "Claude Code",
+    grok: "Grok Build"
+  };
   if (!executable) {
-    process.stdout.write(`${name === "claude" ? "Claude Code" : "Codex"}: not installed; skipped.\n`);
+    process.stdout.write(`${labels[name] || name}: not installed; skipped.\n`);
     return;
   }
   if (options.dryRun) {
-    process.stdout.write(`Would configure ${name === "claude" ? "Claude Code" : "Codex"} using ${executable}.\n`);
+    process.stdout.write(`Would configure ${labels[name] || name} using ${executable}.\n`);
     return;
   }
-  runCommand(process.execPath, [wrapper, "configure", name === "claude" ? "claude" : "codex"], {
+  runCommand(process.execPath, [wrapper, "configure", name], {
     env: { ...process.env, HOME: home }
   });
 }
@@ -223,6 +228,7 @@ if (!options.skipLink) {
 
 configureClient("codex", home, options);
 configureClient("claude", home, options);
+configureClient("grok", home, options);
 const launchAgent = writeLaunchAgent(home, options.dryRun);
 loadLaunchAgent(launchAgent, options);
 process.stdout.write(`macOS installation ${options.dryRun ? "plan complete" : "complete"}.\n`);

@@ -53,6 +53,10 @@ import {
 } from "./src/proxy-transforms.mjs";
 import { createProviderProxy } from "./src/provider-proxy.mjs";
 import { createAccountService } from "./src/account-service.mjs";
+import {
+  grokProxyBaseUrl,
+  upsertGrokVsllmProxyConfig
+} from "./src/grok-config.mjs";
 import { createClientConfigService } from "./src/client-config.mjs";
 import { createCliService } from "./src/cli-service.mjs";
 
@@ -241,11 +245,16 @@ try {
     "grok-4.5"
   );
   assert.equal(
+    remappedProxyRequestModel("grok-4.6[1m]", { account: vsllmAccount }),
+    "grok-4.6"
+  );
+  assert.equal(
     remappedProxyRequestModel("kimi-k3[1m]", { account: vsllmAccount }),
     "kimi-k3"
   );
   assert.equal(encodedClaudeGatewayModelId("kimi-k3"), "claude-fable-5-dd-3k-imik");
   assert.equal(encodedClaudeGatewayModelId("grok-4.5"), "claude-fable-5-dd-5.4-korg");
+  assert.equal(encodedClaudeGatewayModelId("grok-4.6"), "claude-fable-5-dd-6.4-korg");
   const namespacedVsllmFable = encodedVsllmClaudeGatewayModelId("claude-fable-5");
   assert.match(namespacedVsllmFable, /^claude-vsllm-/);
   assert.equal(resolvedClaudeGatewayModelId(namespacedVsllmFable), "claude-fable-5");
@@ -255,6 +264,32 @@ try {
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik"), "kimi-k3");
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik[1m]"), "kimi-k3[1m]");
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-5.4-korg[1m]"), "grok-4.5[1m]");
+  assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-6.4-korg[1m]"), "grok-4.6[1m]");
+
+  const grokProxyRoot = "http://127.0.0.1:47778/_codex-auth-advanced/test-group";
+  assert.equal(
+    grokProxyBaseUrl(grokProxyRoot),
+    "http://127.0.0.1:47778/_codex-auth-advanced/test-group/v1"
+  );
+  const grokConfigured = upsertGrokVsllmProxyConfig([
+    "[cli]",
+    'installer = "internal"',
+    "",
+    "[ui]",
+    "yolo = false",
+    ""
+  ].join("\n"), grokProxyRoot);
+  assert.match(grokConfigured, /\[model_providers\.vsllm\]/);
+  assert.match(grokConfigured, /base_url = "http:\/\/127\.0\.0\.1:47778\/_codex-auth-advanced\/test-group\/v1"/);
+  assert.match(grokConfigured, /\[model\.vsllm-grok-45\]/);
+  assert.match(grokConfigured, /model = "grok-4.5"/);
+  assert.match(grokConfigured, /\[model\.vsllm-grok-46\]/);
+  assert.match(grokConfigured, /model = "grok-4.6"/);
+  assert.match(grokConfigured, /\[cli\]/);
+  assert.doesNotMatch(grokConfigured, /\[model\.vsllm-grok-4\.5\]/);
+  const grokReconfigured = upsertGrokVsllmProxyConfig(grokConfigured, `${grokProxyRoot}-updated`);
+  assert.match(grokReconfigured, /test-group-updated\/v1"/);
+  assert.equal(grokReconfigured.match(/\[model\.vsllm-grok-45\]/g)?.length, 1);
 
   const rolling = rollingApiSpendFromTotal({
     api_spend_window: {
@@ -482,6 +517,15 @@ try {
   assert.equal(configured.configured, true);
   assert.match(readTextFile(path.join(serviceHome, "config.toml")), /^model_provider = "openai"$/m);
   assert.match(readTextFile(path.join(serviceHome, "config.toml")), /openai_base_url = "http:\/\/127\.0\.0\.1:47778\//);
+
+  const grokHome = path.join(tempRoot, "grok-home");
+  fs.mkdirSync(grokHome, { recursive: true, mode: 0o700 });
+  const grokConfiguredClient = clientConfig.configureGrokBuildClient(serviceHome, { grokHome });
+  assert.equal(grokConfiguredClient.configured, true);
+  assert.equal(grokConfiguredClient.models.length, 2);
+  const grokConfig = readTextFile(path.join(grokHome, "config.toml"));
+  assert.match(grokConfig, /model = "grok-4.5"/);
+  assert.match(grokConfig, /model = "grok-4.6"/);
 
   writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
     active_account_key: exhaustedAccount.account_key,

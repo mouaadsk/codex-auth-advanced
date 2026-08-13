@@ -13,10 +13,11 @@ const home = path.join(tempRoot, "home");
 const codexHome = path.join(home, ".codex");
 const accountsDir = path.join(codexHome, "accounts");
 const claudeDir = path.join(home, ".claude");
+const grokDir = path.join(home, ".grok");
 const fakeBin = path.join(tempRoot, "bin");
 const proxyPort = 47891;
 
-for (const directory of [accountsDir, claudeDir, fakeBin]) {
+for (const directory of [accountsDir, claudeDir, grokDir, fakeBin]) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 }
 const fakeReasoningLevels = ["low", "medium", "high", "xhigh", "max", "ultra"]
@@ -39,6 +40,18 @@ fs.chmodSync(fakeCodexExecutable, 0o755);
 const fakeClaudeExecutable = path.join(fakeBin, "claude");
 fs.writeFileSync(fakeClaudeExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 fs.chmodSync(fakeClaudeExecutable, 0o755);
+const fakeGrokExecutable = path.join(fakeBin, "grok");
+fs.writeFileSync(fakeGrokExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+fs.chmodSync(fakeGrokExecutable, 0o755);
+
+fs.writeFileSync(path.join(grokDir, "config.toml"), [
+  "[cli]",
+  'installer = "internal"',
+  "",
+  "[ui]",
+  "yolo = false",
+  ""
+].join("\n"), { mode: 0o600 });
 
 const accountKey = "apikey-vsllm-install-test";
 fs.writeFileSync(path.join(codexHome, "config.toml"), [
@@ -194,23 +207,26 @@ await new Promise((resolve) => gatewayProxy.listen(proxyPort, "127.0.0.1", resol
 gatewayProxy.unref();
 const configureHelp = await runWrapper(["configure", "--help"]);
 for (const expected of [
-  "Usage: codex-auth-advanced configure [all|codex|claude]",
-  "all      Configure Codex and Claude Code (default).",
+  "Usage: codex-auth-advanced configure [all|codex|claude|grok]",
+  "all      Configure Codex, Claude Code, and Grok Build (default).",
   "codex    Configure Codex",
-  "claude   Configure Claude Code"
+  "claude   Configure Claude Code",
+  "grok     Configure Grok Build"
 ]) {
   if (!configureHelp.stdout.includes(expected)) {
     throw new Error(`configure help is missing ${expected}:\n${configureHelp.stdout}`);
   }
 }
 const topLevelHelp = await runWrapper(["--help"]);
-if (!topLevelHelp.stdout.includes("configure [all|codex|claude]")) {
+if (!topLevelHelp.stdout.includes("configure [all|codex|claude|grok]")) {
   throw new Error(`top-level help does not advertise configure:\n${topLevelHelp.stdout}`);
 }
 
 const first = await runInstaller();
-if (!first.stdout.includes("Codex: configured") || !first.stdout.includes("Claude Code: configured")) {
-  throw new Error(`installer did not configure both clients:\n${first.stdout}\n${first.stderr}`);
+if (!first.stdout.includes("Codex: configured")
+  || !first.stdout.includes("Claude Code: configured")
+  || !first.stdout.includes("Grok Build: configured")) {
+  throw new Error(`installer did not configure all clients:\n${first.stdout}\n${first.stderr}`);
 }
 if (!first.stdout.includes("Codex models: configured")) {
   throw new Error(`installer did not configure the Codex model picker:\n${first.stdout}\n${first.stderr}`);
@@ -299,6 +315,22 @@ if (gatewayRequests.length === 0
   throw new Error(`Claude gateway model cache refresh used invalid proxy credentials: ${JSON.stringify(gatewayRequests)}`);
 }
 
+const grokConfigPath = path.join(grokDir, "config.toml");
+const grokConfig = fs.readFileSync(grokConfigPath, "utf8");
+for (const expected of [
+  "[cli]",
+  'installer = "internal"',
+  "[model_providers.vsllm]",
+  `base_url = "${expectedBaseUrl}/v1"`,
+  'api_backend = "responses"',
+  "[model.vsllm-grok-45]",
+  'model = "grok-4.5"',
+  "[model.vsllm-grok-46]",
+  'model = "grok-4.6"'
+]) {
+  if (!grokConfig.includes(expected)) throw new Error(`Grok config is missing ${expected}:\n${grokConfig}`);
+}
+
 const plistPath = path.join(home, "Library", "LaunchAgents", "com.mouaadsk.codex-auth-advanced.proxy.plist");
 const plist = fs.readFileSync(plistPath, "utf8");
 for (const expected of [serviceRunner, "<key>RunAtLoad</key>", "<key>KeepAlive</key>", `<string>${home}</string>`, String(proxyPort)]) {
@@ -307,40 +339,59 @@ for (const expected of [serviceRunner, "<key>RunAtLoad</key>", "<key>KeepAlive</
 
 const codexBackupsAfterFirst = backupCount(codexConfigPath);
 const claudeBackupsAfterFirst = backupCount(claudeSettingsPath);
-if (codexBackupsAfterFirst !== 1 || claudeBackupsAfterFirst !== 1) {
-  throw new Error(`expected one client backup each, got Codex=${codexBackupsAfterFirst}, Claude=${claudeBackupsAfterFirst}`);
+const grokBackupsAfterFirst = backupCount(grokConfigPath);
+if (codexBackupsAfterFirst !== 1 || claudeBackupsAfterFirst !== 1 || grokBackupsAfterFirst !== 1) {
+  throw new Error(`expected one client backup each, got Codex=${codexBackupsAfterFirst}, Claude=${claudeBackupsAfterFirst}, Grok=${grokBackupsAfterFirst}`);
 }
 
 const second = await runInstaller();
-if (!second.stdout.includes("Codex: already configured") || !second.stdout.includes("Claude Code: already configured")) {
+if (!second.stdout.includes("Codex: already configured")
+  || !second.stdout.includes("Claude Code: already configured")
+  || !second.stdout.includes("Grok Build: already configured")) {
   throw new Error(`installer was not idempotent:\n${second.stdout}\n${second.stderr}`);
 }
 if (!second.stdout.includes("Codex models: already configured")) {
   throw new Error(`installer rewrote an unchanged Codex model catalog:\n${second.stdout}\n${second.stderr}`);
 }
-if (backupCount(codexConfigPath) !== codexBackupsAfterFirst || backupCount(claudeSettingsPath) !== claudeBackupsAfterFirst) {
+if (backupCount(codexConfigPath) !== codexBackupsAfterFirst
+  || backupCount(claudeSettingsPath) !== claudeBackupsAfterFirst
+  || backupCount(grokConfigPath) !== grokBackupsAfterFirst) {
   throw new Error("idempotent install created unnecessary additional backups");
 }
 
 const configureAll = await runWrapper(["configure"]);
 if (!configureAll.stdout.includes("Codex: already configured")
-  || !configureAll.stdout.includes("Claude Code: already configured")) {
+  || !configureAll.stdout.includes("Claude Code: already configured")
+  || !configureAll.stdout.includes("Grok Build: already configured")) {
   throw new Error(`configure did not default to all clients:\n${configureAll.stdout}\n${configureAll.stderr}`);
 }
 const configureExplicitAll = await runWrapper(["configure", "all"]);
 if (!configureExplicitAll.stdout.includes("Codex: already configured")
-  || !configureExplicitAll.stdout.includes("Claude Code: already configured")) {
-  throw new Error(`configure all did not configure both clients:\n${configureExplicitAll.stdout}\n${configureExplicitAll.stderr}`);
+  || !configureExplicitAll.stdout.includes("Claude Code: already configured")
+  || !configureExplicitAll.stdout.includes("Grok Build: already configured")) {
+  throw new Error(`configure all did not configure every client:\n${configureExplicitAll.stdout}\n${configureExplicitAll.stderr}`);
 }
 const configureCodex = await runWrapper(["configure", "codex"]);
-if (!configureCodex.stdout.includes("Codex: already configured") || configureCodex.stdout.includes("Claude Code:")) {
+if (!configureCodex.stdout.includes("Codex: already configured")
+  || configureCodex.stdout.includes("Claude Code:")
+  || configureCodex.stdout.includes("Grok Build:")) {
   throw new Error(`configure codex did not stay scoped to Codex:\n${configureCodex.stdout}`);
 }
 const configureClaude = await runWrapper(["configure", "claude"]);
-if (!configureClaude.stdout.includes("Claude Code: already configured") || configureClaude.stdout.includes("Codex:")) {
+if (!configureClaude.stdout.includes("Claude Code: already configured")
+  || configureClaude.stdout.includes("Codex:")
+  || configureClaude.stdout.includes("Grok Build:")) {
   throw new Error(`configure claude did not stay scoped to Claude Code:\n${configureClaude.stdout}`);
 }
-if (backupCount(codexConfigPath) !== codexBackupsAfterFirst || backupCount(claudeSettingsPath) !== claudeBackupsAfterFirst) {
+const configureGrok = await runWrapper(["configure", "grok"]);
+if (!configureGrok.stdout.includes("Grok Build: already configured")
+  || configureGrok.stdout.includes("Codex:")
+  || configureGrok.stdout.includes("Claude Code:")) {
+  throw new Error(`configure grok did not stay scoped to Grok Build:\n${configureGrok.stdout}`);
+}
+if (backupCount(codexConfigPath) !== codexBackupsAfterFirst
+  || backupCount(claudeSettingsPath) !== claudeBackupsAfterFirst
+  || backupCount(grokConfigPath) !== grokBackupsAfterFirst) {
   throw new Error("direct configure commands created unnecessary backups");
 }
 
