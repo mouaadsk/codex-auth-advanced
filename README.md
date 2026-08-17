@@ -189,6 +189,16 @@ printf '%s' "$VSLLM_API_KEY" | \
     --stdin
 ```
 
+For LLM API (`llmapi.pro`), use the built-in `llmapi` template:
+
+```shell
+printf '%s' "$LLMAPI_KEY" | \
+  codex-auth-advanced add-api-key \
+    --template llmapi \
+    --alias llmapi \
+    --stdin
+```
+
 ### Start The Proxy
 
 ```shell

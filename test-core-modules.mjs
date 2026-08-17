@@ -5,6 +5,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import {
   apiKeySessionConfigKeys,
+  apiKeyTemplate,
   defaultApiKeyConfig,
   inferApiKeyTemplateName,
   mergeApiRuntimeConfig,
@@ -40,7 +41,9 @@ import {
   apiProviderTransientRetryReason,
   encodedClaudeGatewayModelId,
   encodedVsllmClaudeGatewayModelId,
+  isVsllmApiAccount,
   isVsllmClaudeGatewayModelId,
+  parseProviderUsageDetails,
   parseVsllmSubscriptionSelf,
   remappedProxyRequestModel,
   resolvedClaudeGatewayModelId,
@@ -150,6 +153,34 @@ try {
   assert.match(generated, /^model_context_window = 320000$/m);
   assert.equal(parseTomlString('"gpt-5.6-sol"'), "gpt-5.6-sol");
   assert.equal(inferApiKeyTemplateName({ alias: "my tcdmx account" }), "tcdmx");
+  assert.equal(inferApiKeyTemplateName({ alias: "llmapi-main" }), "llmapi");
+  assert.equal(inferApiKeyTemplateName({}, "https://llmapi.pro/v1"), "llmapi");
+  assert.equal(apiKeyTemplate("llmapi")?.baseUrl, "https://llmapi.pro/v1");
+  assert.equal(isVsllmApiAccount({ alias: "llmapi" }, "https://llmapi.pro/v1/models"), true);
+  assert.equal(isVsllmApiAccount({ alias: "custom-relay" }, "https://llmapi.pro/v1/models"), true);
+
+  const llmapiUsage = parseProviderUsageDetails({
+    plan: "max",
+    five_hour: {
+      used: 3,
+      limit: 2000,
+      remaining: 1997,
+      reset_at: "2026-08-17T23:25:29.755Z"
+    },
+    week: {
+      used: 3,
+      limit: 10000,
+      remaining: 9997,
+      reset_at: "2026-08-24T18:25:29.755Z"
+    }
+  });
+  assert.equal(llmapiUsage.spend, 3);
+  assert.equal(llmapiUsage.daily, 3);
+  assert.equal(llmapiUsage.limitUsd, 2000);
+  assert.equal(llmapiUsage.remaining, 1997);
+  assert.equal(llmapiUsage.spendWindowMinutes, 300);
+  assert.equal(llmapiUsage.exhausted, false);
+  assert.ok(Number.isFinite(llmapiUsage.resetsAt));
   assert.equal(
     providerDashboardOriginMatchesModelsEndpoint("https://vsllm.com/v1/models", "https://vsllm.com"),
     true
@@ -219,6 +250,15 @@ try {
   assert.equal(
     apiProviderExhaustionReason(402, { error: { message: "no active subscription" } }, vsllmAccount),
     "no_active_subscription"
+  );
+  const llmapiAccount = { alias: "llmapi", api_template: "llmapi" };
+  assert.equal(
+    apiProviderExhaustionReason(403, { error: { message: "Quota exhausted. Please wait for reset or upgrade." } }, llmapiAccount),
+    "quota_exhausted"
+  );
+  assert.equal(
+    apiProviderExhaustionReason(429, { error: { message: "window/quota limit reached" } }, llmapiAccount),
+    "rate_limit"
   );
   assert.equal(
     remappedProxyRequestModel("gpt-5.6-terra", { account: vsllmAccount }),

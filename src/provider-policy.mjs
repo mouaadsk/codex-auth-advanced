@@ -86,7 +86,8 @@ function accountOrEndpointMatches(value, pattern) {
 
 export function isVsllmApiAccount(account, endpoint = "") {
   const isVsllm = String(account?.email || "").startsWith("vsllm") || String(account?.alias || "").startsWith("vsllm");
-  return isVsllm || accountOrEndpointMatches(endpoint, "vsllm.com");
+  const isLlmapi = String(account?.email || "").startsWith("llmapi") || String(account?.alias || "").startsWith("llmapi") || account?.api_template === "llmapi";
+  return isVsllm || isLlmapi || accountOrEndpointMatches(endpoint, "vsllm.com") || accountOrEndpointMatches(endpoint, "llmapi.pro");
 }
 
 export function apiSpendLimitUsd(account, options = {}) {
@@ -218,7 +219,17 @@ function responseBodyMatches(body, pattern, options = {}) {
 }
 
 function isInsufficientBalanceBody(body) {
-  return responseBodyMatches(body, /insufficient[_ -]?(balance|quota|credits?)|额度不足/i);
+  return responseBodyMatches(
+    body,
+    /insufficient[_ -]?(balance|quota|credits?)|额度不足/i
+  );
+}
+
+function isQuotaExhaustedBody(body) {
+  return responseBodyMatches(
+    body,
+    /quota[_ -]?(exhausted|limit|reached)|window\/quota/i
+  );
 }
 
 function isNoActiveSubscriptionBody(body) {
@@ -285,11 +296,14 @@ export function apiProviderTransientRetryReason(status, body, account = null) {
 
 export function apiProviderExhaustionReason(status, body, account = null) {
   if (isInvalidApiKeyBody(body)) return "invalid_api_key";
+  if (status === 403 && isQuotaExhaustedBody(body)) {
+    return "quota_exhausted";
+  }
+  if (status === 402 && (isNoActiveSubscriptionBody(body) || isInsufficientBalanceBody(body))) {
+    return "no_active_subscription";
+  }
   if (isInsufficientBalanceBody(body)) {
     return shouldTrustProviderBalanceExhaustion(account) ? "provider_limit" : null;
-  }
-  if (status === 402 && isNoActiveSubscriptionBody(body)) {
-    return "no_active_subscription";
   }
   if (status === 429) return "rate_limit";
   return null;
@@ -425,14 +439,16 @@ export function parseProviderUsageDetails(body) {
   const usage = body?.usage;
   const todayUsage = usage?.today;
   const totalUsage = usage?.total;
-  const daily = firstFinite(subscription?.daily_usage_usd, todayUsage?.actual_cost, todayUsage?.cost);
-  const weekly = firstFinite(subscription?.weekly_usage_usd, body?.weekly_usage_usd);
+  const fiveHour = body?.five_hour;
+  const week = body?.week;
+  const daily = firstFinite(subscription?.daily_usage_usd, todayUsage?.actual_cost, todayUsage?.cost, fiveHour?.used);
+  const weekly = firstFinite(subscription?.weekly_usage_usd, body?.weekly_usage_usd, week?.used);
   const monthly = firstFinite(subscription?.monthly_usage_usd, body?.monthly_usage_usd);
-  const total = firstFinite(totalUsage?.actual_cost, totalUsage?.cost, body?.total_cost, body?.cost, body?.usage_usd);
-  const dailyLimit = firstFinite(subscription?.daily_limit_usd, body?.daily_limit_usd);
-  const weeklyLimit = firstFinite(subscription?.weekly_limit_usd, body?.weekly_limit_usd);
+  const total = firstFinite(totalUsage?.actual_cost, totalUsage?.cost, body?.total_cost, body?.cost, body?.usage_usd, fiveHour?.used, week?.used);
+  const dailyLimit = firstFinite(subscription?.daily_limit_usd, body?.daily_limit_usd, fiveHour?.limit);
+  const weeklyLimit = firstFinite(subscription?.weekly_limit_usd, body?.weekly_limit_usd, week?.limit);
   const monthlyLimit = firstFinite(subscription?.monthly_limit_usd, body?.monthly_limit_usd);
-  const remaining = firstFinite(body?.remaining);
+  const remaining = firstFinite(body?.remaining, fiveHour?.remaining, week?.remaining);
   const balance = firstFinite(body?.balance);
   const activeLimit = firstFinite(
     Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null,
@@ -448,7 +464,21 @@ export function parseProviderUsageDetails(body) {
         : firstFinite(total, monthly, weekly, daily);
   const primaryUsage = firstFinite(activeUsage, total, monthly, weekly, daily);
   const primaryLimit = activeLimit;
-  const exhausted = remaining === 0 && (Number.isFinite(primaryLimit) || Number.isFinite(balance));
+  const exhausted = (Number.isFinite(remaining) && remaining <= 0)
+    || (Number.isFinite(primaryLimit) && Number.isFinite(primaryUsage) && primaryUsage >= primaryLimit)
+    || (remaining === 0 && (Number.isFinite(primaryLimit) || Number.isFinite(balance)));
+
+  let resetsAt = null;
+  if (typeof fiveHour?.reset_at === "string") {
+    const ts = Math.floor(new Date(fiveHour.reset_at).getTime() / 1000);
+    if (Number.isFinite(ts) && ts > 0) resetsAt = ts;
+  } else if (typeof week?.reset_at === "string") {
+    const ts = Math.floor(new Date(week.reset_at).getTime() / 1000);
+    if (Number.isFinite(ts) && ts > 0) resetsAt = ts;
+  }
+
+  const spendWindowMinutes = fiveHour ? 300 : (week ? 10080 : null);
+
   return {
     daily: Number.isFinite(daily) ? daily : total,
     weekly: Number.isFinite(weekly) ? weekly : null,
@@ -457,6 +487,8 @@ export function parseProviderUsageDetails(body) {
     totalSpend: Number.isFinite(total) ? total : null,
     limitUsd: primaryLimit,
     remaining: Number.isFinite(remaining) ? remaining : null,
+    resetsAt,
+    spendWindowMinutes,
     exhausted
   };
 }
@@ -475,6 +507,8 @@ export function costsFromProviderUsage(providerUsage) {
     totalSpend: providerUsage?.totalSpend ?? providerUsage?.monthly ?? providerUsage?.spend ?? null,
     limitUsd: providerUsage?.limitUsd ?? null,
     remaining: providerUsage?.remaining ?? null,
+    resetsAt: providerUsage?.resetsAt ?? null,
+    spendWindowMinutes: providerUsage?.spendWindowMinutes ?? null,
     exhausted: providerUsage?.exhausted === true
   };
 }

@@ -53,8 +53,10 @@ function modelId(model) {
 }
 
 function modelSupportsAnthropicMessages(model) {
-  return Array.isArray(model?.supported_endpoint_types)
-    && model.supported_endpoint_types.some((type) => String(type || "").toLowerCase() === "anthropic");
+  if (Array.isArray(model?.supported_endpoint_types)) {
+    return model.supported_endpoint_types.some((type) => String(type || "").toLowerCase() === "anthropic");
+  }
+  return true;
 }
 
 function officialClaudeModels(models) {

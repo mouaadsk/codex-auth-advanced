@@ -218,6 +218,16 @@ export function apiKeyTemplate(name) {
       repairInvalidEncryptedContent: true
     };
   }
+  if (normalized === "llmapi" || normalized === "llmapi-pro" || normalized === "llmapi.pro") {
+    return {
+      name: "llmapi",
+      baseUrl: "https://llmapi.pro/v1",
+      defaultSpendLimitUsd: null,
+      defaultModelContextWindow: 320000,
+      defaultAutoCompactTokenLimit: 250000,
+      repairInvalidEncryptedContent: false
+    };
+  }
   return null;
 }
 
@@ -236,6 +246,7 @@ export function inferApiKeyTemplateName(account, upstreamBaseUrl = "") {
     .join(" ")
     .toLowerCase();
 
+  if (hostname === "llmapi.pro" || hostname.endsWith(".llmapi.pro") || label.includes("llmapi")) return "llmapi";
   if (hostname === "tcdmx.com" || label.includes("tcdmx")) return "tcdmx";
   if (hostname === "codex-everywhere.com" || label.includes("codex-everywhere")) return "codex-everywhere";
   return "openai";

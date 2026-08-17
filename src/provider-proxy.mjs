@@ -997,7 +997,7 @@ export function createProviderProxy(options) {
           ? await (async () => {
             const switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, responseBody, {
               excludeAccountKeys: attemptedAccountKeys,
-              force: exhaustionReason === "no_active_subscription"
+              force: exhaustionReason === "no_active_subscription" || exhaustionReason === "quota_exhausted" || exhaustionReason === "provider_limit"
             });
             return switched
               ? targetUrlForProxyRequest(req, { ...route, accountSelector: null, pathPrefix: `${providerProxyPrefix}/${providerProxyGroupId(route.codexHome)}` })

@@ -367,12 +367,11 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
 
   function accountShouldAutoSwitch(account, registry) {
     if (!account) return false;
-    if (account.auth_mode === "apikey") return accountIsExhausted(account);
     if (accountIsExhausted(account)) return true;
     const thresholds = registryAutoThresholds(registry);
     const primary = accountRemainingPercent(account, "primary");
     const secondary = accountRemainingPercent(account, "secondary");
-    return primary != null && primary <= thresholds.primary || secondary != null && secondary <= thresholds.secondary;
+    return (primary != null && primary <= thresholds.primary) || (secondary != null && secondary <= thresholds.secondary);
   }
 
   function accountIsSwitchCandidate(account) {
