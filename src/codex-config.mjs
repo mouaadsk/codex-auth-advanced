@@ -228,6 +228,16 @@ export function apiKeyTemplate(name) {
       repairInvalidEncryptedContent: false
     };
   }
+  if (normalized === "vsllm" || normalized === "vsllm.com" || normalized === "api.vsllm.com") {
+    return {
+      name: "vsllm",
+      baseUrl: "https://api.vsllm.com/v1",
+      defaultSpendLimitUsd: 55,
+      defaultModelContextWindow: 320000,
+      defaultAutoCompactTokenLimit: 250000,
+      repairInvalidEncryptedContent: false
+    };
+  }
   return null;
 }
 
@@ -246,6 +256,7 @@ export function inferApiKeyTemplateName(account, upstreamBaseUrl = "") {
     .join(" ")
     .toLowerCase();
 
+  if (hostname === "vsllm.com" || hostname === "api.vsllm.com" || label.includes("vsllm")) return "vsllm";
   if (hostname === "llmapi.pro" || hostname.endsWith(".llmapi.pro") || label.includes("llmapi")) return "llmapi";
   if (hostname === "tcdmx.com" || label.includes("tcdmx")) return "tcdmx";
   if (hostname === "codex-everywhere.com" || label.includes("codex-everywhere")) return "codex-everywhere";

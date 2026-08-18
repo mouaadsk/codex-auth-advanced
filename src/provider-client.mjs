@@ -215,16 +215,17 @@ export function providerOriginFromModelsEndpoint(endpoint) {
   return normalizeProviderOrigin(endpoint);
 }
 
-const vsllmProviderOrigin = "https://vsllm.com";
+const vsllmApiOrigin = "https://api.vsllm.com";
+const vsllmWebOrigin = "https://vsllm.com";
 
 export function canonicalizeVsllmProviderBaseUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return raw;
   try {
     const parsed = new URL(raw);
-    if (parsed.origin !== vsllmProviderOrigin) return raw;
+    if (parsed.origin !== vsllmWebOrigin && parsed.origin !== vsllmApiOrigin) return raw;
     const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
-    return `${vsllmProviderOrigin}${pathname}${parsed.search}${parsed.hash}`;
+    return `${vsllmApiOrigin}${pathname}${parsed.search}${parsed.hash}`;
   } catch {
     return raw;
   }
@@ -233,13 +234,19 @@ export function canonicalizeVsllmProviderBaseUrl(value) {
 export function canonicalizeVsllmProviderOrigin(origin) {
   const normalized = normalizeProviderOrigin(origin);
   if (!normalized) return normalized;
-  return normalized === vsllmProviderOrigin ? vsllmProviderOrigin : normalized;
+  return (normalized === vsllmWebOrigin || normalized === vsllmApiOrigin) ? vsllmApiOrigin : normalized;
 }
 
 export function providerDashboardOriginMatchesModelsEndpoint(modelsEndpoint, dashboardOrigin) {
   const modelsOrigin = providerOriginFromModelsEndpoint(modelsEndpoint);
   const normalizedDashboardOrigin = normalizeProviderOrigin(dashboardOrigin);
   if (!modelsOrigin || !normalizedDashboardOrigin) return false;
+  if (
+    (modelsOrigin === vsllmWebOrigin || modelsOrigin === vsllmApiOrigin) &&
+    (normalizedDashboardOrigin === vsllmWebOrigin || normalizedDashboardOrigin === vsllmApiOrigin)
+  ) {
+    return true;
+  }
   return modelsOrigin === normalizedDashboardOrigin;
 }
 

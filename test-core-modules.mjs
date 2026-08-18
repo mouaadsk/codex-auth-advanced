@@ -193,9 +193,11 @@ try {
     providerDashboardOriginMatchesModelsEndpoint("https://api.example.com/v1/models", "https://example.com"),
     false
   );
-  assert.equal(canonicalizeVsllmProviderOrigin("https://vsllm.com"), "https://vsllm.com");
+  assert.equal(canonicalizeVsllmProviderOrigin("https://vsllm.com"), "https://api.vsllm.com");
+  assert.equal(canonicalizeVsllmProviderOrigin("https://api.vsllm.com"), "https://api.vsllm.com");
   assert.equal(canonicalizeVsllmProviderOrigin("https://api.example.com"), "https://api.example.com");
-  assert.equal(canonicalizeVsllmProviderBaseUrl("https://vsllm.com/v1/"), "https://vsllm.com/v1");
+  assert.equal(canonicalizeVsllmProviderBaseUrl("https://vsllm.com/v1/"), "https://api.vsllm.com/v1");
+  assert.equal(canonicalizeVsllmProviderBaseUrl("https://api.vsllm.com/v1/"), "https://api.vsllm.com/v1");
   assert.equal(canonicalizeVsllmProviderBaseUrl("https://api.example.com/v1"), "https://api.example.com/v1");
 
   const nowSeconds = 2_000_000;
@@ -341,8 +343,8 @@ try {
     }
   }, 107, 480, nowSeconds);
   assert.equal(rolling.spend, 12);
-  assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com"), "https://vsllm.com/v1/models");
-  assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com/v1"), "https://vsllm.com/v1/models");
+  assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com"), "https://api.vsllm.com/v1/models");
+  assert.equal(modelsEndpointFromBaseUrl("https://vsllm.com/v1"), "https://api.vsllm.com/v1/models");
   assert.equal(normalizeProviderOrigin("https://vsllm.com/v1/models"), "https://vsllm.com");
 
   const compactTarget = {
@@ -541,7 +543,7 @@ try {
   );
   const activeTarget = accountService.activeApiProxyTarget(serviceHome);
   assert.equal(activeTarget.apiKey, "primary-secret");
-  assert.equal(activeTarget.upstreamBaseUrl, "https://vsllm.com/v1");
+  assert.equal(activeTarget.upstreamBaseUrl, "https://api.vsllm.com/v1");
   assert.equal(
     accountService.firstUsableSwitchCandidate(readJsonFile(path.join(serviceAccountsDir, "registry.json"))).account_key,
     fallbackAccount.account_key
