@@ -33,16 +33,12 @@ export function encodedClaudeGatewayModelId(model) {
 export function encodedVsllmClaudeGatewayModelId(model) {
   const id = String(model || "").trim();
   if (!id) return id;
-  return `${claudeVsllmGatewayModelPrefix}${Buffer.from(id, "utf8").toString("base64url")}`;
+  return `${claudeVsllmGatewayModelPrefix}${id}`;
 }
 
 function decodedVsllmClaudeGatewayModelId(value) {
-  try {
-    const decoded = Buffer.from(value, "base64url").toString("utf8").trim();
-    return decoded || null;
-  } catch {
-    return null;
-  }
+  const decoded = String(value || "").trim();
+  return decoded || null;
 }
 
 export function resolvedClaudeGatewayModelId(model) {
@@ -61,9 +57,7 @@ export function resolvedClaudeGatewayModelId(model) {
 export function isVsllmClaudeGatewayModelId(model) {
   const id = String(model || "").trim();
   const { base } = splitClaudeGatewayModelSuffix(id);
-  if (base.startsWith(claudeVsllmGatewayModelPrefix)) {
-    return decodedVsllmClaudeGatewayModelId(base.slice(claudeVsllmGatewayModelPrefix.length)) != null;
-  }
+  if (base.startsWith(claudeVsllmGatewayModelPrefix)) return base.length > claudeVsllmGatewayModelPrefix.length;
   if (base.startsWith(claudeGatewayModelPrefix)) {
     const resolved = resolvedClaudeGatewayModelId(base).toLowerCase();
     return legacyVsllmClaudeGatewayModelIds.has(resolved);
@@ -410,17 +404,10 @@ function normalizeProxyModelAlias(model) {
 
 function remappedVsllmModel(model, { compact = false } = {}) {
   const normalized = normalizeProxyModelAlias(model);
-  if (normalized === "gpt-5.2") {
-    return compact ? "gpt-5.5-openai-compact" : "gpt-5.5";
-  }
-  if (normalized === "gpt-5.5-pro20x") {
-    return compact ? "gpt-5.5-openai-compact" : "gpt-5.5";
-  }
   const aliases = {
     "kimi-k3[1m]": "kimi-k3",
     "grok-4.5[1m]": "grok-4.5",
     "grok-4.6[1m]": "grok-4.6",
-    "gpt-5.5-pro20x-openai-compact": "gpt-5.5-openai-compact",
     "gpt-5.6-sol-pro20x": "gpt-5.6-sol",
     "gpt-5.6-terra-pro20x": "gpt-5.6-terra",
     "gpt-5.6-luna-pro20x": "gpt-5.6-luna"

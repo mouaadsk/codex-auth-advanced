@@ -270,18 +270,8 @@ try {
     remappedProxyRequestModel("gpt-5.6-terra-pro20x", { account: vsllmAccount }),
     "gpt-5.6-terra"
   );
-  assert.equal(
-    remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }, { compact: true }),
-    "gpt-5.5-openai-compact"
-  );
-  assert.equal(
-    remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }),
-    "gpt-5.5"
-  );
-  assert.equal(
-    remappedProxyRequestModel("gpt-5.5-pro20x", { account: vsllmAccount }, { compact: true }),
-    "gpt-5.5-openai-compact"
-  );
+  assert.equal(remappedProxyRequestModel("gpt-5.2", { account: vsllmAccount }), null);
+  assert.equal(remappedProxyRequestModel("gpt-5.5-pro20x", { account: vsllmAccount }), null);
   assert.equal(
     remappedProxyRequestModel("grok-4.5[1m]", { account: vsllmAccount }),
     "grok-4.5"
@@ -298,9 +288,10 @@ try {
   assert.equal(encodedClaudeGatewayModelId("grok-4.5"), "claude-fable-5-dd-5.4-korg");
   assert.equal(encodedClaudeGatewayModelId("grok-4.6"), "claude-fable-5-dd-6.4-korg");
   const namespacedVsllmFable = encodedVsllmClaudeGatewayModelId("claude-fable-5");
-  assert.match(namespacedVsllmFable, /^claude-vsllm-/);
+  assert.equal(namespacedVsllmFable, "claude-vsllm-claude-fable-5");
   assert.equal(resolvedClaudeGatewayModelId(namespacedVsllmFable), "claude-fable-5");
   assert.equal(isVsllmClaudeGatewayModelId(namespacedVsllmFable), true);
+  assert.equal(isVsllmClaudeGatewayModelId("claude-vsllm-kimi-k3[1m]"), true);
   assert.equal(isVsllmClaudeGatewayModelId("claude-fable-5"), false);
   assert.equal(isVsllmClaudeGatewayModelId("claude-fake-5"), true);
   assert.equal(resolvedClaudeGatewayModelId("claude-fable-5-dd-3k-imik"), "kimi-k3");
@@ -354,7 +345,7 @@ try {
     repairInvalidEncryptedContent: true
   };
   const compactRequest = {
-    model: "gpt-5.2",
+    model: "gpt-5.5",
     client_metadata: { session: "remove-me" },
     reasoning: { effort: "xhigh" },
     input: [{
@@ -373,7 +364,7 @@ try {
   const rewrittenJson = JSON.parse(rewrittenCompact.body.toString("utf8"));
   assert.equal(rewrittenCompact.rewritten, true);
   assert.equal(rewrittenCompact.decoded, true);
-  assert.equal(rewrittenJson.model, "gpt-5.5-openai-compact");
+  assert.equal(rewrittenJson.model, "gpt-5.5");
   assert.equal(rewrittenJson.client_metadata, undefined);
   assert.equal(rewrittenJson.reasoning.effort, "xhigh");
 

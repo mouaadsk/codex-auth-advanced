@@ -449,7 +449,7 @@ The picker merges two live catalogs without replacing either one:
 
 Official Claude Code entries remain first-party picker choices and use Claude Code OAuth. The cache contains only VSLLM entries, built from every live `/v1/models` item whose `supported_endpoint_types` includes `anthropic`; the bridge also adds VSLLM's Responses-only `grok-4.5` and `grok-4.6`. This is data-driven, so running `configure claude` refreshes newly available Anthropic-compatible VSLLM models without maintaining a static allowlist.
 
-Claude Code only accepts discovered IDs beginning with `claude` or `anthropic`, so each VSLLM picker choice has a reversible internal `claude-vsllm-...` ID while its display name remains `VSLLM: <actual-model-id>`. That namespace is what lets official and VSLLM versions of Fable coexist. Kimi K3 and Grok 4.5 retain a `[1m]` suffix so Claude Code budgets their 1M context windows; the suffix is removed before forwarding upstream.
+Claude Code only accepts discovered IDs beginning with `claude` or `anthropic`, so each VSLLM picker choice has a readable, reversible internal `claude-vsllm-<actual-model-id>` ID while its display name remains `VSLLM: <actual-model-id>`. That namespace is what lets official and VSLLM versions of Fable coexist. Kimi K3 and Grok 4.5 retain a `[1m]` suffix so Claude Code budgets their 1M context windows; the suffix is removed before forwarding upstream.
 
 Native VSLLM entries use `/v1/messages`. Grok 4.5 is translated in-process from Claude Messages to `/v1/responses`. The bridge converts system and conversation content, images, thinking configuration, tools, tool choices, tool calls, and tool results. Streaming Responses events are converted back into Anthropic `message_start`, content-block, `message_delta`, and `message_stop` events; non-stream responses are converted into Anthropic message JSON. Account selection, pinned routes, exhaustion detection, retries, and failover remain owned by the same provider proxy.
 
@@ -496,7 +496,6 @@ For VSLLM accounts, the selected GPT-5.6 tier is forwarded unchanged. The older 
 
 | Codex request | VSLLM responses request | VSLLM compact request |
 | --- | --- | --- |
-| `gpt-5.2` | `gpt-5.5` | `gpt-5.5-openai-compact` |
 | `gpt-5.6-sol` | `gpt-5.6-sol` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra` | `gpt-5.6-terra` |
 | `gpt-5.6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |

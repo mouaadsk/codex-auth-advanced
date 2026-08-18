@@ -26,9 +26,6 @@ import {
 import {
   createSseResponseTransformStream,
   createStreamDiagnostics,
-  dummyClaudeCompactionResponse,
-  dummyCompactionResponse,
-  dummyRemoteCompactionV2Response,
   isClaudeMessagesCompactionTarget,
   isCompactProxyTarget,
   isResponsesProxyTarget,
@@ -867,8 +864,8 @@ export function createProviderProxy(options) {
             }
           );
           if (!localCompacted) {
-            console.warn("[Proxy] Remote compaction v2 fallback failed. Generating a protocol-compatible placeholder.");
-            localCompacted = dummyRemoteCompactionV2Response("Provider-compatible summarization failed");
+            console.warn("[Proxy] Remote compaction v2 fallback failed; leaving the original request intact.");
+            return writeProxyError(res, 502, "Provider-compatible summarization failed; compaction was not applied.");
           }
           upstream = localCompacted;
           break;
@@ -911,8 +908,8 @@ export function createProviderProxy(options) {
             { originalModel: originalRequestModel }
           );
           if (!localCompacted) {
-            console.warn(`[Proxy] Local compaction fallback failed during error handler. Generating dummy placeholder...`);
-            localCompacted = dummyCompactionResponse(fetchError?.message || `Upstream status ${upstream?.status}`);
+            console.warn(`[Proxy] Local compaction fallback failed during error handler; leaving the original request intact.`);
+            return writeProxyError(res, 502, "Compaction summarization failed; compaction was not applied.");
           }
           if (localCompacted) {
             upstream = localCompacted;
@@ -930,8 +927,8 @@ export function createProviderProxy(options) {
             sanitizeProxyRequestHeaders
           );
           if (!localCompacted) {
-            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler. Generating dummy placeholder...`);
-            localCompacted = dummyClaudeCompactionResponse(fetchError?.message || `Upstream status ${upstream?.status}`, claudeCompactionModel);
+            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler; leaving the original request intact.`);
+            return writeProxyError(res, 502, "Compaction summarization failed; compaction was not applied.");
           }
           if (localCompacted) {
             upstream = localCompacted;

@@ -420,7 +420,7 @@ function proxyGroupId(home) {
 }
 
 function vsllmClaudeGatewayModelId(model, suffix = "") {
-  return `claude-vsllm-${Buffer.from(model, "utf8").toString("base64url")}${suffix}`;
+  return `claude-vsllm-${model}${suffix}`;
 }
 
 function writeAccount({
@@ -847,7 +847,7 @@ try {
   };
   const aliasedModelBody = {
     ...body,
-    model: "gpt-5.2"
+    model: "gpt-5.5"
   };
   const vsllmModelMappings = [
     ["gpt-5.6-sol", "gpt-5.6-sol", "ultra"],
@@ -970,11 +970,10 @@ try {
   const remoteCompactionDummy = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
   const remoteCompactionDummyText = await remoteCompactionDummy.text();
   const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
-  if (remoteCompactionDummy.status !== 200
+  if (remoteCompactionDummy.status !== 502
     || upstreamRequests.length !== beforeRemoteCompactionDummy + 1
-    || remoteCompactionDummyEvents.filter((event) => event.type === "response.output_item.done" && event.item?.type === "compaction").length !== 1
-    || remoteCompactionDummyEvents.filter((event) => event.type === "response.completed").length !== 1) {
-    throw new Error(`remote compaction v2 failure should still return a protocol-compatible terminal stream, got:\n${remoteCompactionDummyText}`);
+    || !remoteCompactionDummyText.includes("compaction was not applied")) {
+    throw new Error(`remote compaction v2 failure should return a non-lossy error, got ${remoteCompactionDummy.status}:\n${remoteCompactionDummyText}`);
   }
 
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
@@ -1012,7 +1011,7 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.5-openai-compact"
+    expectedModel: "gpt-5.5"
   });
   assertCompactResponseTextContent("vsllm compact aliased response", aliasedCompactRes);
 
@@ -1027,14 +1026,14 @@ try {
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.5-openai-compact"
+    expectedModel: "gpt-5.5"
   });
   assertRequestAt(beforeAliasedVsllmFallback + 1, {
     label: "vsllm compact alias fallback",
     bearer: "vsllm-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: false,
-    expectedModel: "gpt-5.2"
+    expectedModel: "gpt-5.5"
   });
 
   for (const [inputModel, expectedModel, expectedReasoningEffort] of vsllmModelMappings) {
@@ -1279,21 +1278,6 @@ try {
   }
   if (claudeCompactFallbackReqBody.messages?.[0]?.content?.includes("detailed summary of the conversation") !== true) {
     throw new Error(`Claude compaction fallback should forward the transcript text, got ${claudeCompactFallbackReq.bodyText}`);
-  }
-
-  claudeCompactionFailures.push("cloudflare_timeout", "unreachable");
-  const beforeClaudeCompactDummy = upstreamRequests.length;
-  const claudeCompactDummy = await proxyRawRequest(proxyPort, "/v1/messages", claudeCompactionBody, {
-    "anthropic-version": "2023-06-01"
-  });
-  const claudeCompactDummyText = await claudeCompactDummy.text();
-  if (claudeCompactDummy.status !== 200
-    || !claudeCompactDummyText.includes("COMPACTION FALLBACK WARNING")
-    || !claudeCompactDummyText.includes("event: message_stop")) {
-    throw new Error(`Claude compaction dummy fallback should return a warning SSE message, got ${claudeCompactDummy.status}:\n${claudeCompactDummyText}`);
-  }
-  if (upstreamRequests.length !== beforeClaudeCompactDummy + 2) {
-    throw new Error(`Claude compaction dummy path should attempt /v1/messages then /chat/completions, got ${upstreamRequests.length - beforeClaudeCompactDummy} upstream requests`);
   }
 
   const beforeClaudeNormal = upstreamRequests.length;
@@ -1717,7 +1701,7 @@ try {
     bearer: "tcdmx-secret",
     acceptEncoding: "identity",
     expectEncryptedContent: true,
-    expectedModel: "gpt-5.2"
+    expectedModel: "gpt-5.5"
   });
   await proxyRequest(proxyPort, "/responses", {
     ...body,

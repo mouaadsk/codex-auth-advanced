@@ -193,8 +193,8 @@ const gatewayProxy = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       data: [
-        { id: "claude-vsllm-Y2xhdWRlLWZhYmxlLTU", display_name: "VSLLM: claude-fable-5", owned_by: "vsllm" },
-        { id: "claude-vsllm-a2ltaS1rMw[1m]", display_name: "VSLLM: kimi-k3", owned_by: "vsllm" },
+        { id: "claude-vsllm-claude-fable-5", display_name: "VSLLM: claude-fable-5", owned_by: "vsllm" },
+        { id: "claude-vsllm-kimi-k3[1m]", display_name: "VSLLM: kimi-k3", owned_by: "vsllm" },
         { id: "claude-fable-5", display_name: "Claude Fable 5", owned_by: "anthropic" }
       ]
     }));
@@ -272,7 +272,7 @@ const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf8"));
 if (claudeSettings.effortLevel !== "high" || claudeSettings.enabledPlugins?.example !== true) {
   throw new Error(`Claude settings lost unrelated values: ${JSON.stringify(claudeSettings)}`);
 }
-if (claudeSettings.model !== "claude-vsllm-a2ltaS1rMw[1m]") {
+if (claudeSettings.model !== "claude-vsllm-kimi-k3[1m]") {
   throw new Error(`Claude Kimi selection was not migrated to 1M context: ${JSON.stringify(claudeSettings)}`);
 }
 if (claudeSettings.env.ANTHROPIC_BASE_URL !== expectedBaseUrl
@@ -301,8 +301,8 @@ if (fs.existsSync(claudeGatewayModelsCachePath)) {
   const claudeGatewayModelsCache = JSON.parse(fs.readFileSync(claudeGatewayModelsCachePath, "utf8"));
   if (claudeGatewayModelsCache.baseUrl !== expectedBaseUrl
     || JSON.stringify(claudeGatewayModelsCache.models) !== JSON.stringify([
-      { id: "claude-vsllm-Y2xhdWRlLWZhYmxlLTU", display_name: "VSLLM: claude-fable-5" },
-      { id: "claude-vsllm-a2ltaS1rMw[1m]", display_name: "VSLLM: kimi-k3" }
+      { id: "claude-vsllm-claude-fable-5", display_name: "VSLLM: claude-fable-5" },
+      { id: "claude-vsllm-kimi-k3[1m]", display_name: "VSLLM: kimi-k3" }
     ])) {
     throw new Error(`Claude gateway model cache was not refreshed correctly: ${JSON.stringify(claudeGatewayModelsCache)}`);
   }

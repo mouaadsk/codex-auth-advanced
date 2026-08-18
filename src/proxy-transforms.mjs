@@ -1031,28 +1031,6 @@ Produce a clear, structured summary in Markdown format. Keep the summary under 8
   }
 }
 
-export function dummyCompactionResponse(errorMsg) {
-  const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a dummy placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
-  const compactedMessage = compactTextMessage(summaryText);
-  const compactionResponse = {
-    type: "response.compaction",
-    encrypted_content: "",
-    messages: [compactedMessage],
-    output: [compactedMessage]
-  };
-  return new Response(JSON.stringify(compactionResponse), {
-    status: 200,
-    headers: new Headers({
-      "content-type": "application/json; charset=utf-8"
-    })
-  });
-}
-
-export function dummyRemoteCompactionV2Response(errorMsg) {
-  const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
-  return remoteCompactionV2Response(summaryText);
-}
-
 function claudeMessagesJsonResponse(body, extraHeaders = {}) {
   const responseBody = Buffer.from(JSON.stringify(body), "utf8");
   return new Response(responseBody, {
@@ -1114,9 +1092,4 @@ export function claudeMessagesCompactionResponse(summaryText, model) {
       "cache-control": "no-cache"
     })
   });
-}
-
-export function dummyClaudeCompactionResponse(errorMsg, model) {
-  const summaryText = `[COMPACTION FALLBACK WARNING]\nLocal compaction failed due to: ${errorMsg || "Timeout or API error"}.\nTo prevent session crash, a dummy placeholder compaction response was returned. The conversation history has been truncated, but outstanding tasks and core instructions might need to be re-referenced if missing.`;
-  return claudeMessagesCompactionResponse(summaryText, model);
 }
