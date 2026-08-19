@@ -663,6 +663,26 @@ export function supportedShapesForAccount(account, options = {}) {
   return shapes;
 }
 
+// Per-model static capability map for VSLLM. Some models only speak a
+// subset of the 4 wire shapes; the chain walker uses this to prune the
+// default per-source chain instead of walking shapes the model cannot serve.
+//
+// Keyed by the upstream model id as VSLLM advertises it (lowercased).
+// Grok models today only implement /v1/chat/completions.
+const MODEL_SHAPE_CAPABILITIES = Object.freeze({
+  "grok-4.5": new Set([WIRE_SHAPES.CHAT_COMPLETIONS]),
+  "grok-4.6": new Set([WIRE_SHAPES.CHAT_COMPLETIONS]),
+  "grok-4": new Set([WIRE_SHAPES.CHAT_COMPLETIONS])
+});
+
+export function supportedShapesForModel(model) {
+  const id = String(model || "").trim().toLowerCase();
+  if (!id) return null;
+  // Allow suffixes like [1m] on the model id (Kimi 1M context).
+  const base = id.split(/[\\[\\(]/)[0];
+  return MODEL_SHAPE_CAPABILITIES[base] || MODEL_SHAPE_CAPABILITIES[id] || null;
+}
+
 // Strict transport / 5xx / model capacity / transient usage limit -> next shape.
 // Plus one lenient exception: 400 "endpoint unsupported" so Grok-style accounts
 // that only speak chat_completions aren't punished for the wrong leading shape.

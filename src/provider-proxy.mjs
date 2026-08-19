@@ -16,12 +16,10 @@ import {
   prepareClaudeResponsesBridge,
   retargetClaudeResponsesBridge,
   translateResponsesResponseToClaude,
-  prepareClaudeChatBridge,
-  translateMessagesResponseToResponses
+  prepareClaudeChatBridge
 } from "./claude-responses-bridge.mjs";
 import {
   prepareChatResponsesBridge,
-  translateChatResponseToResponses,
   translateResponsesResponseToChat,
   chatTargetFromResponsesTarget
 } from "./chat-responses-bridge.mjs";
@@ -43,10 +41,14 @@ import {
   runLocalCompactionFallback,
   summarizeViaShape
 } from "./proxy-transforms.mjs";
+// antigravity translations are handled inside shape-translator.mjs
+// (buildShapeBridge + retargetBridge + translateShapeResponse).
 import {
-  prepareAntigravityBridge,
-  translateAntigravityResponseToShape
-} from "./antigravity-bridge.mjs";
+  buildShapeBridge,
+  retargetBridge,
+  translateRequest as translateShapeRequest,
+  translateResponse as translateShapeResponse
+} from "./shape-translator.mjs";
 import {
   isProviderProxyLoopbackRequest,
   writeProviderProxyControlResponse,
@@ -562,7 +564,8 @@ export function createProviderProxy(options) {
       const planner = createEndpointChainPlanner({
         sourceShape,
         isCompact: isCompactProxyTarget(target),
-        requestUrl: req.url
+        requestUrl: req.url,
+        model: originalRequestModel
       });
       planner.prime(target.account);
       const isCompact = isCompactProxyTarget(target);
@@ -570,93 +573,21 @@ export function createProviderProxy(options) {
       // Universal shape bridge dispatcher. Given the current target and the
       // next shape to try, translates the request body into that shape's
       // wire format and returns {target, body} for the chain walker to use.
-      async function prepareShapeBridge({ target: curTarget, nextShape, sourceShape: srcShape, sourceBody, originalRequest: origReq }) {
-        const baseUrl = curTarget.upstreamBaseUrl;
-        if (!baseUrl) return null;
-        if (srcShape === WIRE_SHAPES.RESPONSES && nextShape === WIRE_SHAPES.CHAT_COMPLETIONS) {
-          const chatUrl = shapeUrlFor(baseUrl, WIRE_SHAPES.CHAT_COMPLETIONS);
-          if (!chatUrl) return null;
-          const parsed = parseProxyBody(sourceBody);
-          if (!parsed) return null;
-          const messages = (parsed.input || [])
-            .filter((item) => item?.type === "message")
-            .map((m) => ({
-              role: m.role === "assistant" ? "assistant" : "user",
-              content: Array.isArray(m.content) ? m.content.map((p) => p.text || "").join("\n") : (typeof m.content === "string" ? m.content : "")
-            }));
-          const chatPayload = {
-            model: parsed.model,
-            messages,
-            stream: parsed.stream === true
-          };
-          return {
-            target: { ...curTarget, url: chatUrl },
-            body: Buffer.from(JSON.stringify(chatPayload), "utf8"),
-            sourceShape: srcShape,
-            nextShape,
-            originalRequest: origReq
-          };
-        }
-        if (srcShape === WIRE_SHAPES.RESPONSES && nextShape === WIRE_SHAPES.MESSAGES) {
-          const messagesUrl = shapeUrlFor(baseUrl, WIRE_SHAPES.MESSAGES);
-          if (!messagesUrl) return null;
-          const parsed = parseProxyBody(sourceBody);
-          if (!parsed) return null;
-          const messages = (parsed.input || [])
-            .filter((item) => item?.type === "message")
-            .map((m) => ({
-              role: m.role === "assistant" ? "assistant" : "user",
-              content: Array.isArray(m.content) ? m.content.map((p) => p.text || "").join("\n") : (typeof m.content === "string" ? m.content : "")
-            }));
-          const messagesPayload = {
-            model: parsed.model,
-            max_tokens: 4096,
-            messages
-          };
-          return {
-            target: { ...curTarget, url: messagesUrl },
-            body: Buffer.from(JSON.stringify(messagesPayload), "utf8"),
-            sourceShape: srcShape,
-            nextShape,
-            originalRequest: origReq
-          };
-        }
-        if (srcShape === WIRE_SHAPES.RESPONSES && nextShape === WIRE_SHAPES.ANTIGRAVITY) {
-          const agBridge = prepareAntigravityBridge(
-            { ...curTarget, url: shapeUrlFor(baseUrl, WIRE_SHAPES.RESPONSES) },
-            sourceBody
-          );
-          if (!agBridge || agBridge.kind !== "antigravity") return null;
-          return {
-            target: agBridge.target,
-            body: agBridge.body,
-            sourceShape: srcShape,
-            nextShape,
-            originalRequest: agBridge.originalRequest,
-            geminiRequest: agBridge.translatedRequest
-          };
-        }
-        return null;
+      // Universal shape bridge: delegates to shape-translator.mjs which
+      // owns all 4-shape request/response translation. The proxy only
+      // owns the chain walker and the account-switch logic.
+      function prepareShapeBridge({ target: curTarget, nextShape, sourceShape: srcShape, sourceBody, originalRequest: origReq }) {
+        return buildShapeBridge({
+          target: curTarget,
+          sourceShape: srcShape,
+          targetShape: nextShape,
+          sourceBody,
+          sourceRequest: origReq
+        });
       }
 
-      // Universal response translator: converts a response body in fromShape
-      // into the source shape's format.
-      async function translateShapeResponseToSource({ rawBody, fromShape, toShape, sourceBody, bridge }) {
-        if (!rawBody) return null;
-        let parsed = null;
-        try { parsed = JSON.parse(rawBody); } catch { return null; }
-        if (fromShape === toShape) return parsed;
-        if (fromShape === WIRE_SHAPES.CHAT_COMPLETIONS && toShape === WIRE_SHAPES.RESPONSES) {
-          return translateChatResponseToResponses(parsed);
-        }
-        if (fromShape === WIRE_SHAPES.MESSAGES && toShape === WIRE_SHAPES.RESPONSES) {
-          return translateMessagesResponseToResponses(parsed, parseProxyBody(sourceBody) || {});
-        }
-        if (fromShape === WIRE_SHAPES.ANTIGRAVITY && toShape === WIRE_SHAPES.RESPONSES) {
-          const translated = translateAntigravityResponseToShape(parsed, WIRE_SHAPES.RESPONSES, bridge?.originalRequest || {});
-          return translated?.body || null;
-        }
-        return null;
+      function translateShapeResponseToSource({ rawBody, fromShape, toShape, bridge }) {
+        return translateShapeResponse(fromShape, toShape, rawBody, bridge?.originalRequest || {});
       }
 
       while (true) {
@@ -859,6 +790,22 @@ export function createProviderProxy(options) {
               target = bridge.target;
               body = bridge.body;
               bodyAlreadyDecoded = true;
+              // On streaming requests, SSE translation across shapes is
+              // not implemented; the bridged shape serves a non-streaming
+              // call so the JSON response path can translate back to the
+              // source shape. Clients keep their stream=true at the wire.
+              if (requestIsStreaming && bridge.translatedRequest) {
+                bridge.translatedRequest = { ...bridge.translatedRequest, stream: false };
+                bridge.body = Buffer.from(JSON.stringify(bridge.translatedRequest), "utf8");
+                body = bridge.body;
+                // For antigravity, force non-streaming by retargeting the
+                // URL to :generateContent (not :streamGenerateContent).
+                if (bridge.kind === "antigravity" && bridge.target?.antigravityStream) {
+                  const nonStreamUrl = bridge.target.url.replace(":streamGenerateContent", ":generateContent");
+                  bridge.target = { ...bridge.target, url: nonStreamUrl, antigravityStream: false };
+                  target = bridge.target;
+                }
+              }
               target.responseFromShape = nextShape;
               target.responseToShape = sourceShape;
               target.shapeBridge = bridge;

@@ -13,7 +13,8 @@ import {
   endpointChainForSource,
   isShapeFallbackStatus,
   isAccountExhaustionStatus,
-  supportedShapesForAccount
+  supportedShapesForAccount,
+  supportedShapesForModel
 } from "./provider-policy.mjs";
 
 const SHAPE_PATHS = {
@@ -42,15 +43,19 @@ function shapeName(shape) {
   return SHAPE_PATH_NAMES[shape] || shape;
 }
 
-function buildShapeAttempts({ sourceShape, account, isCompact }) {
+function buildShapeAttempts({ sourceShape, account, isCompact, model = null }) {
   const supported = supportedShapesForAccount(account);
+  const modelSupported = supportedShapesForModel(model);
   const chain = endpointChainForSource(sourceShape);
-const attempts = [];
+  const attempts = [];
   const seen = new Set();
   for (const shape of chain) {
     if (seen.has(shape)) continue;
     seen.add(shape);
     if (!supported.has(shape)) continue;
+    // Per-model capability pruning: if VSLLM only advertises a subset for
+    // this model (e.g. Grok only speaks /v1/chat/completions), drop the rest.
+    if (modelSupported && !modelSupported.has(shape)) continue;
     // Compact walks every wire shape on the active account: the chain walker
     // builds a summarization request for each non-Responses shape (see
     // summarizeViaShape in proxy-transforms.mjs) so a /responses/compact
@@ -73,7 +78,8 @@ function buildAntigravityAttempt({ sourceShape, account, isCompact }) {
 export function createEndpointChainPlanner({
   sourceShape,
   isCompact = false,
-  requestUrl = ""
+  requestUrl = "",
+  model = null
 } = {}) {
   const attemptsByAccount = new Map(); // account_key -> ordered shapes
   let lastAccountKey = null;
@@ -84,7 +90,7 @@ export function createEndpointChainPlanner({
     if (!account || typeof account !== "object") return [];
     const key = account.account_key || account.email || account.alias || "anonymous";
     if (attemptsByAccount.has(key)) return attemptsByAccount.get(key);
-    const attempts = buildShapeAttempts({ sourceShape, account, isCompact });
+    const attempts = buildShapeAttempts({ sourceShape, account, isCompact, model });
     attemptsByAccount.set(key, attempts);
     return attempts;
   }
