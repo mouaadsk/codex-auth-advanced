@@ -168,8 +168,8 @@ export function defaultApiKeyConfig(baseUrl, sourceToml = "", templateName = nul
   const contextDefaults = apiKeyContextDefaults(templateName);
   return mergeSessionModelConfig([
     'model_provider = "OpenAI"',
-    'model = "gpt-5.5"',
-    'review_model = "gpt-5.5"',
+    'model = "gpt-5.6-sol"',
+    'review_model = "gpt-5.6-sol"',
     'model_reasoning_effort = "xhigh"',
     "disable_response_storage = true",
     'network_access = "enabled"',

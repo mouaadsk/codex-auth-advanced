@@ -775,12 +775,42 @@ export function normalizeCompactionResponse(value) {
 }
 
 function compactionCompletionsUrl(target) {
+  return compactionShapeUrl(target, "chat_completions");
+}
+
+// Derive the per-shape URL on the same upstream for a compact fallback call.
+// VSLLM exposes the same model on every wire shape, so we just rewrite the
+// path. Antigravity uses Google's Gemini :generateContent envelope and is
+// keyed off the original model id from the request.
+export function compactionShapeUrl(target, shape, modelId) {
   try {
     const url = new URL(target.url);
-    const pathname = url.pathname
-      .replace(/\/responses\/compact\/?$/, "/chat/completions")
-      .replace(/\/responses\/?$/, "/chat/completions")
-      .replace(/\/v1\/messages\/?$/, "/chat/completions");
+    let pathname = url.pathname;
+    if (shape === "chat_completions") {
+      pathname = pathname
+        .replace(/\/responses\/compact\/?$/, "/chat/completions")
+        .replace(/\/responses\/?$/, "/chat/completions")
+        .replace(/\/v1\/messages\/?$/, "/chat/completions")
+        .replace(/\/v1beta\/models\/[^:]+\:generateContent\/?$/, "/chat/completions")
+        .replace(/\/v1beta\/models\/[^:]+\:streamGenerateContent\/?$/, "/chat/completions");
+    } else if (shape === "messages") {
+      pathname = pathname
+        .replace(/\/responses\/compact\/?$/, "/messages")
+        .replace(/\/responses\/?$/, "/messages")
+        .replace(/\/chat\/completions\/?$/, "/messages")
+        .replace(/\/v1beta\/models\/[^:]+\:generateContent\/?$/, "/messages")
+        .replace(/\/v1beta\/models\/[^:]+\:streamGenerateContent\/?$/, "/messages");
+    } else if (shape === "antigravity") {
+      const model = modelId || extractModelFromCompactUrl(url.pathname);
+      pathname = model
+        ? `/v1beta/models/${encodeURIComponent(model)}:generateContent`
+        : pathname
+          .replace(/\/chat\/completions\/?$/, "/v1beta/models/__unknown__:generateContent")
+          .replace(/\/v1\/messages\/?$/, "/v1beta/models/__unknown__:generateContent")
+          .replace(/\/responses(?:\/compact)?\/?$/, "/v1beta/models/__unknown__:generateContent");
+    } else {
+      return null;
+    }
     if (pathname === url.pathname) return null;
     url.pathname = pathname;
     url.search = "";
@@ -788,6 +818,15 @@ function compactionCompletionsUrl(target) {
   } catch {
     return null;
   }
+}
+
+function extractModelFromCompactUrl(pathname) {
+  const m = String(pathname || "").match(/\/v1beta\/models\/([^/:]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+function extractModelFromRequest(parsed) {
+  return typeof parsed?.model === "string" && parsed.model.trim() ? parsed.model.trim() : null;
 }
 
 // Remote compaction v2 is streamed through /responses. Codex accepts exactly
@@ -840,6 +879,193 @@ function claudeCompactionTranscriptText(parsed) {
       .map((part) => String(part.text ?? part.content ?? ""))
       .join("\n");
   return text.trim() ? text : null;
+}
+
+// Build a flat text transcript from a Codex /v1/responses/compact payload so
+// any wire shape can summarize it with a one-shot prompt. Items that are
+// purely metadata (compaction_trigger, reasoning) are dropped; messages,
+// compaction summaries (this proxy's own encrypted_content tag), function
+// calls, and function outputs are preserved verbatim.
+function extractCompactConversationText(parsed) {
+  const inputItems = Array.isArray(parsed?.input) ? parsed.input : [];
+  let text = "";
+  for (const item of inputItems) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "message") {
+      const role = item.role || "unknown";
+      const parts = [];
+      if (Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (part && typeof part.text === "string") {
+            parts.push(part.text);
+          } else if (part && typeof part === "object" && typeof part.content === "string") {
+            parts.push(part.content);
+          } else if (typeof part === "string") {
+            parts.push(part);
+          }
+        }
+      } else if (typeof item.content === "string") {
+        parts.push(item.content);
+      }
+      if (parts.length > 0) text += `[${role}]: ${parts.join("\n")}\n\n`;
+    } else if (item.type === "compaction") {
+      const summary = decodeRemoteCompactionV2Summary(item.encrypted_content);
+      if (summary) text += `[earlier compacted context]: ${summary}\n\n`;
+    } else if (item.type === "function_call") {
+      text += `[assistant called function]: ${item.name || ""} with arguments ${item.arguments || ""}\n\n`;
+    } else if (item.type === "function_call_output") {
+      text += `[function output]: ${item.output ?? ""}\n\n`;
+    }
+  }
+  return text.trim();
+}
+
+const summarizeSystemPrompt = `You are a helper that compacts and summarizes conversational context for an AI agent.
+Analyze the following conversation history and produce a concise, highly detailed summary of what has been discussed and accomplished so far.
+Focus on:
+1. The user's goal and requirements.
+2. The key technical details, decisions, and instructions established.
+3. Code blocks, modifications, or implementations that were written or modified.
+4. Current outstanding tasks or next steps.
+
+Produce a clear, structured summary in Markdown format. Keep the summary under 800 words.`;
+
+// Build the per-shape summarization body for compact fallback.
+function buildCompactSummarizeBody({ shape, model, conversationText, reasoningEffort, target }) {
+  const reasoning = isVsllmApiAccount(target?.account, target?.upstreamBaseUrl || target?.url || "")
+    && typeof reasoningEffort === "string" && reasoningEffort.trim()
+    ? reasoningEffort.trim()
+    : null;
+  const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
+  if (shape === "chat_completions") {
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: summarizeSystemPrompt },
+        { role: "user", content: userPrompt }
+      ]
+    };
+    if (reasoning) body.reasoning_effort = reasoning;
+    return body;
+  }
+  if (shape === "messages") {
+    const body = {
+      model,
+      max_tokens: 4096,
+      system: summarizeSystemPrompt,
+      messages: [{ role: "user", content: userPrompt }]
+    };
+    if (reasoning) body.thinking = { type: "enabled", budget_tokens: 2048 };
+    return body;
+  }
+  if (shape === "antigravity") {
+    const body = {
+      contents: [
+        { role: "user", parts: [{ text: `${summarizeSystemPrompt}\n\n${userPrompt}` }] }
+      ]
+    };
+    return body;
+  }
+  return null;
+}
+
+async function readShapeSummarizeResponse({ shape, res }) {
+  if (res.status !== 200) return null;
+  const text = await res.text();
+  if (!text) return null;
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  if (shape === "chat_completions") {
+    const choice = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+    const content = choice?.message?.content;
+    return typeof content === "string" ? content.trim() : null;
+  }
+  if (shape === "messages") {
+    if (Array.isArray(parsed?.content)) {
+      const textPart = parsed.content.find((p) => p && p.type === "text");
+      if (textPart && typeof textPart.text === "string") return textPart.text.trim();
+    }
+    return null;
+  }
+  if (shape === "antigravity") {
+    const candidate = Array.isArray(parsed?.candidates) ? parsed.candidates[0] : null;
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    const textPart = parts.find((p) => p && typeof p.text === "string");
+    return textPart ? String(textPart.text).trim() : null;
+  }
+  return null;
+}
+
+// Wrap a compact summary into the Codex /v1/responses/compact response envelope.
+function codexCompactResponse(summaryText, parsed) {
+  const compactedMessage = compactTextMessage(summaryText);
+  return {
+    type: "response.compaction",
+    encrypted_content: "",
+    messages: [compactedMessage],
+    output: [compactedMessage]
+  };
+}
+
+// Try one shape's endpoint on the same upstream as a real summarization call
+// for compact. Returns a Codex-compact-formatted Response on success or null
+// on any failure. The summarization request is a fresh one-shot prompt and
+// does NOT forward the original compact payload (which is unreadable by the
+// non-Responses shape). The summary text is wrapped in Codex-compact format.
+export async function summarizeViaShape({ shape, target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {} }) {
+  if (!shape || shape === "responses") return null;
+  const startTime = Date.now();
+  const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
+  let parsed = null;
+  try { parsed = JSON.parse(decoded.body.toString("utf8")); } catch { return null; }
+  const fallbackModel = typeof options.originalModel === "string" && options.originalModel.trim()
+    ? options.originalModel.trim()
+    : extractModelFromRequest(parsed) || "gpt-5.6-sol";
+  const conversationText = extractCompactConversationText(parsed);
+  if (!conversationText) {
+    console.error(`[Proxy Compact Shape] No conversation text found for shape ${shape} on ${target?.url}.`);
+    return null;
+  }
+  const shapeUrl = compactionShapeUrl(target, shape, fallbackModel);
+  if (!shapeUrl) {
+    console.error(`[Proxy Compact Shape] Cannot derive ${shape} URL from ${target?.url}.`);
+    return null;
+  }
+  const summarizeBody = buildCompactSummarizeBody({
+    shape,
+    model: fallbackModel,
+    conversationText,
+    reasoningEffort: parsed?.reasoning?.effort ?? parsed?.reasoning_effort,
+    target
+  });
+  if (!summarizeBody) return null;
+  const authHeaders = sanitizeRequestHeaders(headers, target, { omitContentEncoding: true });
+  try {
+    const res = await fetch(shapeUrl, {
+      method: "POST",
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify(summarizeBody),
+      signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(60000) : undefined
+    });
+    const summaryText = await readShapeSummarizeResponse({ shape, res });
+    if (!summaryText) {
+      console.error(`[Proxy Compact Shape] ${shape} endpoint returned status ${res.status} or empty summary.`);
+      return null;
+    }
+    console.log(`[Proxy Compact Shape] ${shape} summary generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Size: ${summaryText.length} chars.`);
+    const compactJson = codexCompactResponse(summaryText, parsed);
+    const responseBody = Buffer.from(JSON.stringify(compactJson), "utf8");
+    return new Response(responseBody, {
+      status: 200,
+      headers: new Headers({
+        "content-type": "application/json; charset=utf-8",
+        "content-length": String(responseBody.length)
+      })
+    });
+  } catch (err) {
+    console.error(`[Proxy Compact Shape] ${shape} fallback failed:`, err?.message || err);
+    return null;
+  }
 }
 
 export async function runLocalCompactionFallback(target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {}) {
@@ -928,53 +1154,17 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   // Codex /responses/compact path: the native compact endpoint failed, so we
   // re-summarize via chat completions. Send the FULL conversation — no item
   // dropping, no per-item truncation — so the summary reflects everything.
-  const inputItems = Array.isArray(parsed.input) ? parsed.input : [];
-
-  let conversationText = "";
-  for (const item of inputItems) {
-    if (item.type === "message") {
-      const role = item.role || "unknown";
-      const parts = [];
-      if (Array.isArray(item.content)) {
-        for (const part of item.content) {
-          if (part && typeof part.text === "string") {
-            parts.push(part.text);
-          } else if (part && typeof part === "object" && typeof part.content === "string") {
-            parts.push(part.content);
-          } else if (typeof part === "string") {
-            parts.push(part);
-          }
-        }
-      } else if (typeof item.content === "string") {
-        parts.push(item.content);
-      }
-      conversationText += `[${role}]: ${parts.join("\n")}\n\n`;
-    } else if (item.type === "compaction") {
-      const summary = decodeRemoteCompactionV2Summary(item.encrypted_content);
-      if (summary) conversationText += `[earlier compacted context]: ${summary}\n\n`;
-    } else if (item.type === "function_call") {
-      conversationText += `[assistant called function]: ${item.name} with arguments ${item.arguments}\n\n`;
-    } else if (item.type === "function_call_output") {
-      conversationText += `[function output]: ${item.output ?? ""}\n\n`;
-    }
+  const conversationText = extractCompactConversationText(parsed);
+  if (!conversationText) {
+    console.error(`[Proxy Local Compaction] No conversation text found in compact payload.`);
+    return null;
   }
-
-  const systemPrompt = `You are a helper that compacts and summarizes conversational context for an AI agent.
-Analyze the following conversation history and produce a concise, highly detailed summary of what has been discussed and accomplished so far.
-Focus on:
-1. The user's goal and requirements.
-2. The key technical details, decisions, and instructions established.
-3. Code blocks, modifications, or implementations that were written or modified.
-4. Current outstanding tasks or next steps.
-
-Produce a clear, structured summary in Markdown format. Keep the summary under 800 words.`;
-
   const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
 
   const completionBody = applyReasoningEffort({
     model: fallbackModel,
     messages: [
-      { role: "system", content: systemPrompt },
+      { role: "system", content: summarizeSystemPrompt },
       { role: "user", content: userPrompt }
     ]
   });

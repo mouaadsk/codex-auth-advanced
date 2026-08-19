@@ -560,3 +560,132 @@ export function usageSnapshotForApiSpend(spend, limitUsd, exhausted, options = {
     plan_type: "apikey"
   };
 }
+
+// ---------- Universal endpoint chain (Phase: universal compatibility) ----------
+//
+// The proxy now classifies every request into one of four wire shapes
+// (responses, chat_completions, messages, antigravity) and walks the
+// per-source chain across the available shapes on the active account before
+// either retrying on the same shape (capacity / transient usage limits) or
+// switching account (balance exhaustion only).
+
+export const WIRE_SHAPES = Object.freeze({
+  RESPONSES: "responses",
+  CHAT_COMPLETIONS: "chat_completions",
+  MESSAGES: "messages",
+  ANTIGRAVITY: "antigravity"
+});
+
+const DEFAULT_SOURCE_CHAINS = Object.freeze({
+  [WIRE_SHAPES.RESPONSES]: [
+    WIRE_SHAPES.RESPONSES,
+    WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.MESSAGES,
+    WIRE_SHAPES.ANTIGRAVITY
+  ],
+  [WIRE_SHAPES.CHAT_COMPLETIONS]: [
+    WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.RESPONSES,
+    WIRE_SHAPES.MESSAGES,
+    WIRE_SHAPES.ANTIGRAVITY
+  ],
+  [WIRE_SHAPES.MESSAGES]: [
+    WIRE_SHAPES.MESSAGES,
+    WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.RESPONSES,
+    WIRE_SHAPES.ANTIGRAVITY
+  ],
+  [WIRE_SHAPES.ANTIGRAVITY]: [
+    WIRE_SHAPES.ANTIGRAVITY,
+    WIRE_SHAPES.RESPONSES,
+    WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.MESSAGES
+  ]
+});
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+export function detectSourceShapeFromUrl(url) {
+  let pathname = "";
+  try {
+    pathname = new URL(url, "http://localhost").pathname.replace(/\/$/, "");
+  } catch {
+    pathname = String(url || "").split("?")[0].replace(/\/$/, "");
+  }
+  if (!pathname) return null;
+  if (pathname.endsWith("/responses/compact")) return WIRE_SHAPES.RESPONSES;
+  if (pathname.endsWith("/responses")) return WIRE_SHAPES.RESPONSES;
+  if (pathname.endsWith("/chat/completions")) return WIRE_SHAPES.CHAT_COMPLETIONS;
+  if (pathname.endsWith("/messages/count_tokens")) return WIRE_SHAPES.MESSAGES;
+  if (pathname.endsWith("/messages")) return WIRE_SHAPES.MESSAGES;
+  if (pathname.endsWith(":streamGenerateContent")) return WIRE_SHAPES.ANTIGRAVITY;
+  if (pathname.endsWith(":generateContent")) return WIRE_SHAPES.ANTIGRAVITY;
+  if (pathname.includes("/v1beta/models/")) return WIRE_SHAPES.ANTIGRAVITY;
+  if (pathname.endsWith("/antigravity")) return WIRE_SHAPES.ANTIGRAVITY;
+  return null;
+}
+
+export function endpointChainForSource(sourceShape) {
+  return DEFAULT_SOURCE_CHAINS[sourceShape] ? [...DEFAULT_SOURCE_CHAINS[sourceShape]] : [];
+}
+
+export function supportedShapesForAccount(account, options = {}) {
+  const shapes = new Set();
+  if (!account || typeof account !== "object") return shapes;
+  if (isVsllmApiAccount(account, options.endpoint)) {
+    // VSLLM historically advertises every wire shape on its gateway.
+    shapes.add(WIRE_SHAPES.RESPONSES);
+    shapes.add(WIRE_SHAPES.MESSAGES);
+    shapes.add(WIRE_SHAPES.CHAT_COMPLETIONS);
+    if (account?.antigravity_base_url || account?.antigravityBaseUrl
+      || account?.gemini_base_url || account?.geminiBaseUrl
+      || (typeof account?.endpoint === "string" && account.endpoint.includes("vsllm.com"))) {
+      shapes.add(WIRE_SHAPES.ANTIGRAVITY);
+    }
+  }
+  if (account?.api_template === "llmapi" || /llmapi/i.test(String(account?.alias || "") + String(account?.email || ""))) {
+    shapes.add(WIRE_SHAPES.RESPONSES);
+    shapes.add(WIRE_SHAPES.CHAT_COMPLETIONS);
+  }
+  if (account?.api_template === "antigravity" || /antigravity/i.test(String(account?.alias || "") + String(account?.email || ""))) {
+    shapes.add(WIRE_SHAPES.ANTIGRAVITY);
+    shapes.add(WIRE_SHAPES.RESPONSES);
+    shapes.add(WIRE_SHAPES.CHAT_COMPLETIONS);
+  }
+  if (account?.auth_mode === "apikey") {
+    if (!shapes.size) {
+      shapes.add(WIRE_SHAPES.RESPONSES);
+      shapes.add(WIRE_SHAPES.CHAT_COMPLETIONS);
+    }
+  }
+  return shapes;
+}
+
+// Strict transport / 5xx / model capacity / transient usage limit -> next shape.
+// Plus one lenient exception: 400 "endpoint unsupported" so Grok-style accounts
+// that only speak chat_completions aren't punished for the wrong leading shape.
+const ENDPOINT_UNSUPPORTED_PATTERNS = [
+  /unsupported[\s_-]?endpoint/i,
+  /unknown[\s_-]?(route|endpoint)/i,
+  /endpoint[\s_-]?not[\s_-]?(?:implemented|supported|available)/i,
+  /not[\s_-]?implemented/i,
+  /model[\s_-]?does[\s_-]?not[\s_-]?support[\s_-]?(the[\s_-]?)?(?:chat|response|message)/i
+];
+
+export function isShapeFallbackStatus(status, body) {
+  if (status == null) return true;
+  if (status === 502 || status === 504 || status === 524) return true;
+  if (status === 408) return true;
+  if (status === 404 || status === 405) return true;
+  if (status === 400 && body && typeof body === "object") {
+    const text = responseBodySearchText ? responseBodySearchText(body) : JSON.stringify(body);
+    if (ENDPOINT_UNSUPPORTED_PATTERNS.some((pattern) => pattern.test(text))) return true;
+  }
+  return false;
+}
+
+export function isAccountExhaustionStatus(status, body, account = null) {
+  return apiProviderExhaustionReason(status, body, account) != null;
+}

@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
-import https from "node:https";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -16,12 +15,20 @@ import {
   createClaudeResponsesSseTransformStream,
   prepareClaudeResponsesBridge,
   retargetClaudeResponsesBridge,
-  translateResponsesResponseToClaude
+  translateResponsesResponseToClaude,
+  prepareClaudeChatBridge
 } from "./claude-responses-bridge.mjs";
 import {
+  prepareChatResponsesBridge,
+  translateChatResponseToResponses,
+  translateResponsesResponseToChat
+} from "./chat-responses-bridge.mjs";
+import {
   apiProviderExhaustionReason,
+  detectSourceShapeFromUrl,
   apiProviderTransientRetryReason,
-  isInvalidEncryptedContentBody
+  isInvalidEncryptedContentBody,
+  WIRE_SHAPES
 } from "./provider-policy.mjs";
 import {
   createSseResponseTransformStream,
@@ -31,8 +38,39 @@ import {
   isResponsesProxyTarget,
   repairProviderProxyBodyPlaintext,
   rewriteProviderProxyRequestBody,
-  runLocalCompactionFallback
+  runLocalCompactionFallback,
+  summarizeViaShape
 } from "./proxy-transforms.mjs";
+import {
+  isProviderProxyLoopbackRequest,
+  writeProviderProxyControlResponse,
+  stripHopByHopHeaders,
+  stripProxyResponseHeaders,
+  isAllowedCloudflareCookieName,
+  cookieNameFromSetCookie,
+  responseSetCookieHeaders,
+  writeProxyError,
+  writeProxySocketError,
+  writeProxySocketResponseHead,
+  bindProxySocketTunnel,
+  sanitizeProxyRequestHeaders as _sanitizeProxyRequestHeaders
+} from "./provider-proxy-http.mjs";
+import {
+  providerProxyGroupId,
+  codexHomeFromProviderProxyGroupId,
+  providerProxyBaseUrl,
+  providerProxyAccountBaseUrl,
+  providerProxyHealthUrl,
+  isProviderProxyBaseUrl,
+  isTransientApiFailureStatus,
+  proxyRequestTargetUrl,
+  isClaudeMessagesTarget,
+  isOfficialClaudeModel,
+  providerProxyRouteFromIncoming,
+  shapeUrlFor
+} from "./provider-proxy-routing.mjs";
+import { createEndpointChainPlanner, shapeName } from "./endpoint-chain.mjs";
+import { handleProviderProxyUpgrade } from "./provider-proxy-upgrade.mjs";
 import { ensureDir, userHome } from "./storage.mjs";
 
 const providerProxyScriptPath = fileURLToPath(new URL("../bin/codex-auth-advanced.js", import.meta.url));
@@ -60,7 +98,15 @@ export function createProviderProxy(options) {
   const streamStallWatchdogMs = Math.max(0, Number(options.streamStallWatchdogMs) || 0);
   const officialAnthropicBaseUrl = String(options.officialAnthropicBaseUrl || "https://api.anthropic.com").replace(/\/+$/, "");
 
-  const chatgptCloudflareCookies = new Map();
+  const chatgptCloudflareCookies = new Map();  function captureChatgptCloudflareCookies(headers) {
+    for (const header of responseSetCookieHeaders(headers)) {
+      const name = cookieNameFromSetCookie(header);
+      if (!name || !isAllowedCloudflareCookieName(name)) continue;
+      const value = String(header).split(";", 1)[0]?.trim();
+      if (value) chatgptCloudflareCookies.set(name, value);
+    }
+  }
+
   const claudeGatewayCatalogCache = new Map();
   const claudeGatewayCatalogCacheTtlMs = 5 * 60 * 1000;
   let providerProxyServer = null;
@@ -70,46 +116,16 @@ export function createProviderProxy(options) {
   let providerProxyActiveRequests = 0;
   let providerProxyActiveUpgrades = 0;
 
-  function providerProxyGroupId(codexHome) {
-    return Buffer.from(path.resolve(codexHome), "utf8").toString("base64url");
-  }
 
-  function codexHomeFromProviderProxyGroupId(groupId) {
-    return Buffer.from(String(groupId || ""), "base64url").toString("utf8");
-  }
 
-  function providerProxyBaseUrl(codexHome) {
-    return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`;
-  }
 
-  function providerProxyAccountBaseUrl(codexHome, account) {
-    const accountKey = typeof account?.account_key === "string" ? account.account_key.trim() : "";
-    if (!accountKey) return null;
-    return `${providerProxyBaseUrl(codexHome)}/accounts/${encodeURIComponent(accountKey)}/v1`;
-  }
 
-  function providerProxyHealthUrl() {
-    return `http://${providerProxyHost}:${providerProxyPort}${providerProxyPrefix}/health`;
-  }
 
   function providerProxyActiveOperationCount() {
     return providerProxyActiveRequests + providerProxyActiveUpgrades;
   }
 
-  function isProviderProxyLoopbackRequest(req) {
-    const address = String(req.socket?.remoteAddress || "");
-    return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
-  }
 
-  function writeProviderProxyControlResponse(res, status, payload, extraHeaders = {}) {
-    const body = JSON.stringify(payload);
-    res.writeHead(status, {
-      "content-type": "application/json",
-      "content-length": Buffer.byteLength(body),
-      ...extraHeaders
-    });
-    res.end(body);
-  }
 
   function providerProxyHealthPayload() {
     return {
@@ -165,77 +181,25 @@ export function createProviderProxy(options) {
     socket.once("error", release);
   }
 
-  function isProviderProxyBaseUrl(baseUrl) {
-    try {
-      const parsed = new URL(String(baseUrl || ""));
-      const expectedPort = String(providerProxyPort);
-      const actualPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-      return parsed.hostname === providerProxyHost
-        && actualPort === expectedPort
-        && parsed.pathname.startsWith(`${providerProxyPrefix}/`);
-    } catch {
-      return false;
-    }
-  }
 
-  function isTransientApiFailureStatus(status) {
-    return status === 502 || status === 503 || status === 504 || status === 524;
-  }
 
-  function proxyRequestTargetUrl(req, codexHome, target, routePath = `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`) {
-    const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
-    let rest = incoming.pathname.startsWith(routePath)
-      ? incoming.pathname.slice(routePath.length)
-      : incoming.pathname;
-    if (!rest.startsWith("/")) rest = `/${rest}`;
-    if (rest === "/") rest = "";
-
-    const requestedV1 = rest === "/v1" || rest.startsWith("/v1/");
-    if (requestedV1) {
-      rest = rest === "/v1" ? "" : rest.slice(3);
-    }
-
-    const isTargetNeedV1 = requestedV1 || rest === "/responses" || rest.startsWith("/responses/") || rest === "/chat/completions" || rest.startsWith("/chat/completions/");
-    if (isTargetNeedV1 && target.upstreamBaseUrl && !target.upstreamBaseUrl.includes("/v1")) {
-      rest = `/v1${rest}`;
-    }
-
-    return {
-      ...target,
-      url: `${target.upstreamBaseUrl}${rest}${incoming.search}`
-    };
-  }
 
   function targetUrlForProxyRequest(req, route) {
     const target = route.accountSelector
       ? pinnedApiProxyTarget(route.codexHome, route.accountSelector)
       : activeApiProxyTarget(route.codexHome);
     if (target.error) return target;
-    return proxyRequestTargetUrl(req, route.codexHome, target, route.pathPrefix);
+    return proxyRequestTargetUrl(req, route.codexHome, target, route.pathPrefix, providerProxyHost, providerProxyPort);
   }
 
   function officialAnthropicTargetForProxyRequest(req, route) {
     return proxyRequestTargetUrl(req, route.codexHome, {
       upstreamBaseUrl: officialAnthropicBaseUrl,
       officialAnthropic: true
-    }, route.pathPrefix);
+    }, route.pathPrefix, providerProxyHost, providerProxyPort);
   }
 
-  function isClaudeMessagesTarget(target) {
-    try {
-      const pathname = new URL(target?.url || "").pathname.replace(/\/$/, "");
-      return pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/messages/count_tokens");
-    } catch {
-      return false;
-    }
-  }
 
-  function isOfficialClaudeModel(model) {
-    const normalized = String(model || "").trim().toLowerCase().replace(/\[1m\]$/i, "");
-    if (!normalized || isVsllmClaudeGatewayModel(model)) return false;
-    return /^(claude|anthropic)-/.test(normalized)
-      || ["default", "best", "fable", "fable-5", "opus", "sonnet", "haiku", "opusplan"].includes(normalized);
-  }
 
   async function modelsFromProvider(req, target) {
     try {
@@ -276,169 +240,17 @@ export function createProviderProxy(options) {
     return catalog;
   }
 
-  function providerProxyRouteFromIncoming(incoming) {
-    const pathMatch = incoming.pathname.match(new RegExp(`^${providerProxyPrefix.replaceAll("/", "\\/")}\\/([^/]+)(?:\\/|$)`));
-    if (!pathMatch) {
-      return { error: "Unknown codex-auth-advanced proxy route.", status: 404 };
-    }
 
-    const groupId = pathMatch[1];
-    let codexHome = "";
-    try {
-      codexHome = codexHomeFromProviderProxyGroupId(groupId);
-    } catch {
-      return { error: "Invalid codex-auth-advanced proxy group id.", status: 400 };
-    }
 
-    const groupPath = `${providerProxyPrefix}/${groupId}`;
-    const remainder = incoming.pathname.slice(groupPath.length);
-    if (remainder === "/accounts" || remainder.startsWith("/accounts/")) {
-      const accountMatch = remainder.match(/^\/accounts\/([^/]+)(?:\/|$)/);
-      if (!accountMatch) {
-        return { error: "Pinned proxy routes require an account key or alias after /accounts/.", status: 400 };
-      }
 
-      let accountSelector = "";
-      try {
-        accountSelector = decodeURIComponent(accountMatch[1]).trim();
-      } catch {
-        return { error: "Invalid encoded account selector in pinned proxy route.", status: 400 };
-      }
-      if (!accountSelector || accountSelector.includes("/")) {
-        return { error: "Invalid pinned proxy account selector.", status: 400 };
-      }
 
-      return {
-        codexHome,
-        accountSelector,
-        pathPrefix: `${groupPath}/accounts/${accountMatch[1]}`
-      };
-    }
 
-    return { codexHome, accountSelector: null, pathPrefix: groupPath };
-  }
-
-  function stripHopByHopHeaders(headers) {
-    const out = {};
-    for (const [key, value] of Object.entries(headers || {})) {
-      if (Array.isArray(value)) out[key] = value.join(", ");
-      else if (value != null) out[key] = String(value);
-    }
-    for (const name of [
-      "connection",
-      "keep-alive",
-      "proxy-authenticate",
-      "proxy-authorization",
-      "te",
-      "trailer",
-      "transfer-encoding",
-      "upgrade",
-      "host",
-      "content-length"
-    ]) {
-      delete out[name];
-    }
-    return out;
-  }
-
-  function stripProxyResponseHeaders(headers) {
-    const out = {};
-    headers.forEach((value, key) => {
-      const lower = key.toLowerCase();
-      if ([
-        "connection",
-        "content-encoding",
-        "content-length",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade"
-      ].includes(lower)) {
-        return;
-      }
-      out[key] = value;
-    });
-    return out;
-  }
-
-  function isAllowedCloudflareCookieName(name) {
-    return [
-      "__cf_bm",
-      "__cflb",
-      "__cfruid",
-      "__cfseq",
-      "__cfwaitingroom",
-      "_cfuvid",
-      "cf_clearance",
-      "cf_ob_info",
-      "cf_use_ob"
-    ].includes(name) || name.startsWith("cf_chl_");
-  }
-
-  function cookieNameFromSetCookie(header) {
-    const name = String(header || "").split("=", 1)[0]?.trim();
-    return name || null;
-  }
-
-  function responseSetCookieHeaders(headers) {
-    if (!headers) return [];
-    if (typeof headers.getSetCookie === "function") {
-      return headers.getSetCookie();
-    }
-    const setCookie = headers["set-cookie"] ?? headers["Set-Cookie"];
-    if (Array.isArray(setCookie)) return setCookie;
-    if (typeof setCookie === "string" && setCookie.length > 0) return [setCookie];
-    return [];
-  }
-
-  function captureChatgptCloudflareCookies(headers) {
-    for (const header of responseSetCookieHeaders(headers)) {
-      const name = cookieNameFromSetCookie(header);
-      if (!name || !isAllowedCloudflareCookieName(name)) continue;
-      const value = String(header).split(";", 1)[0]?.trim();
-      if (value) chatgptCloudflareCookies.set(name, value);
-    }
-  }
 
   function chatgptCloudflareCookieHeader() {
     return [...chatgptCloudflareCookies.values()].join("; ");
   }
 
-  function writeProxyError(res, status, message) {
-    if (res.destroyed || res.writableEnded) return false;
-    if (res.headersSent) {
-      try {
-        res.end();
-      } catch {
-        // The response is already closing; avoid a second writeHead attempt.
-      }
-      return false;
-    }
-    const body = JSON.stringify({ error: { message, type: "codex_auth_advanced_proxy" } });
-    res.writeHead(status, {
-      "content-type": "application/json",
-      "content-length": Buffer.byteLength(body)
-    });
-    res.end(body);
-    return true;
-  }
 
-  function writeProxySocketError(socket, status, message) {
-    if (socket.destroyed || !socket.writable) return;
-    const body = JSON.stringify({ error: { message, type: "codex_auth_advanced_proxy" } });
-    const statusMessage = http.STATUS_CODES[status] || "Error";
-    socket.end([
-      `HTTP/1.1 ${status} ${statusMessage}`,
-      "content-type: application/json",
-      `content-length: ${Buffer.byteLength(body)}`,
-      "connection: close",
-      "",
-      body
-    ].join("\r\n"));
-  }
 
   function sanitizeProxyRequestHeaders(headers, target, { websocket = false, omitContentEncoding = false } = {}) {
     const out = {};
@@ -612,108 +424,7 @@ export function createProviderProxy(options) {
     };
   }
 
-  function writeProxySocketResponseHead(socket, status, headers, { allowUpgrade = false } = {}) {
-    const statusMessage = http.STATUS_CODES[status] || "OK";
-    socket.write(`HTTP/1.1 ${status} ${statusMessage}\r\n`);
-    for (const [key, value] of Object.entries(headers || {})) {
-      const lower = key.toLowerCase();
-      if (lower === "host" || lower === "content-length" || lower === "keep-alive" || lower === "proxy-authenticate" || lower === "proxy-authorization" || lower === "te" || lower === "trailer" || lower === "transfer-encoding") {
-        continue;
-      }
-      if (!allowUpgrade && (lower === "connection" || lower === "upgrade")) continue;
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          if (item != null) socket.write(`${key}: ${item}\r\n`);
-        }
-        continue;
-      }
-      if (value != null) socket.write(`${key}: ${value}\r\n`);
-    }
-    socket.write("\r\n");
-  }
 
-  function bindProxySocketTunnel(clientSocket, upstreamSocket) {
-    const destroyPeer = (peer) => () => {
-      if (!peer.destroyed) peer.destroy();
-    };
-    clientSocket.on("error", destroyPeer(upstreamSocket));
-    upstreamSocket.on("error", destroyPeer(clientSocket));
-    clientSocket.on("close", destroyPeer(upstreamSocket));
-    upstreamSocket.on("close", destroyPeer(clientSocket));
-    clientSocket.pipe(upstreamSocket);
-    upstreamSocket.pipe(clientSocket);
-  }
-
-  async function handleProviderProxyUpgrade(req, socket, head) {
-    const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
-    if (incoming.pathname === `${providerProxyPrefix}/health`) {
-      writeProxySocketError(socket, 400, "WebSocket upgrades are not supported on the health route.");
-      return;
-    }
-
-    const route = providerProxyRouteFromIncoming(incoming);
-    if (route.error) {
-      writeProxySocketError(socket, route.status || 400, route.error);
-      return;
-    }
-
-    const target = targetUrlForProxyRequest(req, route);
-    if (target.error) {
-      writeProxySocketError(socket, target.status || 500, target.error);
-      return;
-    }
-    if (!target.chatgpt) {
-      writeProxySocketError(socket, 426, "WebSocket transport is not supported for API-key provider proxy targets.");
-      return;
-    }
-
-    try {
-      const upstreamUrl = new URL(target.url);
-      const headers = sanitizeProxyRequestHeaders(req.headers, target, { websocket: true });
-      const requestHeaders = {
-        ...headers,
-        host: upstreamUrl.host
-      };
-
-      const requestOptions = {
-        protocol: upstreamUrl.protocol,
-        hostname: upstreamUrl.hostname,
-        port: upstreamUrl.port,
-        method: req.method || "GET",
-        path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
-        headers: requestHeaders
-      };
-
-      const client = upstreamUrl.protocol === "https:" ? https : http;
-      const upstreamRequest = client.request(requestOptions);
-
-      upstreamRequest.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
-        if (target.chatgpt) {
-          captureChatgptCloudflareCookies(upstreamRes.headers);
-        }
-        writeProxySocketResponseHead(socket, upstreamRes.statusCode || 101, upstreamRes.headers, { allowUpgrade: true });
-        if (upstreamHead?.length) socket.write(upstreamHead);
-        if (head?.length) upstreamSocket.write(head);
-        bindProxySocketTunnel(socket, upstreamSocket);
-      });
-
-      upstreamRequest.on("response", (upstreamRes) => {
-        if (target.chatgpt) {
-          captureChatgptCloudflareCookies(upstreamRes.headers);
-        }
-        writeProxySocketResponseHead(socket, upstreamRes.statusCode || 500, upstreamRes.headers);
-        upstreamRes.pipe(socket);
-      });
-
-      upstreamRequest.on("error", (error) => {
-        writeProxySocketError(socket, 502, `Provider proxy request failed: ${error?.message || error}`);
-      });
-
-      upstreamRequest.end();
-    } catch (error) {
-      writeProxySocketError(socket, 502, `Provider proxy request failed: ${error?.message || error}`);
-    }
-  }
 
   async function handleProviderProxyRequest(req, res) {
     const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
@@ -746,7 +457,7 @@ export function createProviderProxy(options) {
 
     trackProviderProxyRequest(res);
 
-    const route = providerProxyRouteFromIncoming(incoming);
+    const route = providerProxyRouteFromIncoming(incoming, providerProxyPrefix);
     if (route.error) {
       writeProxyError(res, route.status || 400, route.error);
       return;
@@ -770,6 +481,7 @@ export function createProviderProxy(options) {
       }
       let body = await readProxyRequestBody(req);
       let upstream = null;
+      const originalSourceBody = body;
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
       const modelCapacityRetries = new Map();
@@ -836,6 +548,18 @@ export function createProviderProxy(options) {
         bodyAlreadyDecoded = true;
         console.log(`[Proxy] Bridging Claude Messages model ${claudeResponsesBridge.originalRequest.model} through OpenAI Responses.`);
       }
+      // Universal endpoint chain: detect the wire shape the client sent and
+      // walk per-account shape plans on transport failures before considering
+      // an account-level switch. Account switching still happens on balance
+      // exhaustion only; shape failover stays on the same account.
+      const sourceShape = detectSourceShapeFromUrl(incoming.pathname);
+      const planner = createEndpointChainPlanner({
+        sourceShape,
+        isCompact: isCompactProxyTarget(target),
+        requestUrl: req.url
+      });
+      planner.prime(target.account);
+      const isCompact = isCompactProxyTarget(target);
       while (true) {
         if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
         const targetLabel = target.officialAnthropic
@@ -987,30 +711,123 @@ export function createProviderProxy(options) {
         if (route.accountSelector && exhausted) {
           markApiAccountExhaustedFromProxy(route.codexHome, target.account, upstream.status, responseBody);
         }
-        const shouldFailOver = !route.accountSelector && (exhausted || transientRetryReason != null || isTransientApiFailureStatus(upstream.status));
-        if (!shouldFailOver) break;
-
-        const retryTarget = exhausted
-          ? await (async () => {
-            const switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, responseBody, {
-              excludeAccountKeys: attemptedAccountKeys,
-              force: exhaustionReason === "no_active_subscription" || exhaustionReason === "quota_exhausted" || exhaustionReason === "provider_limit"
-            });
-            return switched
-              ? targetUrlForProxyRequest(req, { ...route, accountSelector: null, pathPrefix: `${providerProxyPrefix}/${providerProxyGroupId(route.codexHome)}` })
-              : null;
-          })()
-          : await targetFromTransientApiFailure(route.codexHome, req, {
+        // Per-account wire-shape chain walker: try other supported shapes on
+        // the SAME account when the current shape failed with a shape-fallback
+        // status (transport error / 4xx/5xx indicating the wrong endpoint).
+        // Account switching happens only on balance exhaustion below.
+        let shapesForAccount = planner.shapesForAccount(target.account);
+        let shapeCursor = shapesForAccount.indexOf(target.responseFromShape || planner.sourceShape);
+        if (shapeCursor < 0) shapeCursor = shapesForAccount.indexOf(sourceShape);
+        if (shapeCursor < 0) shapeCursor = -1;
+        const isShapeFallback = planner.shouldFailOverToNextShape({ status: upstream?.status, body: responseBody });
+        if (!route.accountSelector && isShapeFallback && shapeCursor + 1 < shapesForAccount.length) {
+          const nextShape = shapesForAccount[shapeCursor + 1];
+          if (nextShape) {
+            const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+            console.warn(`[Proxy] ${label} returned status ${upstream?.status}; trying next wire shape ${shapeName(nextShape)}.`);
+            // Compact requests need a special summarization call for non-Responses
+            // shapes; the upstream does not understand the encrypted_content /
+            // compaction_trigger envelope, so summarizeViaShape builds a fresh
+            // one-shot prompt and wraps the result back into Codex compact format.
+            if (isCompact && nextShape !== WIRE_SHAPES.RESPONSES) {
+              const summarized = await summarizeViaShape({
+                shape: nextShape,
+                target,
+                body: originalSourceBody,
+                headers: req.headers,
+                alreadyDecoded: true,
+                sanitizeRequestHeaders: sanitizeProxyRequestHeaders,
+                options: { originalModel: originalRequestModel }
+              });
+              if (summarized) {
+                upstream = summarized;
+                break;
+              }
+              // Fall through to advance to next shape on the next iteration.
+              continue;
+            }
+            // Non-compact chain advancement: retarget the URL to the next
+            // shape's endpoint on the same upstream. The body is sent
+            // unchanged; the upstream responds in the new shape's format and
+            // the response is forwarded to the client as-is (the upstream
+            // already speaks the right wire protocol).
+            const retargetUrl = shapeUrlFor(target.upstreamBaseUrl, nextShape);
+            if (retargetUrl) {
+              target = { ...target, url: retargetUrl };
+              target.responseFromShape = nextShape;
+              target.responseToShape = sourceShape;
+              continue;
+            }
+            continue;
+          }
+        }
+        // Account-level failover: only on hard exhaustion OR a per-account
+        // API-key restriction (the key itself is blocked, not the server).
+        // Transport / shape failures stay on the same account (handled by the
+        // chain walker above). API-key restriction is transient for the
+        // REGISTRY (no persistent switch / no exhaust) but the current
+        // request still tries the next account without touching the stored
+        // active account. Bounded transient retries (model_capacity / vsllm
+        // usage limit) on the SAME account falling through the shape chain
+        // also need a transient-only failover to keep the request alive.
+        const transientExhausted = (transientRetryReason === "model_capacity" || transientRetryReason === "vsllm_usage_limit");
+        const shouldFailOverAccount = !route.accountSelector
+          && (exhausted || transientRetryReason === "api_key_restriction" || transientExhausted);
+        if (!shouldFailOverAccount) break;
+        let switched = false;
+        if (exhausted) {
+          switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, responseBody, {
+            excludeAccountKeys: attemptedAccountKeys,
+            force: exhaustionReason === "no_active_subscription" || exhaustionReason === "quota_exhausted" || exhaustionReason === "provider_limit"
+          });
+        } else {
+          // Transient per-key / per-request failover: pick another account
+          // for THIS request only; do not mutate the registry's active
+          // account or mark any account as exhausted.
+          const transientTarget = await targetFromTransientApiFailure(route.codexHome, req, {
             excludeAccountKeys: attemptedAccountKeys
           });
-        if (!retryTarget) break;
-        if (retryTarget.error || retryTarget.account?.account_key === target.account?.account_key || attemptedAccountKeys.has(retryTarget.account?.account_key)) {
-          break;
+          if (transientTarget) {
+            target = retargetClaudeResponsesBridge(transientTarget, claudeResponsesBridge);
+            continue;
+          }
         }
-        target = retargetClaudeResponsesBridge(retryTarget, claudeResponsesBridge);
+        if (!switched) break;
+        if (!switched) break;
+        const newTarget = targetUrlForProxyRequest(req, { ...route, accountSelector: null, pathPrefix: `${providerProxyPrefix}/${providerProxyGroupId(route.codexHome)}` });
+        if (!newTarget || newTarget.error || attemptedAccountKeys.has(newTarget.account?.account_key) || newTarget.account?.account_key === target.account?.account_key) break;
+        target = retargetClaudeResponsesBridge(newTarget, claudeResponsesBridge);
       }
 
       console.log(`[Proxy Response] ${req.url} -> status: ${upstream.status}`);
+      // Per-shape response translation: when the chain walker retargeted a
+      // Responses-source request to /v1/chat/completions or /v1/messages on
+      // the same upstream, the response body is in the new shape's format.
+      // Translate it back to the source shape so the caller sees what it
+      // expected.
+      if (target.responseFromShape && target.responseToShape
+        && upstream.status >= 200 && upstream.status < 300
+        && target.responseFromShape !== target.responseToShape
+        && !String(upstream.headers.get("content-type") || "").toLowerCase().includes("event-stream")) {
+        try {
+          const rawBody = await upstream.text();
+          let translated = null;
+          if (target.responseFromShape === "chat_completions" && target.responseToShape === "responses") {
+            translated = translateChatResponseToResponses(JSON.parse(rawBody));
+          }
+          if (translated != null) {
+            const outBody = Buffer.from(JSON.stringify(translated), "utf8");
+            const headers = stripProxyResponseHeaders(upstream.headers);
+            headers["content-type"] = "application/json";
+            headers["content-length"] = String(outBody.length);
+            res.writeHead(upstream.status, headers);
+            res.end(outBody);
+            return;
+          }
+        } catch (e) {
+          console.warn(`[Proxy] shape response translation failed: ${e?.message || e}`);
+        }
+      }
       if (!upstream.body) {
         res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
         res.end();
@@ -1178,7 +995,12 @@ export function createProviderProxy(options) {
         return;
       }
       trackProviderProxyUpgrade(socket);
-      handleProviderProxyUpgrade(req, socket, head).catch((error) => {
+      const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
+      const route = providerProxyRouteFromIncoming(incoming, providerProxyPrefix);
+      const target = route.error ? { error: route.error, status: route.status } : targetUrlForProxyRequest(req, route);
+      handleProviderProxyUpgrade({
+        req, socket, head, target, route, captureChatgptCloudflareCookies
+      }).catch((error) => {
         writeProxySocketError(socket, 500, `Provider proxy crashed: ${error?.message || error}`);
       });
     });
@@ -1204,7 +1026,7 @@ export function createProviderProxy(options) {
 
   async function providerProxyIsRunning() {
     try {
-      const response = await fetch(providerProxyHealthUrl(), { signal: AbortSignal.timeout(700) });
+      const response = await fetch(providerProxyHealthUrl(providerProxyHost, providerProxyPort, providerProxyPrefix), { signal: AbortSignal.timeout(700) });
       return response.status === 200;
     } catch {
       return false;
@@ -1239,18 +1061,18 @@ export function createProviderProxy(options) {
         return true;
       }
     }
-    if (!quiet) process.stderr.write(`Warning: provider proxy did not respond at ${providerProxyHealthUrl()}.\n`);
+    if (!quiet) process.stderr.write(`Warning: provider proxy did not respond at ${providerProxyHealthUrl(providerProxyHost, providerProxyPort, providerProxyPrefix)}.\n`);
     return false;
   }
 
   return {
     groupId: providerProxyGroupId,
-    baseUrl: providerProxyBaseUrl,
-    accountBaseUrl: providerProxyAccountBaseUrl,
-    healthUrl: providerProxyHealthUrl,
-    isBaseUrl: isProviderProxyBaseUrl,
-    proxyRequestTargetUrl,
-    routeFromIncoming: providerProxyRouteFromIncoming,
+    baseUrl: (codexHome) => providerProxyBaseUrl(providerProxyHost, providerProxyPort, providerProxyPrefix, codexHome),
+    accountBaseUrl: (codexHome, account) => providerProxyAccountBaseUrl(providerProxyHost, providerProxyPort, providerProxyPrefix, codexHome, account),
+    healthUrl: () => providerProxyHealthUrl(providerProxyHost, providerProxyPort, providerProxyPrefix),
+    isBaseUrl: (url) => isProviderProxyBaseUrl(url, providerProxyHost, providerProxyPort, providerProxyPrefix),
+    proxyRequestTargetUrl: (req, codexHome, target, routePath) => proxyRequestTargetUrl(req, codexHome, target, routePath || `${providerProxyPrefix}/${providerProxyGroupId(codexHome)}`, providerProxyHost, providerProxyPort),
+    routeFromIncoming: (incoming) => providerProxyRouteFromIncoming(incoming, providerProxyPrefix),
     sanitizeRequestHeaders: sanitizeProxyRequestHeaders,
     startServer: startProviderProxyServer,
     isRunning: providerProxyIsRunning,
