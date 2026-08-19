@@ -589,10 +589,15 @@ const DEFAULT_SOURCE_CHAINS = Object.freeze({
     WIRE_SHAPES.MESSAGES,
     WIRE_SHAPES.ANTIGRAVITY
   ],
+  // Per-source priority as configured by the user:
+  //   * Codex (OpenAI Responses): responses -> chat -> messages -> antigravity
+  //   * Codex Chat (OpenAI Chat Completions): chat -> responses -> messages -> antigravity
+  //   * Claude Code (Anthropic Messages): messages -> responses -> chat -> antigravity
+  //   * Antigravity (Gemini): antigravity -> responses -> chat -> messages
   [WIRE_SHAPES.MESSAGES]: [
     WIRE_SHAPES.MESSAGES,
-    WIRE_SHAPES.CHAT_COMPLETIONS,
     WIRE_SHAPES.RESPONSES,
+    WIRE_SHAPES.CHAT_COMPLETIONS,
     WIRE_SHAPES.ANTIGRAVITY
   ],
   [WIRE_SHAPES.ANTIGRAVITY]: [

@@ -47,7 +47,8 @@ import {
   buildShapeBridge,
   retargetBridge,
   translateRequest as translateShapeRequest,
-  translateResponse as translateShapeResponse
+  translateResponse as translateShapeResponse,
+  createShapeSseTransformStream
 } from "./shape-translator.mjs";
 import {
   isProviderProxyLoopbackRequest,
@@ -790,22 +791,11 @@ export function createProviderProxy(options) {
               target = bridge.target;
               body = bridge.body;
               bodyAlreadyDecoded = true;
-              // On streaming requests, SSE translation across shapes is
-              // not implemented; the bridged shape serves a non-streaming
-              // call so the JSON response path can translate back to the
-              // source shape. Clients keep their stream=true at the wire.
-              if (requestIsStreaming && bridge.translatedRequest) {
-                bridge.translatedRequest = { ...bridge.translatedRequest, stream: false };
-                bridge.body = Buffer.from(JSON.stringify(bridge.translatedRequest), "utf8");
-                body = bridge.body;
-                // For antigravity, force non-streaming by retargeting the
-                // URL to :generateContent (not :streamGenerateContent).
-                if (bridge.kind === "antigravity" && bridge.target?.antigravityStream) {
-                  const nonStreamUrl = bridge.target.url.replace(":streamGenerateContent", ":generateContent");
-                  bridge.target = { ...bridge.target, url: nonStreamUrl, antigravityStream: false };
-                  target = bridge.target;
-                }
-              }
+              // SSE translation across shapes is now implemented
+              // (createShapeSseTransformStream). Streaming requests stay
+              // streaming on the bridged shape; the response path picks
+              // the right transform based on responseFromShape /
+              // responseToShape.
               target.responseFromShape = nextShape;
               target.responseToShape = sourceShape;
               target.shapeBridge = bridge;
@@ -945,11 +935,23 @@ export function createProviderProxy(options) {
         diagnostics.finish(reason);
       };
       responseStream.on("error", () => finishDiagnostics("source_error"));
+      // Cross-shape SSE translation: when the chain walker retargeted the
+      // request to a different wire shape, the response is streamed in the
+      // new shape's event format. Translate it back to the source shape.
+      const shapeBridge = target.shapeBridge;
+      const sseBridge = (shapeBridge && target.responseFromShape && target.responseToShape
+        && target.responseFromShape !== target.responseToShape
+        && contentType.includes("event-stream"))
+        ? shapeBridge
+        : null;
+      const sseTransform = sseBridge ? createShapeSseTransformStream(sseBridge) : null;
       if (claudeResponsesBridge?.kind === "responses" && contentType.includes("event-stream")) {
         responseStream = responseStream.pipe(createClaudeResponsesSseTransformStream(
           claudeResponsesBridge.originalRequest,
           diagnostics
         ));
+      } else if (sseTransform) {
+        responseStream = responseStream.pipe(sseTransform);
       } else if (shouldTransformOpenAiResponse) {
         responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream"), diagnostics));
       }
