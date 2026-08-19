@@ -16,12 +16,14 @@ import {
   prepareClaudeResponsesBridge,
   retargetClaudeResponsesBridge,
   translateResponsesResponseToClaude,
-  prepareClaudeChatBridge
+  prepareClaudeChatBridge,
+  translateMessagesResponseToResponses
 } from "./claude-responses-bridge.mjs";
 import {
   prepareChatResponsesBridge,
   translateChatResponseToResponses,
-  translateResponsesResponseToChat
+  translateResponsesResponseToChat,
+  chatTargetFromResponsesTarget
 } from "./chat-responses-bridge.mjs";
 import {
   apiProviderExhaustionReason,
@@ -41,6 +43,10 @@ import {
   runLocalCompactionFallback,
   summarizeViaShape
 } from "./proxy-transforms.mjs";
+import {
+  prepareAntigravityBridge,
+  translateAntigravityResponseToShape
+} from "./antigravity-bridge.mjs";
 import {
   isProviderProxyLoopbackRequest,
   writeProviderProxyControlResponse,
@@ -560,6 +566,99 @@ export function createProviderProxy(options) {
       });
       planner.prime(target.account);
       const isCompact = isCompactProxyTarget(target);
+
+      // Universal shape bridge dispatcher. Given the current target and the
+      // next shape to try, translates the request body into that shape's
+      // wire format and returns {target, body} for the chain walker to use.
+      async function prepareShapeBridge({ target: curTarget, nextShape, sourceShape: srcShape, sourceBody, originalRequest: origReq }) {
+        const baseUrl = curTarget.upstreamBaseUrl;
+        if (!baseUrl) return null;
+        if (srcShape === WIRE_SHAPES.RESPONSES && nextShape === WIRE_SHAPES.CHAT_COMPLETIONS) {
+          const chatUrl = shapeUrlFor(baseUrl, WIRE_SHAPES.CHAT_COMPLETIONS);
+          if (!chatUrl) return null;
+          const parsed = parseProxyBody(sourceBody);
+          if (!parsed) return null;
+          const messages = (parsed.input || [])
+            .filter((item) => item?.type === "message")
+            .map((m) => ({
+              role: m.role === "assistant" ? "assistant" : "user",
+              content: Array.isArray(m.content) ? m.content.map((p) => p.text || "").join("\n") : (typeof m.content === "string" ? m.content : "")
+            }));
+          const chatPayload = {
+            model: parsed.model,
+            messages,
+            stream: parsed.stream === true
+          };
+          return {
+            target: { ...curTarget, url: chatUrl },
+            body: Buffer.from(JSON.stringify(chatPayload), "utf8"),
+            sourceShape: srcShape,
+            nextShape,
+            originalRequest: origReq
+          };
+        }
+        if (srcShape === WIRE_SHAPES.RESPONSES && nextShape === WIRE_SHAPES.MESSAGES) {
+          const messagesUrl = shapeUrlFor(baseUrl, WIRE_SHAPES.MESSAGES);
+          if (!messagesUrl) return null;
+          const parsed = parseProxyBody(sourceBody);
+          if (!parsed) return null;
+          const messages = (parsed.input || [])
+            .filter((item) => item?.type === "message")
+            .map((m) => ({
+              role: m.role === "assistant" ? "assistant" : "user",
+              content: Array.isArray(m.content) ? m.content.map((p) => p.text || "").join("\n") : (typeof m.content === "string" ? m.content : "")
+            }));
+          const messagesPayload = {
+            model: parsed.model,
+            max_tokens: 4096,
+            messages
+          };
+          return {
+            target: { ...curTarget, url: messagesUrl },
+            body: Buffer.from(JSON.stringify(messagesPayload), "utf8"),
+            sourceShape: srcShape,
+            nextShape,
+            originalRequest: origReq
+          };
+        }
+        if (srcShape === WIRE_SHAPES.RESPONSES && nextShape === WIRE_SHAPES.ANTIGRAVITY) {
+          const agBridge = prepareAntigravityBridge(
+            { ...curTarget, url: shapeUrlFor(baseUrl, WIRE_SHAPES.RESPONSES) },
+            sourceBody
+          );
+          if (!agBridge || agBridge.kind !== "antigravity") return null;
+          return {
+            target: agBridge.target,
+            body: agBridge.body,
+            sourceShape: srcShape,
+            nextShape,
+            originalRequest: agBridge.originalRequest,
+            geminiRequest: agBridge.translatedRequest
+          };
+        }
+        return null;
+      }
+
+      // Universal response translator: converts a response body in fromShape
+      // into the source shape's format.
+      async function translateShapeResponseToSource({ rawBody, fromShape, toShape, sourceBody, bridge }) {
+        if (!rawBody) return null;
+        let parsed = null;
+        try { parsed = JSON.parse(rawBody); } catch { return null; }
+        if (fromShape === toShape) return parsed;
+        if (fromShape === WIRE_SHAPES.CHAT_COMPLETIONS && toShape === WIRE_SHAPES.RESPONSES) {
+          return translateChatResponseToResponses(parsed);
+        }
+        if (fromShape === WIRE_SHAPES.MESSAGES && toShape === WIRE_SHAPES.RESPONSES) {
+          return translateMessagesResponseToResponses(parsed, parseProxyBody(sourceBody) || {});
+        }
+        if (fromShape === WIRE_SHAPES.ANTIGRAVITY && toShape === WIRE_SHAPES.RESPONSES) {
+          const translated = translateAntigravityResponseToShape(parsed, WIRE_SHAPES.RESPONSES, bridge?.originalRequest || {});
+          return translated?.body || null;
+        }
+        return null;
+      }
+
       while (true) {
         if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
         const targetLabel = target.officialAnthropic
@@ -746,16 +845,23 @@ export function createProviderProxy(options) {
               // Fall through to advance to next shape on the next iteration.
               continue;
             }
-            // Non-compact chain advancement: retarget the URL to the next
-            // shape's endpoint on the same upstream. The body is sent
-            // unchanged; the upstream responds in the new shape's format and
-            // the response is forwarded to the client as-is (the upstream
-            // already speaks the right wire protocol).
-            const retargetUrl = shapeUrlFor(target.upstreamBaseUrl, nextShape);
-            if (retargetUrl) {
-              target = { ...target, url: retargetUrl };
+            // Non-compact chain advancement: translate the request body into
+            // the next shape's wire format and retarget the URL. The response
+            // is translated back to the source shape below.
+            const bridge = await prepareShapeBridge({
+              target,
+              nextShape,
+              sourceShape,
+              sourceBody: originalSourceBody,
+              originalRequest
+            });
+            if (bridge) {
+              target = bridge.target;
+              body = bridge.body;
+              bodyAlreadyDecoded = true;
               target.responseFromShape = nextShape;
               target.responseToShape = sourceShape;
+              target.shapeBridge = bridge;
               continue;
             }
             continue;
@@ -811,10 +917,13 @@ export function createProviderProxy(options) {
         && !String(upstream.headers.get("content-type") || "").toLowerCase().includes("event-stream")) {
         try {
           const rawBody = await upstream.text();
-          let translated = null;
-          if (target.responseFromShape === "chat_completions" && target.responseToShape === "responses") {
-            translated = translateChatResponseToResponses(JSON.parse(rawBody));
-          }
+          const translated = await translateShapeResponseToSource({
+            rawBody,
+            fromShape: target.responseFromShape,
+            toShape: target.responseToShape,
+            sourceBody: originalSourceBody,
+            bridge: target.shapeBridge
+          });
           if (translated != null) {
             const outBody = Buffer.from(JSON.stringify(translated), "utf8");
             const headers = stripProxyResponseHeaders(upstream.headers);
