@@ -423,10 +423,13 @@ function extractCompactConversationText(parsed) {
     }
   }
   const trimmed = text.trim();
-  const maxSafeChars = 300000;
+  // Keep the summarization prompt small enough that even the slowest upstream
+  // finishes within the proxy watchdog. 80k chars is comfortably under the
+  // budget for a structured summary and ~3-4x faster to summarize end-to-end.
+  const maxSafeChars = 80000;
   if (trimmed.length > maxSafeChars) {
-    const headChars = 60000;
-    const tailChars = 240000;
+    const headChars = 20000;
+    const tailChars = 60000;
     return `${trimmed.slice(0, headChars)}\n\n...[intermediate conversation history omitted for compaction budget]...\n\n${trimmed.slice(-tailChars)}`;
   }
   return trimmed;
@@ -719,11 +722,17 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
 
       if (responsesRes.status === 200) {
         const responsesData = await responsesRes.json().catch(() => null);
-        const extracted = responsesData?.output?.[0]?.content?.[0]?.text
-          || responsesData?.output?.[0]?.text
-          || "";
-        const text = String(extracted).trim();
-        if (text) return text;
+        const firstOutput = Array.isArray(responsesData?.output) ? responsesData.output[0] : null;
+        const firstContent = Array.isArray(firstOutput?.content) ? firstOutput.content[0] : null;
+        // The upstream honored the compaction trigger if and only if the first
+        // output item is itself a compaction item. A regular `message` output
+        // means the upstream ignored the trigger (e.g. llmapi today) and we
+        // must fall back to chat completions to get a real summary.
+        if (firstOutput?.type === "compaction") {
+          const extracted = firstContent?.text || firstOutput?.text || "";
+          const text = String(extracted).trim();
+          if (text) return text;
+        }
       } else {
         const errText = await responsesRes.text().catch(() => "");
         console.warn(`[Proxy Local Compaction] responses endpoint with model ${fallbackModel} returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
