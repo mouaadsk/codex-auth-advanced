@@ -658,6 +658,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     console.error(`[Proxy Local Compaction] No conversation text found in compact payload.`);
     return null;
   }
+  console.log(`[Proxy Local Compaction Debug] fallbackModel=${fallbackModel}, parsedModel=${parsed?.model}, originalModel=${options.originalModel}, textLen=${conversationText.length}`);
   const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
 
   const completionBody = applyReasoningEffort({
@@ -670,66 +671,86 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
 
   let summaryText = "";
   const preferResponsesFirst = target?.account?.api_template === "llmapi";
+  const candidateModels = [
+    fallbackModel,
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.4-mini"
+  ].filter((m, idx, arr) => Boolean(m) && typeof m === "string" && arr.indexOf(m) === idx);
 
   async function trySummarizeViaResponses() {
     if (!target.upstreamBaseUrl) return "";
-    try {
-      const responsesUrl = `${target.upstreamBaseUrl.replace(/\/+$/, "")}/responses`;
-      console.log(`[Proxy Local Compaction] Attempting summarization on ${responsesUrl}...`);
-      const responsesRes = await fetch(responsesUrl, {
-        method: "POST",
-        headers: {
-          ...authHeaders,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: fallbackModel,
-          input: [
-            { role: "user", content: [{ type: "text", text: `${summarizeSystemPrompt}\n\n${userPrompt}` }] }
-          ],
-          max_output_tokens: 1000
-        }),
-        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
-      });
+    const responsesUrl = `${target.upstreamBaseUrl.replace(/\/+$/, "")}/responses`;
+    for (const modelToTry of candidateModels) {
+      try {
+        console.log(`[Proxy Local Compaction] Attempting summarization on ${responsesUrl} with model ${modelToTry}...`);
+        const responsesRes = await fetch(responsesUrl, {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: modelToTry,
+            input: [
+              { role: "user", content: [{ type: "text", text: `${summarizeSystemPrompt}\n\n${userPrompt}` }] }
+            ],
+            max_output_tokens: 1000
+          }),
+          signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+        });
 
-      if (responsesRes.status === 200) {
-        const responsesData = await responsesRes.json().catch(() => null);
-        const extracted = responsesData?.output?.[0]?.content?.[0]?.text
-          || responsesData?.output?.[0]?.text
-          || "";
-        return String(extracted).trim();
-      } else {
-        const errText = await responsesRes.text().catch(() => "");
-        console.warn(`[Proxy Local Compaction] responses endpoint returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
+        if (responsesRes.status === 200) {
+          const responsesData = await responsesRes.json().catch(() => null);
+          const extracted = responsesData?.output?.[0]?.content?.[0]?.text
+            || responsesData?.output?.[0]?.text
+            || "";
+          const text = String(extracted).trim();
+          if (text) return text;
+        } else {
+          const errText = await responsesRes.text().catch(() => "");
+          console.warn(`[Proxy Local Compaction] responses endpoint with model ${modelToTry} returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
+        }
+      } catch (err) {
+        console.warn(`[Proxy Local Compaction] responses endpoint with model ${modelToTry} failed: ${err.message}`);
       }
-    } catch (err) {
-      console.warn(`[Proxy Local Compaction] responses endpoint failed: ${err.message}`);
     }
     return "";
   }
 
   async function trySummarizeViaCompletions() {
     if (!completionsUrl) return "";
-    try {
-      console.log(`[Proxy Local Compaction] Attempting summarization on ${completionsUrl}...`);
-      const res = await fetch(completionsUrl, {
-        method: "POST",
-        headers: {
-          ...authHeaders,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(completionBody),
-        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+    for (const modelToTry of candidateModels) {
+      const currentCompletionBody = applyReasoningEffort({
+        model: modelToTry,
+        messages: [
+          { role: "system", content: summarizeSystemPrompt },
+          { role: "user", content: userPrompt }
+        ]
       });
+      try {
+        console.log(`[Proxy Local Compaction] Attempting summarization on ${completionsUrl} with model ${modelToTry}...`);
+        const res = await fetch(completionsUrl, {
+          method: "POST",
+          headers: {
+            ...authHeaders,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(currentCompletionBody),
+          signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+        });
 
-      if (res.status === 200) {
-        return (await readChatCompletionSummary(res)).trim();
-      } else {
-        const errText = await res.text().catch(() => "");
-        console.warn(`[Proxy Local Compaction] completions endpoint returned status ${res.status}: ${errText.slice(0, 150)}`);
+        if (res.status === 200) {
+          const text = (await readChatCompletionSummary(res)).trim();
+          if (text) return text;
+        } else {
+          const errText = await res.text().catch(() => "");
+          console.warn(`[Proxy Local Compaction] completions endpoint with model ${modelToTry} returned status ${res.status}: ${errText.slice(0, 150)}`);
+        }
+      } catch (err) {
+        console.warn(`[Proxy Local Compaction] completions endpoint with model ${modelToTry} failed: ${err.message}`);
       }
-    } catch (err) {
-      console.warn(`[Proxy Local Compaction] completions endpoint failed: ${err.message}`);
     }
     return "";
   }
