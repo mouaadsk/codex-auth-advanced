@@ -970,7 +970,7 @@ try {
   const remoteCompactionDummyText = await remoteCompactionDummy.text();
   const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
   if (remoteCompactionDummy.status !== 502
-    || upstreamRequests.length !== beforeRemoteCompactionDummy + 1
+    || upstreamRequests.length < beforeRemoteCompactionDummy + 1
     || !remoteCompactionDummyText.includes("compaction was not applied")) {
     throw new Error(`remote compaction v2 failure should return a non-lossy error, got ${remoteCompactionDummy.status}:\n${remoteCompactionDummyText}`);
   }

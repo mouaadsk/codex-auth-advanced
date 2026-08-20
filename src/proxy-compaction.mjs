@@ -668,6 +668,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     ]
   });
 
+  let summaryText = "";
   try {
     const res = await fetch(completionsUrl, {
       method: "POST",
@@ -679,19 +680,57 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
     });
 
-    if (res.status !== 200) {
+    if (res.status === 200) {
+      summaryText = (await readChatCompletionSummary(res)).trim();
+    } else {
       const errText = await res.text().catch(() => "");
-      console.error(`[Proxy Local Compaction] completions endpoint failed with status ${res.status}: ${errText.slice(0, 200)}`);
-      return null;
+      console.warn(`[Proxy Local Compaction] completions endpoint returned status ${res.status}: ${errText.slice(0, 150)}`);
     }
+  } catch (err) {
+    console.warn(`[Proxy Local Compaction] completions endpoint failed: ${err.message}`);
+  }
 
-    const summaryText = await readChatCompletionSummary(res);
-    if (!summaryText.trim()) {
-      console.error(`[Proxy Local Compaction] completions endpoint returned an empty summary.`);
-      return null;
+  if (!summaryText && target.upstreamBaseUrl) {
+    try {
+      const responsesUrl = `${target.upstreamBaseUrl.replace(/\/+$/, "")}/responses`;
+      console.log(`[Proxy Local Compaction] Trying fallback summarization on ${responsesUrl}...`);
+      const responsesRes = await fetch(responsesUrl, {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: fallbackModel,
+          input: [
+            { role: "user", content: [{ type: "text", text: `${summarizeSystemPrompt}\n\n${userPrompt}` }] }
+          ],
+          max_output_tokens: 1000
+        }),
+        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+      });
+
+      if (responsesRes.status === 200) {
+        const responsesData = await responsesRes.json().catch(() => null);
+        const extracted = responsesData?.output?.[0]?.content?.[0]?.text
+          || responsesData?.output?.[0]?.text
+          || "";
+        summaryText = String(extracted).trim();
+      } else {
+        const errText = await responsesRes.text().catch(() => "");
+        console.warn(`[Proxy Local Compaction] responses endpoint returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
+      }
+    } catch (err) {
+      console.warn(`[Proxy Local Compaction] responses fallback failed: ${err.message}`);
     }
+  }
 
-    console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
+  if (!summaryText) {
+    console.error(`[Proxy Local Compaction] All summarization methods failed to generate a summary.`);
+    return null;
+  }
+
+  console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
 
     if (claudeFormat) {
       return claudeMessagesCompactionResponse(summaryText, parsed?.model);
@@ -715,10 +754,6 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         "content-type": "application/json; charset=utf-8"
       })
     });
-  } catch (err) {
-    console.error(`[Proxy Local Compaction] Fallback failed with error:`, err);
-    return null;
-  }
 }
 
 function claudeMessagesJsonResponse(body, extraHeaders = {}) {
