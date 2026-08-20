@@ -964,7 +964,7 @@ try {
     throw new Error(`a proxy-generated compaction item should expand into readable provider context, got ${upstreamRequests.at(-1).bodyText}`);
   }
 
-  for (let i = 0; i < 4; i++) claudeCompactionFailures.push("unreachable");
+  claudeCompactionFailures.push("unreachable");
   const beforeRemoteCompactionDummy = upstreamRequests.length;
   const remoteCompactionDummy = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
   const remoteCompactionDummyText = await remoteCompactionDummy.text();
