@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import {
-  createClaudeResponsesSseTransformStream,
   estimateClaudeInputTokens,
   prepareClaudeResponsesBridge,
   retargetClaudeResponsesBridge,
-  translateClaudeMessagesRequestToResponses,
-  translateResponsesResponseToClaude
-} from "./src/claude-responses-bridge.mjs";
+  translateClaudeMessagesRequestToResponses
+} from "./src/claude-responses-core.mjs";
+import { translateResponsesResponseToClaude } from "./src/claude-responses-responses.mjs";
+import { createClaudeResponsesSseTransformStream } from "./src/claude-responses-sse.mjs";
 
 const longToolName = `mcp__filesystem__${"inspect_repository_tree_".repeat(4)}`;
 const longToolId = `toolu_${"1234567890".repeat(8)}`;

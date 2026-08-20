@@ -20,8 +20,9 @@
 // wire and translates them into the source shape.
 
 import { Transform } from "node:stream";
-import { translateChatCompletionsRequestToResponses, translateResponsesResponseToChat } from "./chat-responses-bridge.mjs";
-import { translateClaudeMessagesRequestToResponses, translateResponsesResponseToClaude } from "./claude-responses-bridge.mjs";
+import { translateChatCompletionsRequestToResponses, translateResponsesResponseToChat } from "./chat-responses-core.mjs";
+import { translateClaudeMessagesRequestToResponses } from "./claude-responses-core.mjs";
+import { translateResponsesResponseToClaude } from "./claude-responses-responses.mjs";
 
 function parseBody(body) {
   if (!body) return null;

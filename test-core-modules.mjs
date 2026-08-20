@@ -49,11 +49,12 @@ import {
   resolvedClaudeGatewayModelId,
   rollingApiSpendFromTotal
 } from "./src/provider-policy.mjs";
+import { normalizeCompactionResponse, repairProviderProxyBodyPlaintext } from "./src/proxy-compaction.mjs";
 import {
-  normalizeCompactionResponse,
-  repairProviderProxyBodyPlaintext,
+  decodeRemoteCompactionV2Summary,
+  encodeRemoteCompactionV2Summary,
   rewriteProviderProxyRequestBody
-} from "./src/proxy-transforms.mjs";
+} from "./src/proxy-body-transforms.mjs";
 import { createProviderProxy } from "./src/provider-proxy.mjs";
 import { createAccountService } from "./src/account-service.mjs";
 import {
@@ -423,6 +424,11 @@ try {
   normalizeCompactionResponse(stringContentNoisy);
   assert.equal(stringContentNoisy.output.length, 1);
   assert.deepEqual(stringContentNoisy.output[0].content, [{ type: "output_text", text: "plain string summary" }]);
+
+  const encodedSummary = encodeRemoteCompactionV2Summary("test summary text");
+  assert.equal(typeof encodedSummary, "string");
+  assert.equal(decodeRemoteCompactionV2Summary(encodedSummary), "test summary text");
+  assert.equal(decodeRemoteCompactionV2Summary("invalid"), null);
 
   const proxy = createProviderProxy({
     host: "127.0.0.1",

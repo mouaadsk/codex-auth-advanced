@@ -5,7 +5,7 @@ import {
   retargetChatResponsesBridge,
   translateChatCompletionsRequestToResponses,
   translateResponsesResponseToChat
-} from "./src/chat-responses-bridge.mjs";
+} from "./src/chat-responses-core.mjs";
 
 const chatRequest = {
   model: "grok-4.5",
@@ -157,7 +157,7 @@ assert.equal(fcChat.choices[0].message.tool_calls[0].id, "call_abc");
 assert.equal(fcChat.choices[0].message.tool_calls[0].function.name, "shell");
 
 // Streaming smoke: feed an SSE buffer through the stream and ensure we get a Chat chunk back.
-import { createChatCompletionsSseTransformStream } from "./src/chat-responses-bridge.mjs";
+import { createChatCompletionsSseTransformStream } from "./src/chat-responses-sse.mjs";
 const sseSource = [
   'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_3","model":"grok-4.5","output":[]}}\n\n',
   'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hi"}\n\n',

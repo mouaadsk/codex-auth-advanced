@@ -12,17 +12,14 @@ import {
   isVsllmClaudeGatewayModel
 } from "./claude-gateway.mjs";
 import {
-  createClaudeResponsesSseTransformStream,
-  prepareClaudeResponsesBridge,
-  retargetClaudeResponsesBridge,
-  translateResponsesResponseToClaude,
-  prepareClaudeChatBridge
-} from "./claude-responses-bridge.mjs";
+  createClaudeResponsesSseTransformStream
+} from "./claude-responses-sse.mjs";
 import {
-  prepareChatResponsesBridge,
-  translateResponsesResponseToChat,
-  chatTargetFromResponsesTarget
-} from "./chat-responses-bridge.mjs";
+  prepareClaudeResponsesBridge,
+  retargetClaudeResponsesBridge
+} from "./claude-responses-core.mjs";
+import { translateResponsesResponseToClaude, prepareClaudeChatBridge } from "./claude-responses-responses.mjs";
+import { prepareChatResponsesBridge, translateResponsesResponseToChat, chatTargetFromResponsesTarget } from "./chat-responses-core.mjs";
 import {
   apiProviderExhaustionReason,
   detectSourceShapeFromUrl,
@@ -32,15 +29,19 @@ import {
 } from "./provider-policy.mjs";
 import {
   createSseResponseTransformStream,
-  createStreamDiagnostics,
+  createStreamDiagnostics
+} from "./proxy-sse-transforms.mjs";
+import { isResponsesProxyTarget } from "./proxy-sse-transforms.mjs";
+import { rewriteProviderProxyRequestBody } from "./proxy-body-transforms.mjs";
+import {
   isClaudeMessagesCompactionTarget,
   isCompactProxyTarget,
-  isResponsesProxyTarget,
-  repairProviderProxyBodyPlaintext,
-  rewriteProviderProxyRequestBody,
+  repairProviderProxyBodyPlaintext
+} from "./proxy-compaction.mjs";
+import {
   runLocalCompactionFallback,
   summarizeViaShape
-} from "./proxy-transforms.mjs";
+} from "./proxy-compaction.mjs";
 // antigravity translations are handled inside shape-translator.mjs
 // (buildShapeBridge + retargetBridge + translateShapeResponse).
 import {
@@ -784,8 +785,7 @@ export function createProviderProxy(options) {
               target,
               nextShape,
               sourceShape,
-              sourceBody: originalSourceBody,
-              originalRequest
+              sourceBody: originalSourceBody
             });
             if (bridge) {
               target = bridge.target;
@@ -875,7 +875,8 @@ export function createProviderProxy(options) {
         }
       }
       if (!upstream.body) {
-        res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
+        console.log(`[DEBUG streaming] upstream.status=${upstream.status}, content-type=${contentType}, hasBody=${!!upstream.body}`);
+      res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
         res.end();
         return;
       }
@@ -906,6 +907,7 @@ export function createProviderProxy(options) {
       if (contentType.includes("event-stream")) res.flushHeaders();
       const contentEncoding = String(upstream.headers.get("content-encoding") || "").toLowerCase();
       let responseStream = Readable.fromWeb(upstream.body);
+      responseStream.on("data", (c) => console.log(`[DEBUG upstream->transform] chunk len=${c.length}, sample=${c.toString().slice(0, 60)}`));
       const watchdogStallTarget = responseStream;
       // The stall watchdog destroys the upstream source when the origin goes
       // silent; that 'error' is expected and must not nuke the client
@@ -938,6 +940,7 @@ export function createProviderProxy(options) {
       // Cross-shape SSE translation: when the chain walker retargeted the
       // request to a different wire shape, the response is streamed in the
       // new shape's event format. Translate it back to the source shape.
+      console.log(`[DEBUG sse] target.responseFromShape=${target.responseFromShape}, target.responseToShape=${target.responseToShape}, shapeBridge=${!!target.shapeBridge}`);
       const shapeBridge = target.shapeBridge;
       const sseBridge = (shapeBridge && target.responseFromShape && target.responseToShape
         && target.responseFromShape !== target.responseToShape
@@ -952,6 +955,7 @@ export function createProviderProxy(options) {
         ));
       } else if (sseTransform) {
         responseStream = responseStream.pipe(sseTransform);
+        responseStream.on("data", (c) => console.log(`[DEBUG sse->res] chunk len=${c.length}, sample=${c.toString().slice(0, 100)}`));
       } else if (shouldTransformOpenAiResponse) {
         responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream"), diagnostics));
       }

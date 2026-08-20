@@ -142,11 +142,13 @@ export function providerProxyRouteFromIncoming(incoming, providerProxyPrefix) {
 // account without touching the registry. Returns null when the shape has no
 // URL suffix that can be swapped on the given upstream.
 export function shapeUrlFor(baseUrl, shape) {
-  const base = String(baseUrl || "").replace(/\/$/, "");
-  if (!base) return null;
-  if (shape === "responses") return `${base}/v1/responses`;
-  if (shape === "responses_compact") return `${base}/v1/responses/compact`;
-  if (shape === "messages") return `${base}/v1/messages`;
-  if (shape === "chat_completions") return `${base}/v1/chat/completions`;
+  const raw = String(baseUrl || "").replace(/\/$/, "");
+  if (!raw) return null;
+  // If baseUrl already includes the /v1 prefix, don't add it again.
+  const base = /\/v1$/.test(raw) ? raw : `${raw}/v1`;
+  if (shape === "responses") return `${base}/responses`;
+  if (shape === "responses_compact") return `${base}/responses/compact`;
+  if (shape === "messages") return `${base}/messages`;
+  if (shape === "chat_completions") return `${base}/chat/completions`;
   return null;
 }

@@ -29,14 +29,14 @@ import {
   translateChatCompletionsRequestToResponses,
   translateChatResponseToResponses,
   translateResponsesResponseToChat
-} from "./chat-responses-bridge.mjs";
+} from "./chat-responses-core.mjs";
+import { translateClaudeMessagesRequestToResponses } from "./claude-responses-core.mjs";
 import {
-  translateClaudeMessagesRequestToResponses,
   translateClaudeMessagesRequestToChat,
   translateMessagesResponseToResponses,
   translateChatResponseToClaude,
   translateResponsesResponseToClaude
-} from "./claude-responses-bridge.mjs";
+} from "./claude-responses-responses.mjs";
 import { Transform } from "node:stream";
 import {
   prepareAntigravityBridge,
@@ -44,7 +44,7 @@ import {
   translateAntigravityResponseToShape,
   createAntigravitySseTransformStream
 } from "./antigravity-bridge.mjs";
-import { createChatToResponsesSseTransformStream } from "./chat-responses-bridge.mjs";
+import { createChatToResponsesSseTransformStream } from "./chat-responses-sse.mjs";
 
 const SHAPE_PATH = {
   [WIRE_SHAPES.RESPONSES]: "/v1/responses",
@@ -54,8 +54,18 @@ const SHAPE_PATH = {
 
 function parseBody(body) {
   if (!body) return null;
-  if (typeof body === "object") return body;
-  const raw = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
+  if (Buffer.isBuffer(body)) {
+    if (body.length === 0) return null;
+    try { return JSON.parse(body.toString("utf8")); } catch { return null; }
+  }
+  if (typeof body === "object") {
+    // Could already be a parsed object, but skip Buffer-like objects
+    if (body && body.type === "Buffer") {
+      try { return JSON.parse(Buffer.from(body.data || []).toString("utf8")); } catch { return null; }
+    }
+    return body;
+  }
+  const raw = String(body);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
 }
@@ -70,10 +80,15 @@ function shapeBaseUrl(target) {
 }
 
 function shapeUrlFor(baseUrl, shape) {
-  const base = String(baseUrl || "").replace(/\/$/, "");
+  const raw = String(baseUrl || "").replace(/\/$/, "");
+  if (!raw) return null;
+  // If baseUrl already ends with /v1, don't add another.
+  const base = /\/v1$/.test(raw) ? raw : `${raw}/v1`;
   const suffix = SHAPE_PATH[shape];
-  if (!base || !suffix) return null;
-  return `${base}${suffix}`;
+  if (!suffix) return null;
+  // SHAPE_PATH already includes /v1, so strip it before concatenation.
+  const cleanSuffix = suffix.startsWith("/v1") ? suffix.slice(3) : suffix;
+  return `${base}${cleanSuffix}`;
 }
 
 function safeJsonParse(text, fallback) {
@@ -373,7 +388,17 @@ function parseSseFrame(frame) {
 
 function responsesEvents() {
   // Translate Responses SSE events -> Chat Completions SSE events.
-  const state = { responseId: null, model: null, outputItemId: null, text: "", started: false, usage: {}, finishReason: null };
+  // Supports text and tool_calls (function_call) deltas.
+  const state = { responseId: null, model: null, outputItemId: null, text: "", started: false, usage: {}, finishReason: null, toolCallIndex: 0, toolCallsSeen: [] };
+  function chatChunk(delta, finishReason) {
+    return sseData({
+      id: state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: state.model || "unknown",
+      choices: [{ index: 0, delta, finish_reason: finishReason || null }]
+    });
+  }
   return function(event) {
     if (!event || event.data == null) return "";
     const e = event.data;
@@ -385,173 +410,59 @@ function responsesEvents() {
     if (e.type === "response.output_item.added") {
       state.outputItemId = e.item?.id || state.outputItemId;
       state.started = true;
-      return sseData({
-        id: state.responseId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: state.model || "unknown",
-        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
-      });
+      if (e.item?.type === "function_call") {
+        // Open a Chat-style tool_call delta with id + name
+        const toolCall = {
+          index: state.toolCallIndex,
+          id: e.item.call_id || e.item.id || `call_${state.toolCallIndex}`,
+          type: "function",
+          function: { name: e.item.name || "", arguments: "" }
+        };
+        state.toolCallsSeen.push(toolCall);
+        state.toolCallIndex += 1;
+        return chatChunk({ role: "assistant", content: null, tool_calls: [toolCall] });
+      }
+      return chatChunk({ role: "assistant", content: "" });
     }
     if (e.type === "response.output_text.delta" && e.delta) {
-      return sseData({
-        id: state.responseId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: state.model || "unknown",
-        choices: [{ index: 0, delta: { content: e.delta }, finish_reason: null }]
-      });
+      return chatChunk({ content: e.delta });
+    }
+    if (e.type === "response.function_call_arguments.delta" && e.delta) {
+      const lastTool = state.toolCallsSeen[state.toolCallsSeen.length - 1];
+      if (lastTool) {
+        return chatChunk({ tool_calls: [{ index: lastTool.index, function: { arguments: e.delta } }] });
+      }
     }
     if (e.type === "response.completed" || e.type === "response.incomplete") {
       const response = e.response || {};
-      const finishReason = response.stop_reason === "max_output_tokens" ? "length" : "stop";
-      return sseData({
-        id: response.id || state.responseId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: response.model || state.model || "unknown",
-        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-        usage: response.usage ? {
-          prompt_tokens: response.usage.input_tokens || 0,
-          completion_tokens: response.usage.output_tokens || 0,
-          total_tokens: response.usage.total_tokens || 0
-        } : undefined
-      }) + sseDone();
+      state.finishReason = response.stop_reason === "max_output_tokens" ? "length"
+        : response.stop_reason === "tool_use" ? "tool_calls"
+        : "stop";
+      let out = chatChunk({}, state.finishReason);
+      if (response.usage) {
+        out += sseData({
+          id: response.id || state.responseId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: response.model || state.model || "unknown",
+          choices: [],
+          usage: {
+            prompt_tokens: response.usage.input_tokens || 0,
+            completion_tokens: response.usage.output_tokens || 0,
+            total_tokens: response.usage.total_tokens || 0
+          }
+        });
+      }
+      return out + sseDone();
     }
     return "";
   };
 }
 
 function responsesToMessagesEvents(originalRequest = {}) {
-  const state = { messageId: null, model: null, blockIndex: 0, textBlockOpen: false, finishReason: null };
-  function openTextBlock() {
-    if (state.textBlockOpen) return "";
-    state.textBlockOpen = true;
-    return sseEvent("content_block_start", {
-      type: "content_block_start",
-      index: state.blockIndex,
-      content_block: { type: "text", text: "" }
-    });
-  }
-  function closeTextBlock() {
-    if (!state.textBlockOpen) return "";
-    state.textBlockOpen = false;
-    const idx = state.blockIndex;
-    state.blockIndex += 1;
-    return sseEvent("content_block_stop", { type: "content_block_stop", index: idx });
-  }
-  return function(event) {
-    if (!event || event.data == null || event.data === "[DONE]") return "";
-    const e = event.data;
-    if (e.type === "response.created" && e.response) {
-      state.messageId = e.response.id;
-      state.model = e.response.model || originalRequest?.model || "";
-      return sseEvent("message_start", {
-        type: "message_start",
-        message: {
-          id: state.messageId,
-          type: "message",
-          role: "assistant",
-          model: state.model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 }
-        }
-      });
-    }
-    if (e.type === "response.output_text.delta" && e.delta) {
-      return openTextBlock() + sseEvent("content_block_delta", {
-        type: "content_block_delta",
-        index: state.blockIndex,
-        delta: { type: "text_delta", text: e.delta }
-      });
-    }
-    if (e.type === "response.completed" || e.type === "response.incomplete") {
-      const response = e.response || {};
-      state.finishReason = response.stop_reason === "max_output_tokens" ? "max_tokens" : "end_turn";
-      return closeTextBlock() + sseEvent("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: state.finishReason, stop_sequence: null },
-        usage: response.usage || { input_tokens: 0, output_tokens: 0 }
-      }) + sseEvent("message_stop", { type: "message_stop" });
-    }
-    return "";
-  };
-}
-
-function chatEvents() {
-  // Translate Chat Completions SSE events -> Responses SSE events.
-  const state = { responseId: null, model: null, outputItemId: null, started: false, text: "", usage: {}, finishReason: null };
-  function emitEvent(type, payload) { return sseData({ type, ...payload }); }
-  return function(event) {
-    if (!event || event.data == null || event.data === "[DONE]") {
-      // [DONE] emits response.completed in responses style
-      if (event && event.data === "[DONE]" && state.started) {
-        return emitEvent("response.completed", {
-          response: {
-            id: state.responseId, object: "response", status: "completed",
-            model: state.model || "unknown",
-            output: [{ id: state.outputItemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: state.text }] }],
-            usage: { input_tokens: Number(state.usage.prompt_tokens) || 0, output_tokens: Number(state.usage.completion_tokens) || 0, total_tokens: Number(state.usage.total_tokens) || 0 },
-            stop_reason: state.finishReason === "length" ? "max_output_tokens" : "end_turn"
-          }
-        });
-      }
-      return "";
-    }
-    const e = event.data;
-    const choice = e.choices?.[0];
-    if (!choice) {
-      if (e.usage) state.usage = e.usage;
-      return "";
-    }
-    const delta = choice.delta || choice.message || {};
-    if (!state.started) {
-      state.started = true;
-      state.responseId = e.id || `resp_${Math.random().toString(36).slice(2, 12)}`;
-      state.model = e.model || state.model;
-      state.outputItemId = `msg_${Math.random().toString(36).slice(2, 10)}`;
-      let out = emitEvent("response.created", {
-        response: { id: state.responseId, object: "response", status: "in_progress", model: state.model, output: [] }
-      });
-      out += emitEvent("response.output_item.added", {
-        output_index: 0,
-        item: { id: state.outputItemId, type: "message", role: "assistant", status: "in_progress", content: [] }
-      });
-      if (typeof delta.content === "string" && delta.content) {
-        state.text += delta.content;
-        out += emitEvent("response.output_text.delta", { item_id: state.outputItemId, output_index: 0, content_index: 0, delta: delta.content });
-      }
-      return out;
-    }
-    let out = "";
-    if (typeof delta.content === "string" && delta.content) {
-      state.text += delta.content;
-      out += emitEvent("response.output_text.delta", { item_id: state.outputItemId, output_index: 0, content_index: 0, delta: delta.content });
-    }
-    if (e.usage) state.usage = e.usage;
-    if (choice.finish_reason) {
-      state.finishReason = choice.finish_reason;
-      out += emitEvent("response.output_item.done", {
-        output_index: 0,
-        item: { id: state.outputItemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: state.text }] }
-      });
-      out += emitEvent("response.completed", {
-        response: {
-          id: state.responseId, object: "response", status: "completed", model: state.model || "unknown",
-          output: [{ id: state.outputItemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: state.text }] }],
-          usage: { input_tokens: Number(state.usage.prompt_tokens) || 0, output_tokens: Number(state.usage.completion_tokens) || 0, total_tokens: Number(state.usage.total_tokens) || 0 },
-          stop_reason: state.finishReason === "length" ? "max_output_tokens" : "end_turn"
-        }
-      });
-    }
-    return out;
-  };
-}
-
-function chatToMessagesEvents(originalRequest = {}) {
-  const state = { messageId: null, model: null, blockIndex: 0, textBlockOpen: false };
+  // Translate Responses SSE events -> Anthropic Messages SSE events.
+  // Supports text and tool_use (function_call) deltas.
+  const state = { messageId: null, model: null, blockIndex: 0, textBlockOpen: false, finishReason: null, toolBlocks: new Map() };
   function openTextBlock() {
     if (state.textBlockOpen) return "";
     state.textBlockOpen = true;
@@ -562,6 +473,209 @@ function chatToMessagesEvents(originalRequest = {}) {
     state.textBlockOpen = false;
     const idx = state.blockIndex; state.blockIndex += 1;
     return sseEvent("content_block_stop", { type: "content_block_stop", index: idx });
+  }
+  function ensureMessageStart(response) {
+    if (state.messageId) return "";
+    state.messageId = response.id || `msg_${Math.random().toString(36).slice(2, 12)}`;
+    state.model = response.model || originalRequest?.model || "";
+    return sseEvent("message_start", {
+      type: "message_start",
+      message: {
+        id: state.messageId, type: "message", role: "assistant", model: state.model,
+        content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    });
+  }
+  return function(event) {
+    if (!event || event.data == null || event.data === "[DONE]") return "";
+    const e = event.data;
+    if (e.type === "response.created" && e.response) {
+      return ensureMessageStart(e.response);
+    }
+    if (e.type === "response.output_item.added" && e.item?.type === "function_call") {
+      const idx = state.blockIndex; state.blockIndex += 1;
+      state.toolBlocks.set(e.item.id || e.item.call_id, idx);
+      return sseEvent("content_block_start", {
+        type: "content_block_start", index: idx,
+        content_block: { type: "tool_use", id: e.item.call_id || e.item.id, name: e.item.name || "", input: {} }
+      });
+    }
+    if (e.type === "response.output_text.delta" && e.delta) {
+      return openTextBlock() + sseEvent("content_block_delta", {
+        type: "content_block_delta", index: state.blockIndex,
+        delta: { type: "text_delta", text: e.delta }
+      });
+    }
+    if (e.type === "response.function_call_arguments.delta" && e.delta) {
+      // Find the latest open tool_use block
+      const lastIdx = Array.from(state.toolBlocks.values()).pop();
+      if (lastIdx != null) {
+        return sseEvent("content_block_delta", {
+          type: "content_block_delta", index: lastIdx,
+          delta: { type: "input_json_delta", partial_json: e.delta }
+        });
+      }
+    }
+    if (e.type === "response.output_item.done" && e.item?.type === "function_call") {
+      const idx = state.toolBlocks.get(e.item.id || e.item.call_id);
+      if (idx != null) {
+        return sseEvent("content_block_stop", { type: "content_block_stop", index: idx });
+      }
+    }
+    if (e.type === "response.completed" || e.type === "response.incomplete") {
+      const response = e.response || {};
+      const reason = response.stop_reason === "max_output_tokens" ? "max_tokens"
+        : response.stop_reason === "tool_use" ? "tool_use"
+        : "end_turn";
+      return closeTextBlock() + sseEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: reason, stop_sequence: null },
+        usage: response.usage || { input_tokens: 0, output_tokens: 0 }
+      }) + sseEvent("message_stop", { type: "message_stop" });
+    }
+    return "";
+  };
+}
+
+function chatEvents() {
+  // Translate Chat Completions SSE events -> Responses SSE events.
+  // Supports text and tool_calls deltas (tool_calls[].function.arguments partial).
+  const state = { responseId: null, model: null, started: false, text: "", usage: {}, finishReason: null, toolCalls: new Map(), toolOrder: [], outputItems: [] };
+  function emitEvent(type, payload) { return sseData({ type, ...payload }); }
+  function responseCompleted() {
+    const output = state.outputItems.length ? state.outputItems : [];
+    return emitEvent("response.completed", {
+      response: {
+        id: state.responseId, object: "response", status: "completed",
+        model: state.model || "unknown",
+        output,
+        usage: { input_tokens: Number(state.usage.prompt_tokens) || 0, output_tokens: Number(state.usage.completion_tokens) || 0, total_tokens: Number(state.usage.total_tokens) || 0 },
+        stop_reason: state.finishReason === "length" ? "max_output_tokens" : state.finishReason === "tool_calls" ? "tool_use" : "end_turn"
+      }
+    });
+  }
+  function ensureStarted(e) {
+    if (state.started) return "";
+    state.started = true;
+    state.responseId = e.id || `resp_${Math.random().toString(36).slice(2, 12)}`;
+    state.model = e.model || state.model;
+    return emitEvent("response.created", {
+      response: { id: state.responseId, object: "response", status: "in_progress", model: state.model, output: [] }
+    });
+  }
+  function ensureMessageOutputItem() {
+    if (state.textOutputItemId) return state.textOutputItemId;
+    const id = `msg_${Math.random().toString(36).slice(2, 10)}`;
+    state.textOutputItemId = id;
+    state.outputItems.push({ id, type: "message", role: "assistant", status: "in_progress", content: [] });
+    return id;
+  }
+  return function(event) {
+    if (!event || event.data == null || event.data === "[DONE]") {
+      if (event && event.data === "[DONE]" && state.started) return responseCompleted();
+      return "";
+    }
+    const e = event.data;
+    const choice = e.choices?.[0];
+    if (!choice) {
+      if (e.usage) state.usage = e.usage;
+      return "";
+    }
+    const delta = choice.delta || choice.message || {};
+    let out = ensureStarted(e);
+
+    if (typeof delta.content === "string" && delta.content) {
+      state.text += delta.content;
+      const msgId = ensureMessageOutputItem();
+      out += emitEvent("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: delta.content });
+    }
+
+    // Handle tool_calls deltas (OpenAI Chat sends one tool_call per delta with index)
+    const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+    for (const tc of toolCalls) {
+      const idx = tc.index ?? 0;
+      let record = state.toolCalls.get(idx);
+      if (!record) {
+        const newId = tc.id || `call_${Math.random().toString(36).slice(2, 10)}`;
+        record = {
+          id: newId,
+          outputItemId: `fc_${Math.random().toString(36).slice(2, 10)}`,
+          name: tc.function?.name || "",
+          arguments: ""
+        };
+        state.toolCalls.set(idx, record);
+        state.toolOrder.push(idx);
+        state.outputItems.push({
+          id: record.outputItemId, type: "function_call",
+          call_id: record.id, name: record.name, arguments: "", status: "in_progress"
+        });
+        out += emitEvent("response.output_item.added", {
+          output_index: state.outputItems.length - 1,
+          item: { id: record.outputItemId, type: "function_call", call_id: record.id, name: record.name, arguments: "", status: "in_progress" }
+        });
+      }
+      if (tc.function?.name && !record.name) record.name = tc.function.name;
+      if (tc.id && record.id !== tc.id) record.id = tc.id;
+      if (tc.function?.arguments) {
+        record.arguments += tc.function.arguments;
+        out += emitEvent("response.function_call_arguments.delta", {
+          item_id: record.outputItemId,
+          output_index: 0,
+          delta: tc.function.arguments
+        });
+      }
+    }
+
+    if (e.usage) state.usage = e.usage;
+    if (choice.finish_reason) {
+      state.finishReason = choice.finish_reason;
+      // Close any in-progress function_call items
+      for (const idx of state.toolOrder) {
+        const record = state.toolCalls.get(idx);
+        if (record) {
+          out += emitEvent("response.output_item.done", {
+            output_index: 0,
+            item: { id: record.outputItemId, type: "function_call", call_id: record.id, name: record.name, arguments: record.arguments, status: "completed" }
+          });
+        }
+      }
+      // Close text message item if open
+      if (state.textOutputItemId) {
+        out += emitEvent("response.output_item.done", {
+          output_index: 0,
+          item: { id: state.textOutputItemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: state.text }] }
+        });
+      }
+      out += responseCompleted();
+    }
+    return out;
+  };
+}
+
+function chatToMessagesEvents(originalRequest = {}) {
+  // Translate Chat Completions SSE events -> Anthropic Messages SSE events.
+  // Supports text and tool_calls deltas.
+  const state = { messageId: null, model: null, blockIndex: 0, textBlockOpen: false, toolIndexMap: new Map() };
+  function openTextBlock() {
+    if (state.textBlockOpen) return "";
+    state.textBlockOpen = true;
+    return sseEvent("content_block_start", { type: "content_block_start", index: state.blockIndex, content_block: { type: "text", text: "" } });
+  }
+  function closeTextBlock() {
+    if (!state.textBlockOpen) return "";
+    state.textBlockOpen = false;
+    const idx = state.blockIndex; state.blockIndex += 1;
+    return sseEvent("content_block_stop", { type: "content_block_stop", index: idx });
+  }
+  function ensureMessageStart(e) {
+    if (state.messageId) return "";
+    state.messageId = e.id || `msg_${Math.random().toString(36).slice(2, 12)}`;
+    state.model = e.model || originalRequest?.model || "";
+    return sseEvent("message_start", {
+      type: "message_start",
+      message: { id: state.messageId, type: "message", role: "assistant", model: state.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+    });
   }
   return function(event) {
     if (!event || event.data == null || event.data === "[DONE]") {
@@ -578,22 +692,34 @@ function chatToMessagesEvents(originalRequest = {}) {
     const choice = e.choices?.[0];
     if (!choice) return "";
     const delta = choice.delta || choice.message || {};
-    let out = "";
-    if (!state.messageId) {
-      state.messageId = e.id || `msg_${Math.random().toString(36).slice(2, 12)}`;
-      state.model = e.model || originalRequest?.model || "";
-      out += sseEvent("message_start", {
-        type: "message_start",
-        message: { id: state.messageId, type: "message", role: "assistant", model: state.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
-      });
-    }
+    let out = ensureMessageStart(e);
     if (typeof delta.content === "string" && delta.content) {
       out += openTextBlock() + sseEvent("content_block_delta", { type: "content_block_delta", index: state.blockIndex, delta: { type: "text_delta", text: delta.content } });
+    }
+    // Tool calls
+    const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+    for (const tc of toolCalls) {
+      const idx = tc.index ?? 0;
+      let blockIdx = state.toolIndexMap.get(idx);
+      if (blockIdx == null) {
+        blockIdx = state.blockIndex; state.blockIndex += 1;
+        state.toolIndexMap.set(idx, blockIdx);
+        out += sseEvent("content_block_start", {
+          type: "content_block_start", index: blockIdx,
+          content_block: { type: "tool_use", id: tc.id || `toolu_${Math.random().toString(36).slice(2, 10)}`, name: tc.function?.name || "", input: {} }
+        });
+      }
+      if (tc.function?.arguments) {
+        out += sseEvent("content_block_delta", {
+          type: "content_block_delta", index: blockIdx,
+          delta: { type: "input_json_delta", partial_json: tc.function.arguments }
+        });
+      }
     }
     if (choice.finish_reason) {
       out += closeTextBlock() + sseEvent("message_delta", {
         type: "message_delta",
-        delta: { stop_reason: choice.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null },
+        delta: { stop_reason: choice.finish_reason === "length" ? "max_tokens" : choice.finish_reason === "tool_calls" ? "tool_use" : "end_turn", stop_sequence: null },
         usage: e.usage ? { input_tokens: e.usage.prompt_tokens || 0, output_tokens: e.usage.completion_tokens || 0 } : { input_tokens: 0, output_tokens: 0 }
       }) + sseEvent("message_stop", { type: "message_stop" });
     }
@@ -603,38 +729,84 @@ function chatToMessagesEvents(originalRequest = {}) {
 
 function messagesEvents() {
   // Translate Anthropic Messages SSE events -> Responses SSE events.
-  const state = { responseId: null, model: null, outputItemId: null, text: "", started: false, usage: { input_tokens: 0, output_tokens: 0 }, stopReason: null };
+  // Supports text and tool_use blocks (Anthropic content_block type=tool_use).
+  const state = { responseId: null, model: null, started: false, textItemId: null, text: "", usage: { input_tokens: 0, output_tokens: 0 }, stopReason: null, outputItems: [], toolBlocks: new Map(), toolItemIndex: 0 };
   function emitEvent(type, payload) { return sseData({ type, ...payload }); }
-  let pendingTextBlock = false;
+  function ensureStarted(message) {
+    if (state.started) return "";
+    state.started = true;
+    state.responseId = message.id || `resp_${Math.random().toString(36).slice(2, 12)}`;
+    state.model = message.model || state.model;
+    return emitEvent("response.created", {
+      response: { id: state.responseId, object: "response", status: "in_progress", model: state.model, output: [] }
+    });
+  }
+  function ensureTextItem() {
+    if (state.textItemId) return state.textItemId;
+    const id = `msg_${Math.random().toString(36).slice(2, 10)}`;
+    state.textItemId = id;
+    state.outputItems.push({ id, type: "message", role: "assistant", status: "in_progress", content: [] });
+    return id;
+  }
+  function responseCompleted() {
+    return emitEvent("response.completed", {
+      response: {
+        id: state.responseId, object: "response", status: "completed", model: state.model || "unknown",
+        output: state.outputItems,
+        usage: state.usage,
+        stop_reason: state.stopReason === "max_tokens" ? "max_output_tokens" : state.stopReason === "tool_use" ? "tool_use" : "end_turn"
+      }
+    });
+  }
   return function(event) {
     if (!event || event.data == null || event.data === "[DONE]") return "";
     const e = event.data;
     const type = e.type || event.eventName;
     if (type === "message_start") {
-      state.responseId = e.message?.id || `resp_${Math.random().toString(36).slice(2, 12)}`;
-      state.model = e.message?.model || state.model;
-      return emitEvent("response.created", {
-        response: { id: state.responseId, object: "response", status: "in_progress", model: state.model, output: [] }
-      });
+      return ensureStarted(e.message || {});
     }
     if (type === "content_block_start") {
-      if (!state.started) {
-        state.started = true;
-        state.outputItemId = e.content_block?.id || `msg_${Math.random().toString(36).slice(2, 10)}`;
+      const block = e.content_block || {};
+      if (block.type === "tool_use") {
+        const itemId = `fc_${Math.random().toString(36).slice(2, 10)}`;
+        state.toolBlocks.set(block.id, { itemId, name: block.name || "", arguments: "" });
+        state.outputItems.push({
+          id: itemId, type: "function_call",
+          call_id: block.id, name: block.name || "", arguments: "", status: "in_progress"
+        });
+        state.toolItemIndex = state.outputItems.length - 1;
         return emitEvent("response.output_item.added", {
-          output_index: 0,
-          item: { id: state.outputItemId, type: "message", role: "assistant", status: "in_progress", content: [] }
-        }) + emitEvent("response.output_text.delta", { item_id: state.outputItemId, output_index: 0, content_index: 0, delta: "" });
+          output_index: state.toolItemIndex,
+          item: { id: itemId, type: "function_call", call_id: block.id, name: block.name || "", arguments: "", status: "in_progress" }
+        });
+      }
+      // Text block — ensure text output item exists
+      const msgId = ensureTextItem();
+      return emitEvent("response.output_item.added", {
+        output_index: state.outputItems.length - 1,
+        item: { id: msgId, type: "message", role: "assistant", status: "in_progress", content: [] }
+      });
+    }
+    if (type === "content_block_delta") {
+      if (e.delta?.type === "text_delta" && e.delta.text) {
+        state.text += e.delta.text;
+        const msgId = ensureTextItem();
+        return emitEvent("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: e.delta.text });
+      }
+      if (e.delta?.type === "input_json_delta" && e.delta.partial_json) {
+        // Find the most recent tool_use block
+        const last = Array.from(state.toolBlocks.values()).pop();
+        if (last) {
+          last.arguments += e.delta.partial_json;
+          return emitEvent("response.function_call_arguments.delta", {
+            item_id: last.itemId, output_index: 0, delta: e.delta.partial_json
+          });
+        }
       }
       return "";
     }
-    if (type === "content_block_delta") {
-      const text = e.delta?.text || "";
-      if (text) {
-        state.text += text;
-        return emitEvent("response.output_text.delta", { item_id: state.outputItemId, output_index: 0, content_index: 0, delta: text });
-      }
-      return "";
+    if (type === "content_block_stop") {
+      return ""; // block close is implicit on response.completed
     }
     if (type === "message_delta") {
       if (e.usage) state.usage = { ...state.usage, ...e.usage };
@@ -642,38 +814,57 @@ function messagesEvents() {
       return "";
     }
     if (type === "message_stop") {
-      return emitEvent("response.completed", {
-        response: {
-          id: state.responseId, object: "response", status: "completed", model: state.model || "unknown",
-          output: [{ id: state.outputItemId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: state.text }] }],
-          usage: state.usage,
-          stop_reason: state.stopReason === "max_tokens" ? "max_output_tokens" : "end_turn"
-        }
-      });
+      return responseCompleted();
     }
     return "";
   };
 }
 
 function messagesToChatEvents() {
-  const state = { model: null, text: "", started: false, finishReason: null, usage: {} };
+  // Translate Anthropic Messages SSE events -> Chat Completions SSE events.
+  // Supports text and tool_use blocks.
+  const state = { model: null, messageId: null, started: false, text: "", finishReason: null, usage: {}, toolIndex: 0, toolSeen: new Map() };
+  function chatChunk(delta, finishReason) {
+    return sseData({
+      id: state.messageId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model || "unknown",
+      choices: [{ index: 0, delta, finish_reason: finishReason || null }]
+    });
+  }
   return function(event) {
     if (!event || event.data == null || event.data === "[DONE]") return "";
     const e = event.data;
     const type = e.type || event.eventName;
     if (type === "message_start") {
       state.model = e.message?.model || state.model;
-      return sseData({
-        id: e.message?.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model || "unknown",
-        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
-      });
+      state.messageId = e.message?.id;
+      state.started = true;
+      return chatChunk({ role: "assistant", content: "" });
     }
-    if (type === "content_block_delta" && e.delta?.text) {
-      state.text += e.delta.text;
-      return sseData({
-        id: e.message?.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model || "unknown",
-        choices: [{ index: 0, delta: { content: e.delta.text }, finish_reason: null }]
-      });
+    if (type === "content_block_start") {
+      const block = e.content_block || {};
+      if (block.type === "tool_use") {
+        const idx = state.toolIndex;
+        const tc = { index: idx, id: block.id || `toolu_${Math.random().toString(36).slice(2, 10)}`, type: "function", function: { name: block.name || "", arguments: "" } };
+        state.toolSeen.set(block.id, tc);
+        state.toolIndex += 1;
+        return chatChunk({ tool_calls: [tc] });
+      }
+      return "";
+    }
+    if (type === "content_block_delta") {
+      if (e.delta?.text) {
+        state.text += e.delta.text;
+        return chatChunk({ content: e.delta.text });
+      }
+      if (e.delta?.partial_json) {
+        // Find the most recently opened tool_use block
+        const last = Array.from(state.toolSeen.values()).pop();
+        if (last) {
+          last.function.arguments += e.delta.partial_json;
+          return chatChunk({ tool_calls: [{ index: last.index, function: { arguments: e.delta.partial_json } }] });
+        }
+      }
+      return "";
     }
     if (type === "message_delta") {
       if (e.delta?.stop_reason) state.finishReason = e.delta.stop_reason;
@@ -681,28 +872,37 @@ function messagesToChatEvents() {
       return "";
     }
     if (type === "message_stop") {
-      const reason = state.finishReason === "max_tokens" ? "length" : "stop";
-      return sseData({
-        id: e.message?.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model || "unknown",
-        choices: [{ index: 0, delta: {}, finish_reason: reason }],
-        usage: state.usage && Object.keys(state.usage).length ? {
-          prompt_tokens: state.usage.input_tokens || 0,
-          completion_tokens: state.usage.output_tokens || 0,
-          total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0)
-        } : undefined
-      }) + sseDone();
+      const reason = state.finishReason === "max_tokens" ? "length"
+        : state.finishReason === "tool_use" ? "tool_calls"
+        : "stop";
+      const out = chatChunk({}, reason);
+      if (state.usage && Object.keys(state.usage).length) {
+        out += sseData({
+          id: state.messageId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model || "unknown",
+          choices: [],
+          usage: {
+            prompt_tokens: state.usage.input_tokens || 0,
+            completion_tokens: state.usage.output_tokens || 0,
+            total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0)
+          }
+        });
+      }
+      return out + sseDone();
     }
     return "";
   };
 }
 
 const SSE_TRANSLATORS = {
-  [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: responsesEvents,
-  [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.MESSAGES}`]: responsesToMessagesEvents,
-  [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.RESPONSES}`]: (orig) => createChatToResponsesSseTransformStream(orig),
-  [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.MESSAGES}`]: chatToMessagesEvents,
-  [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.RESPONSES}`]: messagesEvents,
-  [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: messagesToChatEvents
+  // The key is "clientShape:upstreamShape" -- the client sent in clientShape,
+  // the upstream responded in upstreamShape, so we translate upstreamShape
+  // events back to clientShape events for the client to consume.
+  [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: chatEvents,
+  [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.MESSAGES}`]: messagesEvents,
+  [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.RESPONSES}`]: responsesEvents,
+  [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.MESSAGES}`]: messagesToChatEvents,
+  [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.RESPONSES}`]: responsesToMessagesEvents,
+  [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: chatToMessagesEvents
 };
 
 export function createShapeSseTransformStream(bridge) {
@@ -727,8 +927,10 @@ export function createShapeSseTransformStream(bridge) {
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary.length);
         const event = parseSseFrame(frame);
+        console.log(`[DEBUG sse transform] frameLen=${frame.length}, eventData=${event?.data?.choices?.[0]?.delta?.content || event?.data?.type || 'null'}`);
         if (event == null) continue;
         const out = inner(event);
+        console.log(`[DEBUG sse transform] outLen=${out?.length || 0}`);
         if (out) this.push(sseBytes(out));
       }
       callback();
