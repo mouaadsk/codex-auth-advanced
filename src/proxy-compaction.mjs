@@ -569,11 +569,13 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
 export async function runLocalCompactionFallback(target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {}) {
   const startTime = Date.now();
   const completionsUrl = compactionCompletionsUrl(target);
-  if (!completionsUrl) {
-    console.error(`[Proxy Local Compaction] Cannot derive a chat completions endpoint from ${target?.url}`);
+  const preferResponsesFirst = target?.account?.api_template === "llmapi";
+  if (!completionsUrl && !preferResponsesFirst) {
+    console.error(`[Proxy Local Compaction] Cannot derive an upstream summarization endpoint from ${target?.url}`);
     return null;
   }
-  console.log(`[Proxy Local Compaction] Starting local compaction fallback using completions on ${completionsUrl}...`);
+  const targetDesc = preferResponsesFirst ? `${target?.upstreamBaseUrl || target?.url}/responses` : completionsUrl;
+  console.log(`[Proxy Local Compaction] Starting provider summarization on ${targetDesc}...`);
 
   const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
   let parsed = null;
@@ -670,7 +672,6 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   });
 
   let summaryText = "";
-  const preferResponsesFirst = target?.account?.api_template === "llmapi";
 
   async function trySummarizeViaResponses() {
     if (!target.upstreamBaseUrl) return "";
