@@ -669,31 +669,13 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   });
 
   let summaryText = "";
-  try {
-    const res = await fetch(completionsUrl, {
-      method: "POST",
-      headers: {
-        ...authHeaders,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(completionBody),
-      signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
-    });
+  const preferResponsesFirst = target?.account?.api_template === "llmapi";
 
-    if (res.status === 200) {
-      summaryText = (await readChatCompletionSummary(res)).trim();
-    } else {
-      const errText = await res.text().catch(() => "");
-      console.warn(`[Proxy Local Compaction] completions endpoint returned status ${res.status}: ${errText.slice(0, 150)}`);
-    }
-  } catch (err) {
-    console.warn(`[Proxy Local Compaction] completions endpoint failed: ${err.message}`);
-  }
-
-  if (!summaryText && target.upstreamBaseUrl) {
+  async function trySummarizeViaResponses() {
+    if (!target.upstreamBaseUrl) return "";
     try {
       const responsesUrl = `${target.upstreamBaseUrl.replace(/\/+$/, "")}/responses`;
-      console.log(`[Proxy Local Compaction] Trying fallback summarization on ${responsesUrl}...`);
+      console.log(`[Proxy Local Compaction] Attempting summarization on ${responsesUrl}...`);
       const responsesRes = await fetch(responsesUrl, {
         method: "POST",
         headers: {
@@ -715,13 +697,54 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         const extracted = responsesData?.output?.[0]?.content?.[0]?.text
           || responsesData?.output?.[0]?.text
           || "";
-        summaryText = String(extracted).trim();
+        return String(extracted).trim();
       } else {
         const errText = await responsesRes.text().catch(() => "");
         console.warn(`[Proxy Local Compaction] responses endpoint returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
       }
     } catch (err) {
-      console.warn(`[Proxy Local Compaction] responses fallback failed: ${err.message}`);
+      console.warn(`[Proxy Local Compaction] responses endpoint failed: ${err.message}`);
+    }
+    return "";
+  }
+
+  async function trySummarizeViaCompletions() {
+    if (!completionsUrl) return "";
+    try {
+      console.log(`[Proxy Local Compaction] Attempting summarization on ${completionsUrl}...`);
+      const res = await fetch(completionsUrl, {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(completionBody),
+        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+      });
+
+      if (res.status === 200) {
+        return (await readChatCompletionSummary(res)).trim();
+      } else {
+        const errText = await res.text().catch(() => "");
+        console.warn(`[Proxy Local Compaction] completions endpoint returned status ${res.status}: ${errText.slice(0, 150)}`);
+      }
+    } catch (err) {
+      console.warn(`[Proxy Local Compaction] completions endpoint failed: ${err.message}`);
+    }
+    return "";
+  }
+
+  if (preferResponsesFirst) {
+    summaryText = await trySummarizeViaResponses();
+    if (!summaryText) {
+      console.log(`[Proxy Local Compaction] Falling back to completions endpoint ${completionsUrl}...`);
+      summaryText = await trySummarizeViaCompletions();
+    }
+  } else {
+    summaryText = await trySummarizeViaCompletions();
+    if (!summaryText) {
+      console.log(`[Proxy Local Compaction] Falling back to responses endpoint...`);
+      summaryText = await trySummarizeViaResponses();
     }
   }
 
