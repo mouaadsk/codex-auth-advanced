@@ -410,12 +410,26 @@ function extractCompactConversationText(parsed) {
       const summary = decodeRemoteCompactionV2Summary(item.encrypted_content);
       if (summary) text += `[earlier compacted context]: ${summary}\n\n`;
     } else if (item.type === "function_call") {
-      text += `[assistant called function]: ${item.name || ""} with arguments ${item.arguments || ""}\n\n`;
+      const args = typeof item.arguments === "string" && item.arguments.length > 1000
+        ? `${item.arguments.slice(0, 1000)}...[truncated]`
+        : (item.arguments || "");
+      text += `[assistant called function]: ${item.name || ""} with arguments ${args}\n\n`;
     } else if (item.type === "function_call_output") {
-      text += `[function output]: ${item.output ?? ""}\n\n`;
+      const rawOutput = typeof item.output === "string" ? item.output : String(item.output ?? "");
+      const out = rawOutput.length > 2500
+        ? `${rawOutput.slice(0, 2500)}...[output truncated for summarization]`
+        : rawOutput;
+      text += `[function output]: ${out}\n\n`;
     }
   }
-  return text.trim();
+  const trimmed = text.trim();
+  const maxSafeChars = 300000;
+  if (trimmed.length > maxSafeChars) {
+    const headChars = 60000;
+    const tailChars = 240000;
+    return `${trimmed.slice(0, headChars)}\n\n...[intermediate conversation history omitted for compaction budget]...\n\n${trimmed.slice(-tailChars)}`;
+  }
+  return trimmed;
 }
 
 const summarizeSystemPrompt = `You are a helper that compacts and summarizes conversational context for an AI agent.
