@@ -690,9 +690,110 @@ export function supportedShapesForModel(model) {
   const id = String(model || "").trim().toLowerCase();
   if (!id) return null;
   // Allow suffixes like [1m] on the model id (Kimi 1M context).
-  const base = id.split(/[\\[\\(]/)[0];
+  const base = id.split(/[\[\(]/)[0];
   return MODEL_SHAPE_CAPABILITIES[base] || MODEL_SHAPE_CAPABILITIES[id] || null;
 }
+
+// ---------- Per-model wire-shape probe cache (auto-detected from upstream) ----------
+//
+// Some VSLLM models only serve a subset of the 4 wire shapes (e.g. grok-4.5
+// historically only implemented /v1/chat/completions on the Grok host).
+// The hard-coded MODEL_SHAPE_CAPABILITIES map above covers the known cases,
+// but we also probe the upstream at runtime so the proxy learns new models
+// automatically without code changes. The probe runs once per
+// (account_key, model) and the result is cached.
+//
+// supportedShapesForModelWithProbe consults:
+//   1. The hard-coded map (fast path, deterministic).
+//   2. The probe cache (per account).
+//   3. null (use the default per-source chain; the chain walker then kicks
+//      off a background probe via kickOffShapeProbe so the next request for
+//      this model lands on the right shape immediately).
+
+const MODEL_SHAPE_PROBE_CACHE = new Map(); // account_key -> Map(model -> {shapes, expiresAtMs})
+const MODEL_SHAPE_PROBE_INFLIGHT = new Map(); // dedupe concurrent probes
+const MODEL_SHAPE_PROBE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+
+function _probeCacheForAccount(accountKey) {
+  let inner = MODEL_SHAPE_PROBE_CACHE.get(accountKey);
+  if (!inner) {
+    inner = new Map();
+    MODEL_SHAPE_PROBE_CACHE.set(accountKey, inner);
+  }
+  return inner;
+}
+
+function _isShapeProbeEntryFresh(record) {
+  if (!record || typeof record !== "object") return false;
+  if (record.expiresAtMs != null && Date.now() > record.expiresAtMs) return false;
+  return true;
+}
+
+export function recordShapeProbeResult(accountKey, model, supportedShapes) {
+  if (!accountKey || !model) return;
+  const cache = _probeCacheForAccount(accountKey);
+  const id = String(model).trim().toLowerCase();
+  const base = id.split(/[\[\(]/)[0];
+  cache.set(base, {
+    shapes: supportedShapes instanceof Set ? supportedShapes : new Set(supportedShapes || []),
+    probedAtMs: Date.now(),
+    expiresAtMs: Date.now() + MODEL_SHAPE_PROBE_TTL_MS
+  });
+}
+
+export function clearShapeProbeCache(accountKey = null) {
+  if (accountKey) {
+    MODEL_SHAPE_PROBE_CACHE.delete(accountKey);
+  } else {
+    MODEL_SHAPE_PROBE_CACHE.clear();
+  }
+}
+
+export function supportedShapesForModelWithProbe(model, accountKey = null) {
+  // Probe cache wins over the static map: a fresh probe reflects what the
+  // upstream actually serves right now, while the static map may be stale
+  // (e.g. grok-4.5 historically only spoke chat_completions on the Grok
+  // host, but the llmapi gateway exposes all 4 shapes for every model).
+  if (accountKey) {
+    const cache = _probeCacheForAccount(accountKey);
+    const id = String(model || "").trim().toLowerCase();
+    if (id) {
+      const base = id.split(/[\[\(]/)[0];
+      const record = cache.get(base) || cache.get(id);
+      if (_isShapeProbeEntryFresh(record)) return record.shapes;
+    }
+  }
+  // Static map is the fallback when no probe has been recorded yet.
+  const fromStatic = supportedShapesForModel(model);
+  if (fromStatic) return fromStatic;
+  return null;
+}
+
+export function kickOffShapeProbe({ accountKey, model, probeFn, force = false }) {
+  if (!accountKey || !model || typeof probeFn !== "function") return false;
+  const id = String(model).toLowerCase();
+  const base = id.split(/[\[\(]/)[0];
+  const cache = _probeCacheForAccount(accountKey);
+  const existing = cache.get(base) || cache.get(id);
+  if (!force && _isShapeProbeEntryFresh(existing)) return false;
+  const inflightKey = `${accountKey}\u0000${base}`;
+  if (MODEL_SHAPE_PROBE_INFLIGHT.has(inflightKey)) return false;
+  MODEL_SHAPE_PROBE_INFLIGHT.set(inflightKey, Date.now());
+  Promise.resolve()
+    .then(() => probeFn())
+    .then((shapes) => {
+      if (shapes == null) return; // probe could not determine; skip
+      cache.set(base, {
+        shapes: shapes instanceof Set ? shapes : new Set(shapes),
+        probedAtMs: Date.now(),
+        expiresAtMs: Date.now() + MODEL_SHAPE_PROBE_TTL_MS
+      });
+    })
+    .catch(() => { /* swallow; next request will retry */ })
+    .finally(() => MODEL_SHAPE_PROBE_INFLIGHT.delete(inflightKey));
+  return true;
+}
+
 
 // Strict transport / 5xx / model capacity / transient usage limit -> next shape.
 // Plus one lenient exception: 400 "endpoint unsupported" so Grok-style accounts

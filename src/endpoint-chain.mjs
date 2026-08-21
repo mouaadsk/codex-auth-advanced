@@ -14,7 +14,7 @@ import {
   isShapeFallbackStatus,
   isAccountExhaustionStatus,
   supportedShapesForAccount,
-  supportedShapesForModel
+  supportedShapesForModelWithProbe
 } from "./provider-policy.mjs";
 
 const SHAPE_PATHS = {
@@ -45,7 +45,8 @@ function shapeName(shape) {
 
 function buildShapeAttempts({ sourceShape, account, isCompact, model = null }) {
   const supported = supportedShapesForAccount(account);
-  const modelSupported = supportedShapesForModel(model);
+  const accountKey = account?.account_key || account?.email || account?.alias || null;
+  const modelSupported = supportedShapesForModelWithProbe(model, accountKey);
   const chain = endpointChainForSource(sourceShape);
   const attempts = [];
   const seen = new Set();

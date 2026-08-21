@@ -203,3 +203,77 @@ assert.ok(r3, "chat -> antigravity bridge must build");
 assert.ok(r3.target.url.includes(":streamGenerateContent"));
 
 console.log("endpoint chain bridge ok");
+
+import {
+  recordShapeProbeResult,
+  clearShapeProbeCache,
+  kickOffShapeProbe,
+  supportedShapesForModelWithProbe
+} from "./src/provider-policy.mjs";
+
+// ---------- Probe-driven pruning: model absent from static map ----------
+{
+  clearShapeProbeCache();
+  const planner = createEndpointChainPlanner({
+    sourceShape: WIRE_SHAPES.RESPONSES,
+    model: "discovered-model-1"
+  });
+  planner.prime(vsllmAccount);
+  // Without any probe result, the chain walker still uses the full chain.
+  assert.deepEqual(planner.shapesForAccount(vsllmAccount), [
+    WIRE_SHAPES.RESPONSES, WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.MESSAGES, WIRE_SHAPES.ANTIGRAVITY
+  ]);
+}
+
+// ---------- Probe result prunes the chain ----------
+{
+  clearShapeProbeCache();
+  recordShapeProbeResult(vsllmAccount.account_key, "discovered-model-1", new Set([
+    WIRE_SHAPES.CHAT_COMPLETIONS
+  ]));
+  const planner = createEndpointChainPlanner({
+    sourceShape: WIRE_SHAPES.RESPONSES,
+    model: "discovered-model-1"
+  });
+  planner.prime(vsllmAccount);
+  // Chain walker must prune to chat_completions only.
+  const shapes = planner.shapesForAccount(vsllmAccount);
+  assert.deepEqual(shapes, [WIRE_SHAPES.CHAT_COMPLETIONS]);
+}
+
+// ---------- Per-account probe isolation ----------
+{
+  clearShapeProbeCache();
+  recordShapeProbeResult("acct-A", "model-X", new Set([WIRE_SHAPES.CHAT_COMPLETIONS]));
+  recordShapeProbeResult("acct-B", "model-X", new Set([
+    WIRE_SHAPES.RESPONSES, WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.MESSAGES, WIRE_SHAPES.ANTIGRAVITY
+  ]));
+  const plannerA = createEndpointChainPlanner({ sourceShape: WIRE_SHAPES.RESPONSES, model: "model-X" });
+  plannerA.prime({ ...vsllmAccount, account_key: "acct-A" });
+  const plannerB = createEndpointChainPlanner({ sourceShape: WIRE_SHAPES.RESPONSES, model: "model-X" });
+  plannerB.prime({ ...vsllmAccount, account_key: "acct-B" });
+  assert.deepEqual(plannerA.shapesForAccount({ ...vsllmAccount, account_key: "acct-A" }), [WIRE_SHAPES.CHAT_COMPLETIONS]);
+  assert.deepEqual(plannerB.shapesForAccount({ ...vsllmAccount, account_key: "acct-B" }), [
+    WIRE_SHAPES.RESPONSES, WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.MESSAGES, WIRE_SHAPES.ANTIGRAVITY
+  ]);
+}
+
+// ---------- Probe-pruned chain walker math: only one shape, no failover possible ----------
+{
+  clearShapeProbeCache();
+  recordShapeProbeResult(vsllmAccount.account_key, "chat-only-model", new Set([WIRE_SHAPES.CHAT_COMPLETIONS]));
+  const planner = createEndpointChainPlanner({
+    sourceShape: WIRE_SHAPES.RESPONSES,
+    model: "chat-only-model"
+  });
+  planner.prime(vsllmAccount);
+  const shapes = planner.shapesForAccount(vsllmAccount);
+  // Replicates provider-proxy walker: with only 1 shape, the cursor+1 walk has nowhere to go.
+  assert.equal(shapes.length, 1);
+  assert.equal(shapes[shapes.indexOf(WIRE_SHAPES.CHAT_COMPLETIONS) + 1], undefined);
+}
+
+console.log("endpoint chain + probe ok");

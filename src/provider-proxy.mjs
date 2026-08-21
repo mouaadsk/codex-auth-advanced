@@ -80,6 +80,8 @@ import {
   shapeUrlFor
 } from "./provider-proxy-routing.mjs";
 import { createEndpointChainPlanner, shapeName } from "./endpoint-chain.mjs";
+import { probeModelShapes } from "./shape-probe.mjs";
+import { kickOffShapeProbe, supportedShapesForModelWithProbe } from "./provider-policy.mjs";
 import { handleProviderProxyUpgrade } from "./provider-proxy-upgrade.mjs";
 import { ensureDir, userHome } from "./storage.mjs";
 
@@ -582,6 +584,25 @@ export function createProviderProxy(options) {
       });
       planner.prime(target.account);
       const isCompact = isCompactProxyTarget(target);
+      // Background-probe per-model shape capabilities when we have not seen
+      // this model before on this account. Hard-coded MODEL_SHAPE_CAPABILITIES
+      // and prior probe results short-circuit this; for unknown models we
+      // kick off a one-shot probe so the next request lands on the right
+      // shape without waiting on a chain-walk to discover it.
+      if (originalRequestModel && target.account) {
+        const accountKey = target.account.account_key || target.account.email || target.account.alias || null;
+        const known = supportedShapesForModelWithProbe(originalRequestModel, accountKey);
+        if (!known) {
+          kickOffShapeProbe({
+            accountKey,
+            model: originalRequestModel,
+            probeFn: async () => probeModelShapes({
+              account: target.account,
+              model: originalRequestModel
+            })
+          });
+        }
+      }
 
       // Universal shape bridge dispatcher. Given the current target and the
       // next shape to try, translates the request body into that shape's
