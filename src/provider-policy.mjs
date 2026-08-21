@@ -651,8 +651,14 @@ export function supportedShapesForAccount(account, options = {}) {
     }
   }
   if (account?.api_template === "llmapi" || /llmapi/i.test(String(account?.alias || "") + String(account?.email || ""))) {
+    // LLMAPI documents Claude Code support, which means /v1/messages is
+    // available on the upstream. Include it so Claude Code /compact can route
+    // through the Anthropic Messages shape instead of being forced through
+    // /v1/chat/completions, which OpenAI-mapped Claude models don't serve as
+    // well on llmapi.
     shapes.add(WIRE_SHAPES.RESPONSES);
     shapes.add(WIRE_SHAPES.CHAT_COMPLETIONS);
+    shapes.add(WIRE_SHAPES.MESSAGES);
   }
   if (account?.api_template === "antigravity" || /antigravity/i.test(String(account?.alias || "") + String(account?.email || ""))) {
     shapes.add(WIRE_SHAPES.ANTIGRAVITY);

@@ -518,7 +518,18 @@ export function createProviderProxy(options) {
       // switch to the official Anthropic OAuth target below; an official
       // target can never match the bridge's VSLLM guard.
       claudeResponsesBridge = prepareClaudeResponsesBridge(target, body);
-      if (isClaudeMessagesTarget(target) && isOfficialClaudeModel(rewrittenBody.originalModel)) {
+      // LLMAPI documents Claude Code support at /v1/messages, so a Claude
+      // model on an llmapi account is supposed to be served by llmapi, not
+      // by the official Anthropic OAuth target. The official Anthropic path
+      // is reserved for users who have actually configured an Anthropic
+      // OAuth account — when the active account is llmapi (or any other
+      // provider that supports Anthropic Messages), keep the configured
+      // target so the request reaches the right upstream.
+      const accountSupportsClaudeMessages = target?.account?.api_template === "llmapi"
+        || /llmapi/i.test(String(target?.account?.alias || "") + String(target?.account?.email || ""));
+      if (isClaudeMessagesTarget(target)
+        && isOfficialClaudeModel(rewrittenBody.originalModel)
+        && !accountSupportsClaudeMessages) {
         target = officialAnthropicTargetForProxyRequest(req, route);
       } else if (!target.chatgpt && !target.officialAnthropic && claudeResponsesBridge?.kind !== "responses") {
         // Claude Code /compact is a plain /v1/messages request; detect it by
@@ -1046,6 +1057,28 @@ export function createProviderProxy(options) {
   }
 
   function startProviderProxyServer() {
+    // Prefix every line with an ISO timestamp so the detached log files are
+    // grep-friendly when chasing a transient failure. We patch the console
+    // methods only inside this function so other code paths (CLI commands,
+    // tests) keep emitting bare messages.
+    if (!startProviderProxyServer._consoleTimestamped) {
+      const originalLog = console.log.bind(console);
+      const originalWarn = console.warn.bind(console);
+      const originalError = console.error.bind(console);
+      const format = (args) => {
+        const stamp = new Date().toISOString();
+        const parts = args.map((arg) => {
+          if (typeof arg === "string") return arg;
+          try { return JSON.stringify(arg); } catch { return String(arg); }
+        });
+        return [`[${stamp}]`, ...parts];
+      };
+      console.log = (...args) => originalLog(...format(args));
+      console.warn = (...args) => originalWarn(...format(args));
+      console.error = (...args) => originalError(...format(args));
+      startProviderProxyServer._consoleTimestamped = true;
+    }
+
     const server = http.createServer((req, res) => {
       handleProviderProxyRequest(req, res).catch((error) => {
         writeProxyError(res, 500, `Provider proxy crashed: ${error?.message || error}`);

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import zlib from "node:zlib";
+import { decodeRemoteCompactionV2Summary } from "./src/proxy-body-transforms.mjs";
 
 const repoRoot = new URL(".", import.meta.url).pathname;
 const wrapper = path.join(repoRoot, "bin", "codex-auth-advanced.js");
@@ -22,6 +23,11 @@ const responseFailures = [];
 const claudeCompactionFailures = [];
 const claudeMessageFailures = [];
 let headerStallConnectionCloseCount = 0;
+// When true, the upstream /v1/responses handler returns a type:"message" output
+// for any request whose input contains a compaction_trigger. Used to assert the
+// proxy accepts v2-incompatible upstreams' text summary directly instead of
+// triggering a second /v1/chat/completions round-trip.
+let compactionTriggerReturnsMessageOutput = false;
 const claudeSseBody = [
   "event: message_start",
   `data: ${JSON.stringify({
@@ -239,6 +245,11 @@ const upstream = http.createServer(async (req, res) => {
         { type: "message", role: "assistant", content: "compacted message text" }
       ]
     }));
+  } else if (req.url.endsWith("/chat/completions") && compactionTriggerReturnsMessageOutput) {
+    console.log("[fixture] blocking /v1/chat/completions to force /v1/responses fallback");
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "fixture forces fallback to /v1/responses" } }));
+    return;
   } else if (req.url.endsWith("/chat/completions")) {
     if (claudeCompactionFailures[0] === "unreachable") {
       claudeCompactionFailures.shift();
@@ -257,8 +268,28 @@ const upstream = http.createServer(async (req, res) => {
         }
       ]
     }));
-  } else {
-    const responseFailure = req.url.endsWith("/responses") ? responseFailures.shift() : null;
+  } else if (req.url.endsWith("/responses") && compactionTriggerReturnsMessageOutput) {
+    // Simulate an llmapi-style upstream that produces a real summary but
+    // ships it as type:"message" instead of type:"compaction". The proxy
+    // should accept that text directly so we don't waste a round-trip on
+    // /v1/chat/completions.
+    console.log("[fixture] /v1/responses with flag, body len:", bodyText.length);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "resp_upstream_summary",
+      object: "response",
+      status: "completed",
+      output: [{
+        id: "msg_upstream_summary_0",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "upstream returned this compaction summary directly" }]
+      }]
+    }));
+    return;
+  } else if (req.url.endsWith("/responses")) {
+    const responseFailure = responseFailures.shift();
     if (responseFailure === "no_active_subscription") {
       res.writeHead(402, { "content-type": "application/json" });
       res.end(JSON.stringify({
@@ -677,6 +708,7 @@ const accounts = [
     }
   }),
   writeAccount({ key: "apikey-openai", alias: "openai", template: "openai", baseUrl: upstreamBaseUrl }),
+  writeAccount({ key: "apikey-llmapi", alias: "llmapi", template: "llmapi", baseUrl: upstreamBaseUrl }),
   writeAccount({ key: "chatgpt-business", alias: "business", template: null, baseUrl: upstreamBaseUrl, authMode: "chatgpt" })
 ];
 
@@ -963,6 +995,44 @@ try {
     || !JSON.stringify(expandedSummary).includes("compacted message text")) {
     throw new Error(`a proxy-generated compaction item should expand into readable provider context, got ${upstreamRequests.at(-1).bodyText}`);
   }
+
+  // v2-incompatible upstream (e.g. llmapi) returns type:"message" for the
+  // /v1/responses call even though it produced a real summary. The proxy should
+  // accept that text directly and wrap it in a type:"compaction" envelope, so
+  // Codex sees exactly one upstream request, not two. Switch the active
+  // account to llmapi so the proxy uses preferResponsesFirst=true and the
+  // first /v1/responses attempt is the one we expect to succeed.
+  setActive("apikey-llmapi");
+  compactionTriggerReturnsMessageOutput = true;
+  const beforeAcceptMessage = upstreamRequests.length;
+  const acceptMessageRes = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+  const acceptMessageText = await acceptMessageRes.text();
+  compactionTriggerReturnsMessageOutput = false;
+  if (acceptMessageRes.status !== 200) {
+    throw new Error(`v2 upstream type:"message" output should still yield a 200 compaction, got ${acceptMessageRes.status}:\n${acceptMessageText}`);
+  }
+  if (!String(acceptMessageRes.headers.get("content-type") || "").includes("text/event-stream")) {
+    throw new Error(`v2 upstream type:"message" output should be streamed as SSE, got content-type ${acceptMessageRes.headers.get("content-type")}`);
+  }
+  if (upstreamRequests.length !== beforeAcceptMessage + 1) {
+    throw new Error(`v2 upstream type:"message" should make exactly one upstream request, got ${upstreamRequests.length - beforeAcceptMessage}`);
+  }
+  const acceptMessageReq = upstreamRequests.at(-1);
+  if (!acceptMessageReq?.url.endsWith("/responses")) {
+    throw new Error(`v2 upstream type:"message" should reuse the /v1/responses URL, got ${acceptMessageReq?.url}`);
+  }
+  const acceptMessageEvents = parseSseDataEvents(acceptMessageText);
+  const acceptMessageOutputEvents = acceptMessageEvents.filter((event) => event.type === "response.output_item.done");
+  const acceptMessageSummary = decodeRemoteCompactionV2Summary(acceptMessageOutputEvents[0]?.item?.encrypted_content || "");
+  if (acceptMessageOutputEvents.length !== 1
+    || acceptMessageOutputEvents[0]?.item?.type !== "compaction"
+    || !String(acceptMessageSummary || "").includes("upstream returned this compaction summary directly")) {
+    throw new Error(`v2 upstream type:"message" output should be wrapped in a type:"compaction" envelope, got:\n${acceptMessageText}`);
+  }
+
+  // Restore vsllm so the next suite of tests runs against the same provider
+  // they used before this branch was introduced.
+  setActive("apikey-vsllm");
 
   claudeCompactionFailures.push("unreachable");
   const beforeRemoteCompactionDummy = upstreamRequests.length;
@@ -1268,6 +1338,39 @@ try {
   if (!claudeCompactFallbackReq?.url.endsWith("/chat/completions")) {
     throw new Error(`Claude compaction fallback should use chat completions, got url: ${claudeCompactFallbackReq?.url}`);
   }
+
+  // LLMAPI documents Claude Code support, so /v1/messages is the primary
+  // wire shape. When that fails, the proxy should fall back to /v1/chat/completions
+  // (the only universally available shape on llmapi) and wrap the result in
+  // Anthropic SSE format for Claude Code.
+  setActive("apikey-llmapi");
+  claudeCompactionFailures.push("cloudflare_timeout");
+  const beforeLlmapiClaudeCompact = upstreamRequests.length;
+  const llmapiClaudeCompact = await proxyRawRequest(proxyPort, "/v1/messages", claudeCompactionBody, {
+    "anthropic-version": "2023-06-01"
+  });
+  const llmapiClaudeCompactText = await llmapiClaudeCompact.text();
+  if (llmapiClaudeCompact.status !== 200) {
+    throw new Error(`llmapi Claude compaction fallback should return 200, got ${llmapiClaudeCompact.status}: ${llmapiClaudeCompactText}`);
+  }
+  if (!llmapiClaudeCompact.headers.get("content-type")?.includes("text/event-stream")) {
+    throw new Error(`llmapi Claude compaction fallback should be SSE, got content-type ${llmapiClaudeCompact.headers.get("content-type")}`);
+  }
+  if (!llmapiClaudeCompactText.includes("event: message_start")
+    || !llmapiClaudeCompactText.includes('"type":"text_delta","text":"compacted message text"')
+    || !llmapiClaudeCompactText.includes('"stop_reason":"end_turn"')
+    || !llmapiClaudeCompactText.includes("event: message_stop")) {
+    throw new Error(`llmapi Claude compaction fallback SSE is malformed:\n${llmapiClaudeCompactText}`);
+  }
+  if (upstreamRequests.length !== beforeLlmapiClaudeCompact + 2) {
+    throw new Error(`llmapi Claude compaction fallback should make 2 upstream requests, got ${upstreamRequests.length - beforeLlmapiClaudeCompact}`);
+  }
+  const llmapiClaudeCompactReq = upstreamRequests.at(-1);
+  if (!llmapiClaudeCompactReq?.url.endsWith("/chat/completions")) {
+    throw new Error(`llmapi Claude compaction fallback should use chat completions, got url: ${llmapiClaudeCompactReq?.url}`);
+  }
+  // Restore vsllm for the rest of the suite.
+  setActive("apikey-vsllm");
   const claudeCompactFallbackReqBody = JSON.parse(claudeCompactFallbackReq.bodyText);
   if (claudeCompactFallbackReqBody.model !== "kimi-k3") {
     throw new Error(`Claude compaction fallback should keep model kimi-k3, got ${claudeCompactFallbackReq.bodyText}`);

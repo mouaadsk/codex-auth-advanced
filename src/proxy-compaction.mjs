@@ -558,7 +558,7 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
   try {
     const res = await fetch(shapeUrl, {
       method: "POST",
-      headers: { ...authHeaders, "Content-Type": "application/json" },
+      headers: buildJsonRequestHeaders(authHeaders),
       body: JSON.stringify(summarizeBody),
       signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(60000) : undefined
     });
@@ -581,6 +581,25 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
     console.error(`[Proxy Compact Shape] ${shape} fallback failed:`, err?.message || err);
     return null;
   }
+}
+
+// Build a Headers object for a JSON request body, overriding any existing
+// Content-Type in `authHeaders`. Using a plain-object spread here would emit
+// duplicate `content-type` / `Content-Type` keys that fetch joins with `, `
+// (e.g. `application/json, application/json`), which some upstreams reject
+// with HTTP 400.
+function buildJsonRequestHeaders(authHeaders) {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(authHeaders || {})) {
+    if (key.toLowerCase() === "content-type") continue;
+    if (Array.isArray(value)) {
+      headers.set(key, value.join(", "));
+    } else {
+      headers.set(key, String(value));
+    }
+  }
+  headers.set("Content-Type", "application/json");
+  return headers;
 }
 
 export async function runLocalCompactionFallback(target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {}) {
@@ -629,43 +648,61 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       ? parsed.model.trim()
       : remappedProxyRequestModel(parsed?.model || "gpt-5.5", target, { compact: false }) || "gpt-5.5";
 
-  // Claude path: send the complete, untruncated transcript for summarization.
+  // Claude Code path: send the complete, untruncated transcript for
+  // summarization. The fallback path always uses /v1/chat/completions
+  // because we reach this code only after the upstream's /v1/messages
+  // path failed (the failure handler in provider-proxy.mjs invokes this),
+  // so retrying the same shape is wasteful. Chat completions is the most
+  // universally supported OpenAI-compatible shape on the same upstream.
   if (claudeFormat) {
     const transcript = claudeCompactionTranscriptText(parsed);
     if (!transcript) {
       console.error(`[Proxy Local Compaction] Claude compaction request had no transcript text.`);
       return null;
     }
-    const completionBody = applyReasoningEffort({
+    const summaryText = await summarizeCompactViaChatCompletions({
+      target,
       model: fallbackModel,
+      transcript,
+      authHeaders,
+      buildBody: (body) => applyReasoningEffort(body)
+    });
+    if (!summaryText.trim()) {
+      console.error(`[Proxy Local Compaction] chat completions endpoint returned an empty summary.`);
+      return null;
+    }
+    console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
+    return claudeMessagesCompactionResponse(summaryText, parsed?.model);
+  }
+
+  // Summarize a Claude Code /compact transcript via the upstream's
+  // /v1/chat/completions endpoint (OpenAI chat completions shape). Used
+  // when the upstream speaks OpenAI's chat API rather than Anthropic
+  // Messages.
+  async function summarizeCompactViaChatCompletions({ target, model, transcript, authHeaders, buildBody }) {
+    const completionsUrl = compactionCompletionsUrl(target);
+    if (!completionsUrl) return "";
+    const completionBody = (buildBody || ((b) => b))({
+      model,
       stream: false,
       messages: [{ role: "user", content: transcript }]
     });
     try {
       const res = await fetch(completionsUrl, {
         method: "POST",
-        headers: {
-          ...authHeaders,
-          "Content-Type": "application/json"
-        },
+        headers: buildJsonRequestHeaders(authHeaders),
         body: JSON.stringify(completionBody),
         signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
       });
       if (res.status !== 200) {
         const errText = await res.text().catch(() => "");
         console.error(`[Proxy Local Compaction] completions endpoint failed with status ${res.status}: ${errText.slice(0, 200)}`);
-        return null;
+        return "";
       }
-      const summaryText = await readChatCompletionSummary(res);
-      if (!summaryText.trim()) {
-        console.error(`[Proxy Local Compaction] completions endpoint returned an empty summary.`);
-        return null;
-      }
-      console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
-      return claudeMessagesCompactionResponse(summaryText, parsed?.model);
+      return await readChatCompletionSummary(res);
     } catch (err) {
-      console.error(`[Proxy Local Compaction] Fallback failed with error:`, err);
-      return null;
+      console.error(`[Proxy Local Compaction] completions endpoint failed:`, err?.message || err);
+      return "";
     }
   }
 
@@ -697,10 +734,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       console.log(`[Proxy Local Compaction] Attempting summarization on ${responsesUrl} with model ${fallbackModel}...`);
       const responsesRes = await fetch(responsesUrl, {
         method: "POST",
-        headers: {
-          ...authHeaders,
-          "Content-Type": "application/json"
-        },
+        headers: buildJsonRequestHeaders(authHeaders),
         body: JSON.stringify({
           model: fallbackModel,
           input: [
@@ -724,14 +758,32 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         const responsesData = await responsesRes.json().catch(() => null);
         const firstOutput = Array.isArray(responsesData?.output) ? responsesData.output[0] : null;
         const firstContent = Array.isArray(firstOutput?.content) ? firstOutput.content[0] : null;
-        // The upstream honored the compaction trigger if and only if the first
-        // output item is itself a compaction item. A regular `message` output
-        // means the upstream ignored the trigger (e.g. llmapi today) and we
-        // must fall back to chat completions to get a real summary.
+        // The upstream honored the compaction trigger if the first output is a
+        // real compaction item, OR if it returned a single text message with no
+        // tool calls. The latter is what some v2-incompatible upstreams do
+        // (e.g. llmapi today): they recognize the trigger and produce a real
+        // summary but ship it as type:"message" instead of type:"compaction".
+        // We accept that text directly so we don't pay for a second round-trip
+        // to /v1/chat/completions. Outputs with function_call, web_search, etc.
+        // fall through to the chat completions fallback.
         if (firstOutput?.type === "compaction") {
           const extracted = firstContent?.text || firstOutput?.text || "";
           const text = String(extracted).trim();
           if (text) return text;
+        } else if (firstOutput?.type === "message") {
+          const allParts = Array.isArray(firstOutput?.content) ? firstOutput.content : [];
+          const hasNonTextPart = allParts.some((part) => part && typeof part === "object" && part.type && part.type !== "text" && part.type !== "output_text");
+          const messageText = allParts
+            .filter((part) => part && typeof part === "object" && (part.type === "text" || part.type === "output_text" || part.type === undefined))
+            .map((part) => String(part?.text ?? ""))
+            .join("\n")
+            .trim();
+          // Accept the upstream's text message as the summary only when there
+          // are no tool calls or other non-text output parts (e.g. function_call,
+          // web_search_call, image_generation_call). Anything those -> fall
+          // through to the chat completions fallback, which sends a clean
+          // summarization prompt without the upstream's tool artifacts.
+          if (messageText && !hasNonTextPart) return messageText;
         }
       } else {
         const errText = await responsesRes.text().catch(() => "");
@@ -756,10 +808,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       console.log(`[Proxy Local Compaction] Attempting summarization on ${completionsUrl} with model ${fallbackModel}...`);
       const res = await fetch(completionsUrl, {
         method: "POST",
-        headers: {
-          ...authHeaders,
-          "Content-Type": "application/json"
-        },
+        headers: buildJsonRequestHeaders(authHeaders),
         body: JSON.stringify(currentCompletionBody),
         signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(120000) : undefined
       });
