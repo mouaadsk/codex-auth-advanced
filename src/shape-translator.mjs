@@ -42,7 +42,11 @@ import {
   prepareAntigravityBridge,
   retargetAntigravityBridge,
   translateAntigravityResponseToShape,
-  createAntigravitySseTransformStream
+  createAntigravitySseTransformStream,
+  responsesToGeminiRequest,
+  messagesToGeminiRequest,
+  chatToGeminiRequest,
+  geminiRequestToResponsesRequest
 } from "./antigravity-bridge.mjs";
 import { createChatToResponsesSseTransformStream } from "./chat-responses-sse.mjs";
 
@@ -131,6 +135,10 @@ function responsesToChatRequest(payload) {
       messages.push({ role: "tool", tool_call_id: item.call_id || "", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output || "") });
     }
   }
+  if (typeof source.instructions === "string" && source.instructions.trim()) {
+    if (systemText) systemText = source.instructions + (systemText ? "\n\n" + systemText : "");
+    else systemText = source.instructions.trim();
+  }
   const out = { model: source.model, messages, stream: source.stream === true };
   if (systemText) messages.unshift({ role: "system", content: systemText });
   if (Array.isArray(source.tools) && source.tools.length) {
@@ -180,6 +188,10 @@ function responsesToMessagesRequest(payload) {
       messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: item.call_id || "", content: text }] });
     }
   }
+  if (typeof source.instructions === "string" && source.instructions.trim()) {
+    if (system) system = source.instructions + (system ? "\n\n" + system : "");
+    else system = source.instructions.trim();
+  }
   const out = { model: source.model, messages, max_tokens: 4096 };
   if (system) out.system = system;
   if (Array.isArray(source.tools) && source.tools.length) {
@@ -195,6 +207,20 @@ function responsesToMessagesRequest(payload) {
 function chatToMessagesRequest(payload) {
   const intermediate = translateChatCompletionsRequestToResponses(payload || {});
   return responsesToMessagesRequest(intermediate);
+}
+
+// ---------- Antigravity -> X (Chat / Claude) ----------
+
+function geminiRequestToChatRequest(payload) {
+  const responsesObj = geminiRequestToResponsesRequest(payload);
+  if (!responsesObj) return null;
+  return responsesToChatRequest(responsesObj);
+}
+
+function geminiRequestToMessagesRequest(payload) {
+  const responsesObj = geminiRequestToResponsesRequest(payload);
+  if (!responsesObj) return null;
+  return responsesToMessagesRequest(responsesObj);
 }
 
 // ---------- Response translators (source -> target) ----------
@@ -216,16 +242,16 @@ function chatToMessagesResponse(payload, originalRequest = {}) {
 const REQUEST_TRANSLATORS = {
   [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: responsesToChatRequest,
   [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.MESSAGES}`]: responsesToMessagesRequest,
-  [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.ANTIGRAVITY}`]: null,
+  [`${WIRE_SHAPES.RESPONSES}:${WIRE_SHAPES.ANTIGRAVITY}`]: (payload) => responsesToGeminiRequest(payload),
   [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.RESPONSES}`]: (payload) => translateChatCompletionsRequestToResponses(payload),
   [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.MESSAGES}`]: chatToMessagesRequest,
-  [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.ANTIGRAVITY}`]: null,
+  [`${WIRE_SHAPES.CHAT_COMPLETIONS}:${WIRE_SHAPES.ANTIGRAVITY}`]: (payload) => chatToGeminiRequest(payload),
   [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.RESPONSES}`]: (payload) => translateClaudeMessagesRequestToResponses(payload),
   [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: (payload) => translateClaudeMessagesRequestToChat(payload),
-  [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.ANTIGRAVITY}`]: null,
-  [`${WIRE_SHAPES.ANTIGRAVITY}:${WIRE_SHAPES.RESPONSES}`]: null,
-  [`${WIRE_SHAPES.ANTIGRAVITY}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: null,
-  [`${WIRE_SHAPES.ANTIGRAVITY}:${WIRE_SHAPES.MESSAGES}`]: null
+  [`${WIRE_SHAPES.MESSAGES}:${WIRE_SHAPES.ANTIGRAVITY}`]: (payload) => messagesToGeminiRequest(payload),
+  [`${WIRE_SHAPES.ANTIGRAVITY}:${WIRE_SHAPES.RESPONSES}`]: (payload) => geminiRequestToResponsesRequest(payload),
+  [`${WIRE_SHAPES.ANTIGRAVITY}:${WIRE_SHAPES.CHAT_COMPLETIONS}`]: (payload) => geminiRequestToChatRequest(payload),
+  [`${WIRE_SHAPES.ANTIGRAVITY}:${WIRE_SHAPES.MESSAGES}`]: (payload) => geminiRequestToMessagesRequest(payload)
 };
 
 const RESPONSE_TRANSLATORS = {

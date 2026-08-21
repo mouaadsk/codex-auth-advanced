@@ -21,7 +21,6 @@
 
 import { Transform } from "node:stream";
 import { translateChatCompletionsRequestToResponses, translateResponsesResponseToChat } from "./chat-responses-core.mjs";
-import { translateClaudeMessagesRequestToResponses } from "./claude-responses-core.mjs";
 import { translateResponsesResponseToClaude } from "./claude-responses-responses.mjs";
 
 function parseBody(body) {
@@ -379,6 +378,104 @@ function geminiResponseToMessages(payload, originalRequest = {}) {
     response: responsesObj
   }, originalRequest);
 }
+
+
+// ---------- Gemini request -> X request (the inverse of XToGeminiRequest) ----------
+
+function geminiPartToResponsesPart(part) {
+  if (!part || typeof part !== "object") return null;
+  if (typeof part.text === "string" && !part.functionCall && !part.functionResponse && !part.inlineData && !part.fileData) {
+    return { type: "input_text", text: part.text };
+  }
+  if (part.inlineData && typeof part.inlineData === "object") {
+    const mime = part.inlineData.mimeType || "image/png";
+    const data = part.inlineData.data || "";
+    return { type: "input_image", image_url: `data:${mime};base64,${data}` };
+  }
+  if (part.fileData && typeof part.fileData === "object") {
+    return { type: "input_image", image_url: String(part.fileData.fileUri || "") };
+  }
+  return null;
+}
+
+function geminiContentsToResponsesInput(contents) {
+  const out = [];
+  for (const content of asArray(contents)) {
+    if (!content || typeof content !== "object") continue;
+    const role = content.role === "model" ? "assistant" : "user";
+    if (Array.isArray(content.parts)) {
+      const textParts = [];
+      const functionCalls = [];
+      const functionOutputs = [];
+      for (const part of content.parts) {
+        if (!part || typeof part !== "object") continue;
+        if (part.functionCall) {
+          functionCalls.push(part.functionCall);
+          continue;
+        }
+        if (part.functionResponse) {
+          functionOutputs.push(part.functionResponse);
+          continue;
+        }
+        const translated = geminiPartToResponsesPart(part);
+        if (translated) textParts.push(translated);
+      }
+      if (textParts.length > 0) {
+        out.push({ type: "message", role, content: textParts });
+      }
+      for (const fc of functionCalls) {
+        out.push({
+          type: "function_call",
+          call_id: `call_${Math.random().toString(36).slice(2, 10)}`,
+          name: fc.name || "tool",
+          arguments: safeStringify(fc.args || {})
+        });
+      }
+      for (const fr of functionOutputs) {
+        const responsePayload = fr.response || {};
+        out.push({
+          type: "function_call_output",
+          call_id: `call_${Math.random().toString(36).slice(2, 10)}`,
+          output: typeof responsePayload.output === "string"
+            ? responsePayload.output
+            : safeStringify(responsePayload)
+        });
+      }
+    }
+  }
+  return out;
+}
+
+export function geminiRequestToResponsesRequest(payload) {
+  const wrapper = payload && typeof payload === "object" ? payload : {};
+  const inner = wrapper.request || wrapper;
+  const out = {};
+  if (wrapper.model) out.model = wrapper.model;
+  else if (inner.model) out.model = inner.model;
+  if (typeof inner.systemInstruction === "object" && inner.systemInstruction) {
+    const sysText = asArray(inner.systemInstruction.parts).map((p) => p?.text || "").filter(Boolean).join("\n");
+    if (sysText) out.instructions = sysText;
+  }
+  const input = geminiContentsToResponsesInput(inner.contents);
+  if (input.length) out.input = input;
+  const genConfig = inner.generationConfig || {};
+  if (Number.isFinite(Number(genConfig.temperature))) out.temperature = Number(genConfig.temperature);
+  if (Number.isFinite(Number(genConfig.topP))) out.top_p = Number(genConfig.topP);
+  if (Number.isFinite(Number(genConfig.maxOutputTokens))) out.max_output_tokens = Number(genConfig.maxOutputTokens);
+  if (Array.isArray(inner.tools)) {
+    const declarations = inner.tools.flatMap((tool) => asArray(tool?.functionDeclarations));
+    if (declarations.length) {
+      out.tools = declarations.map((tool) => ({
+        type: "function",
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.parameters || { type: "object", properties: {} }
+      }));
+    }
+  }
+  return out;
+}
+
 
 // ---------- URL builder ----------
 
