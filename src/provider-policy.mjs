@@ -84,6 +84,46 @@ export function isVsllmApiAccount(account, endpoint = "") {
   return isVsllm || isLlmapi || accountOrEndpointMatches(endpoint, "vsllm.com") || accountOrEndpointMatches(endpoint, "llmapi.pro");
 }
 
+// Stable provider slug used to key the persistent per-(provider, model)
+// wire-shape capability cache. Independent of the per-account alias (which
+// can change across machine migrations) and stable across restarts so the
+// probe results survive proxy restarts.
+export function providerSlugForTarget(target = null, account = null) {
+  // 1. Prefer the explicit apiTemplate already attached to the target by
+  //    account-service (e.g. "vsllm", "llmapi", "tcdmx").
+  const tpl = String(target?.apiTemplate || "").trim().toLowerCase();
+  if (tpl && tpl !== "openai") return tpl;
+  const explicit = String(account?.api_template || "").trim().toLowerCase();
+  if (explicit && explicit !== "openai") return explicit;
+  // 2. Fall back to hostname detection.
+  let hostname = "";
+  for (const candidate of [
+    target?.upstreamBaseUrl,
+    target?.upstream_base_url,
+    account?.upstream_base_url,
+    target?.url
+  ]) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    try {
+      hostname = new URL(candidate).hostname.toLowerCase();
+      break;
+    } catch { /* try next */ }
+  }
+  if (hostname === "vsllm.com" || hostname === "api.vsllm.com" || hostname.endsWith(".vsllm.com")) return "vsllm";
+  if (hostname === "llmapi.pro" || hostname.endsWith(".llmapi.pro")) return "llmapi";
+  // 3. Fall back to alias/email heuristics.
+  const label = [account?.alias, account?.email, account?.account_name]
+    .filter((v) => typeof v === "string")
+    .join(" ")
+    .toLowerCase();
+  if (label.includes("vsllm")) return "vsllm";
+  if (label.includes("llmapi")) return "llmapi";
+  if (label.includes("antigravity")) return "antigravity";
+  // 4. Last resort: a sanitized hostname, or "unknown".
+  if (hostname) return hostname.replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "unknown";
+  return "unknown";
+}
+
 export function apiSpendLimitUsd(account, options = {}) {
   const value = Number(account?.api_spend_limit_usd);
   if (Number.isFinite(value) && value > 0) return value;

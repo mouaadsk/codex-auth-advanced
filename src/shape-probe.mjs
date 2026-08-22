@@ -54,8 +54,9 @@ function antigravityPathFor(model) {
   return `/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 }
 
-function resolveUpstreamBase(account) {
+function resolveUpstreamBase(account, target) {
   const candidates = [
+    target?.upstreamBaseUrl,
     account?.upstream_base_url,
     account?.upstreamBaseUrl,
     account?.base_url,
@@ -63,6 +64,19 @@ function resolveUpstreamBase(account) {
   ].filter((v) => typeof v === "string" && v.trim());
   if (!candidates.length) return null;
   return candidates[0].replace(/\/+$/, "");
+}
+
+function resolveApiKey(account, target) {
+  // The account registry often does not store the API key; it lives in the
+  // account's auth.json file and is exposed via target.apiKey (set by
+  // account-service when building the proxy target).
+  const candidates = [
+    target?.apiKey,
+    account?.api_key,
+    account?.apiKey,
+    account?.OPENAI_API_KEY
+  ].filter((v) => typeof v === "string" && v.trim());
+  return candidates[0] || null;
 }
 
 async function probeOneShape({ baseUrl, apiKey, model, shape, signal }) {
@@ -75,9 +89,13 @@ async function probeOneShape({ baseUrl, apiKey, model, shape, signal }) {
   try {
     const response = await fetch(url, {
       method: "POST",
+      // Explicit accept-encoding: identity so the upstream gets a stable,
+      // non-gzip request (also avoids Node's automatic gzip,deflate,br
+      // default from polluting test fixtures that record the last request).
       headers: {
         "authorization": `Bearer ${apiKey}`,
-        "content-type": "application/json"
+        "content-type": "application/json",
+        "accept-encoding": "identity"
       },
       body: JSON.stringify(body),
       signal
@@ -136,10 +154,10 @@ function safeJsonParse(text) {
  * @param {number} [options.timeoutMs]  total budget across all 4 probes
  * @param {object} [options.supported]  Set of shapes the account supports (skipped if absent)
  */
-export async function probeModelShapes({ account, model, timeoutMs = PROBE_TIMEOUT_MS, supported = null }) {
+export async function probeModelShapes({ account, model, target = null, timeoutMs = PROBE_TIMEOUT_MS, supported = null }) {
   if (!account || !model) return null;
-  const baseUrl = resolveUpstreamBase(account);
-  const apiKey = account?.api_key;
+  const baseUrl = resolveUpstreamBase(account, target);
+  const apiKey = resolveApiKey(account, target);
   if (!baseUrl || !apiKey) return null;
   const accountSupported = supported || supportedShapesForAccount(account);
   const candidateShapes = [
@@ -155,7 +173,7 @@ export async function probeModelShapes({ account, model, timeoutMs = PROBE_TIMEO
   timeout.unref?.();
   try {
     const results = await Promise.all(candidateShapes.map((shape) =>
-      probeOneShape({ baseUrl, apiKey, model, shape, signal: controller.signal })
+      probeOneShape({ baseUrl, apiKey, model, shape, target, signal: controller.signal })
     ));
     const supported2 = new Set();
     for (const r of results) if (r.supported) supported2.add(r.shape);

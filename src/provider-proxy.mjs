@@ -81,7 +81,8 @@ import {
 } from "./provider-proxy-routing.mjs";
 import { createEndpointChainPlanner, shapeName } from "./endpoint-chain.mjs";
 import { probeModelShapes } from "./shape-probe.mjs";
-import { kickOffShapeProbe, supportedShapesForModelWithProbe } from "./provider-policy.mjs";
+import { loadShapeCapabilityCache, upsertShapeCapability } from "./shape-probe-store.mjs";
+import { kickOffShapeProbe, providerSlugForTarget, recordShapeProbeResult, supportedShapesForModelWithProbe } from "./provider-policy.mjs";
 import { handleProviderProxyUpgrade } from "./provider-proxy-upgrade.mjs";
 import { ensureDir, userHome } from "./storage.mjs";
 
@@ -121,6 +122,19 @@ export function createProviderProxy(options) {
 
   const claudeGatewayCatalogCache = new Map();
   const claudeGatewayCatalogCacheTtlMs = 5 * 60 * 1000;
+  try {
+    const persisted = loadShapeCapabilityCache();
+    if (persisted && persisted.providers) {
+      for (const [providerSlug, models] of Object.entries(persisted.providers)) {
+        for (const [modelId, entry] of Object.entries(models || {})) {
+          if (!entry || !Array.isArray(entry.shapes) || !entry.shapes.length) continue;
+          recordShapeProbeResult(providerSlug, modelId, entry.shapes);
+        }
+      }
+    }
+  } catch (err) {
+    process.stderr.write(`codex-auth-advanced: failed to preload shape capability cache: ${err?.message || err}\n`);
+  }
   let providerProxyServer = null;
   let providerProxyStartedAtMs = null;
   let providerProxyRestartRequested = false;
@@ -589,17 +603,33 @@ export function createProviderProxy(options) {
       // and prior probe results short-circuit this; for unknown models we
       // kick off a one-shot probe so the next request lands on the right
       // shape without waiting on a chain-walk to discover it.
-      if (originalRequestModel && target.account) {
-        const accountKey = target.account.account_key || target.account.email || target.account.alias || null;
-        const known = supportedShapesForModelWithProbe(originalRequestModel, accountKey);
+      if (originalRequestModel && target.account
+        && process.env.CODEX_AUTH_ADVANCED_DISABLE_SHAPE_PROBE !== "1") {
+        const providerSlug = providerSlugForTarget(target, target.account);
+        const known = supportedShapesForModelWithProbe(originalRequestModel, providerSlug);
         if (!known) {
-          kickOffShapeProbe({
-            accountKey,
-            model: originalRequestModel,
-            probeFn: async () => probeModelShapes({
-              account: target.account,
-              model: originalRequestModel
-            })
+          const probeAccount = target.account;
+          const probeTarget = { upstreamBaseUrl: target.upstreamBaseUrl, apiKey: target.apiKey };
+          setImmediate(() => {
+            kickOffShapeProbe({
+              accountKey: providerSlug,
+              model: originalRequestModel,
+              probeFn: async () => {
+                const shapes = await probeModelShapes({
+                  account: probeAccount,
+                  model: originalRequestModel,
+                  target: probeTarget
+                });
+                if (shapes && shapes.size) {
+                  upsertShapeCapability({
+                    providerSlug,
+                    model: originalRequestModel,
+                    supportedShapes: [...shapes]
+                  });
+                }
+                return shapes;
+              }
+            });
           });
         }
       }

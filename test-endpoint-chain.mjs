@@ -226,36 +226,37 @@ import {
   ]);
 }
 
-// ---------- Probe result prunes the chain ----------
+// ---------- Probe result prunes the chain (per-provider slug) ----------
 {
   clearShapeProbeCache();
-  recordShapeProbeResult(vsllmAccount.account_key, "discovered-model-1", new Set([
+  recordShapeProbeResult("vsllm", "discovered-model-1", new Set([
     WIRE_SHAPES.CHAT_COMPLETIONS
   ]));
   const planner = createEndpointChainPlanner({
     sourceShape: WIRE_SHAPES.RESPONSES,
     model: "discovered-model-1"
   });
-  planner.prime(vsllmAccount);
+  // prime with a target whose apiTemplate resolves to "vsllm" slug
+  planner.prime(vsllmAccount, { apiTemplate: "vsllm" });
   // Chain walker must prune to chat_completions only.
   const shapes = planner.shapesForAccount(vsllmAccount);
   assert.deepEqual(shapes, [WIRE_SHAPES.CHAT_COMPLETIONS]);
 }
 
-// ---------- Per-account probe isolation ----------
+// ---------- Per-provider probe isolation ----------
 {
   clearShapeProbeCache();
-  recordShapeProbeResult("acct-A", "model-X", new Set([WIRE_SHAPES.CHAT_COMPLETIONS]));
-  recordShapeProbeResult("acct-B", "model-X", new Set([
+  recordShapeProbeResult("provider-a", "model-X", new Set([WIRE_SHAPES.CHAT_COMPLETIONS]));
+  recordShapeProbeResult("provider-b", "model-X", new Set([
     WIRE_SHAPES.RESPONSES, WIRE_SHAPES.CHAT_COMPLETIONS,
     WIRE_SHAPES.MESSAGES, WIRE_SHAPES.ANTIGRAVITY
   ]));
   const plannerA = createEndpointChainPlanner({ sourceShape: WIRE_SHAPES.RESPONSES, model: "model-X" });
-  plannerA.prime({ ...vsllmAccount, account_key: "acct-A" });
+  plannerA.prime(vsllmAccount, { apiTemplate: "provider-A" });
   const plannerB = createEndpointChainPlanner({ sourceShape: WIRE_SHAPES.RESPONSES, model: "model-X" });
-  plannerB.prime({ ...vsllmAccount, account_key: "acct-B" });
-  assert.deepEqual(plannerA.shapesForAccount({ ...vsllmAccount, account_key: "acct-A" }), [WIRE_SHAPES.CHAT_COMPLETIONS]);
-  assert.deepEqual(plannerB.shapesForAccount({ ...vsllmAccount, account_key: "acct-B" }), [
+  plannerB.prime(vsllmAccount, { apiTemplate: "provider-B" });
+  assert.deepEqual(plannerA.shapesForAccount(vsllmAccount), [WIRE_SHAPES.CHAT_COMPLETIONS]);
+  assert.deepEqual(plannerB.shapesForAccount(vsllmAccount), [
     WIRE_SHAPES.RESPONSES, WIRE_SHAPES.CHAT_COMPLETIONS,
     WIRE_SHAPES.MESSAGES, WIRE_SHAPES.ANTIGRAVITY
   ]);
@@ -264,12 +265,12 @@ import {
 // ---------- Probe-pruned chain walker math: only one shape, no failover possible ----------
 {
   clearShapeProbeCache();
-  recordShapeProbeResult(vsllmAccount.account_key, "chat-only-model", new Set([WIRE_SHAPES.CHAT_COMPLETIONS]));
+  recordShapeProbeResult("vsllm", "chat-only-model", new Set([WIRE_SHAPES.CHAT_COMPLETIONS]));
   const planner = createEndpointChainPlanner({
     sourceShape: WIRE_SHAPES.RESPONSES,
     model: "chat-only-model"
   });
-  planner.prime(vsllmAccount);
+  planner.prime(vsllmAccount, { apiTemplate: "vsllm" });
   const shapes = planner.shapesForAccount(vsllmAccount);
   // Replicates provider-proxy walker: with only 1 shape, the cursor+1 walk has nowhere to go.
   assert.equal(shapes.length, 1);

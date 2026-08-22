@@ -771,7 +771,8 @@ const proxy = spawn(process.execPath, [wrapper, "proxy", "serve"], {
     CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL: upstreamBaseUrl,
     CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL: `${upstreamBaseUrl}${officialAnthropicPathPrefix}`,
     CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS: "5",
-    CODEX_AUTH_ADVANCED_STREAM_STALL_WATCHDOG_MS: "400"
+    CODEX_AUTH_ADVANCED_STREAM_STALL_WATCHDOG_MS: "400",
+    CODEX_AUTH_ADVANCED_DISABLE_SHAPE_PROBE: "1"
   },
   stdio: ["ignore", "pipe", "pipe"]
 });

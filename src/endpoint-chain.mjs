@@ -14,7 +14,8 @@ import {
   isShapeFallbackStatus,
   isAccountExhaustionStatus,
   supportedShapesForAccount,
-  supportedShapesForModelWithProbe
+  supportedShapesForModelWithProbe,
+  providerSlugForTarget
 } from "./provider-policy.mjs";
 
 const SHAPE_PATHS = {
@@ -43,10 +44,14 @@ function shapeName(shape) {
   return SHAPE_PATH_NAMES[shape] || shape;
 }
 
-function buildShapeAttempts({ sourceShape, account, isCompact, model = null }) {
+function buildShapeAttempts({ sourceShape, account, isCompact, model = null, target = null }) {
   const supported = supportedShapesForAccount(account);
-  const accountKey = account?.account_key || account?.email || account?.alias || null;
-  const modelSupported = supportedShapesForModelWithProbe(model, accountKey);
+  // Key the per-model capability lookup by provider slug (e.g. "vsllm",
+  // "llmapi") so the same model can have different capability sets on
+  // different providers, and so probe results survive proxy restarts via
+  // the persistent cache (which is also keyed by provider slug).
+  const providerSlug = providerSlugForTarget(target, account);
+  const modelSupported = supportedShapesForModelWithProbe(model, providerSlug);
   const chain = endpointChainForSource(sourceShape);
   const attempts = [];
   const seen = new Set();
@@ -84,20 +89,27 @@ export function createEndpointChainPlanner({
 } = {}) {
   const attemptsByAccount = new Map(); // account_key -> ordered shapes
   let lastAccountKey = null;
+  let currentTarget = null;
   let currentShapes = [];
   let cursor = -1;
 
   function ensureAccountShapes(account) {
     if (!account || typeof account !== "object") return [];
-    const key = account.account_key || account.email || account.alias || "anonymous";
+    const acctKey = account.account_key || account.email || account.alias || "anonymous";
+    const slugKey = providerSlugForTarget(currentTarget, account);
+    // Cache key includes both the account and the provider slug so two
+    // requests on different providers that happen to share an account key
+    // (or in tests, the same account) compute distinct shape chains.
+    const key = `${acctKey}\u0000${slugKey}`;
     if (attemptsByAccount.has(key)) return attemptsByAccount.get(key);
-    const attempts = buildShapeAttempts({ sourceShape, account, isCompact, model });
+    const attempts = buildShapeAttempts({ sourceShape, account, isCompact, model, target: currentTarget });
     attemptsByAccount.set(key, attempts);
     return attempts;
   }
 
-  function prime(account) {
+  function prime(account, targetArg = null) {
     lastAccountKey = account?.account_key || account?.email || account?.alias || null;
+    currentTarget = targetArg || currentTarget;
     currentShapes = ensureAccountShapes(account);
     // Shapes are tried in order. The caller is responsible for tracking which
     // shape was just attempted; this planner only exposes the ordered list.
