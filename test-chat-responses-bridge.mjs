@@ -63,6 +63,16 @@ assert.equal(toolCall.call_id, toolResult.call_id);
 assert.equal(toolCall.name, responses.tools[0].name);
 assert.deepEqual(JSON.parse(toolCall.arguments), { path: "/tmp" });
 
+// Chat Completions does not imply an `xhigh` conversion. Preserve the caller's
+// value (including Codex's `max` alias) so provider-specific policy can decide
+// how to handle it.
+const maxEffortResponses = translateChatCompletionsRequestToResponses({
+  model: "gpt-5.6-sol",
+  messages: [{ role: "user", content: "hi" }],
+  reasoning_effort: "max"
+});
+assert.equal(maxEffortResponses.reasoning.effort, "max");
+
 // Image round-trip
 const imageOnly = translateChatCompletionsRequestToResponses({
   model: "grok-4.5",

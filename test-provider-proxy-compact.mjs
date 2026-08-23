@@ -22,6 +22,7 @@ const compactFailures = [];
 const responseFailures = [];
 const claudeCompactionFailures = [];
 const claudeMessageFailures = [];
+const reasoningLevelFailures = [];
 let headerStallConnectionCloseCount = 0;
 // When true, the upstream /v1/responses handler returns a type:"message" output
 // for any request whose input contains a compaction_trigger. Used to assert the
@@ -108,6 +109,18 @@ const upstream = http.createServer(async (req, res) => {
   });
   const isProviderSummarizationRequest = (req.url.endsWith("/chat/completions") || req.url.endsWith("/responses"))
     && bodyText.includes("Here is the conversation history to summarize:");
+  if (isProviderSummarizationRequest && reasoningLevelFailures.length > 0) {
+    const rejectedLevel = reasoningLevelFailures.shift();
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      error: {
+        message: `level "${rejectedLevel}" not supported, valid levels: low, medium, high`,
+        type: "invalid_request_error",
+        code: null
+      }
+    }));
+    return;
+  }
   if (isProviderSummarizationRequest && summarizationFailureMode) {
     const mode = summarizationFailureMode;
     if (mode === "access") {
@@ -1015,6 +1028,32 @@ try {
   if (remoteCompactionCompletedEvents.length !== 1
     || !String(remoteCompactionCompletedEvents[0]?.response?.id || "").startsWith("resp_compact_")) {
     throw new Error(`remote compaction v2 should emit one response.completed event, got:\n${remoteCompactionV2Text}`);
+  }
+
+  // A VSLLM/New API channel may reject `max` even though another channel for
+  // the same model accepts it. The proxy must retry the provider summarizer,
+  // preserve `max` on every attempt, and stop after the bounded retry budget.
+  const maxReasoningCompactionBody = {
+    ...remoteCompactionV2Body,
+    reasoning: { effort: "max", summary: "auto" }
+  };
+  reasoningLevelFailures.push("max", "max");
+  const beforeMaxReasoningCompaction = upstreamRequests.length;
+  const maxReasoningCompaction = await proxyRawRequest(proxyPort, "/responses", maxReasoningCompactionBody);
+  const maxReasoningCompactionText = await maxReasoningCompaction.text();
+  if (maxReasoningCompaction.status !== 200) {
+    throw new Error(`max-effort compaction should recover after channel retries, got ${maxReasoningCompaction.status}:\n${maxReasoningCompactionText}`);
+  }
+  const maxReasoningRequests = upstreamRequests.slice(beforeMaxReasoningCompaction);
+  if (maxReasoningRequests.length !== 3
+    || maxReasoningRequests.some((request) => request.authorization !== "Bearer vsllm-secret")) {
+    throw new Error(`max-effort compaction should make exactly two retries on the same VSLLM account, got ${JSON.stringify(maxReasoningRequests)}`);
+  }
+  for (const request of maxReasoningRequests) {
+    const requestBody = JSON.parse(request.bodyText);
+    if (requestBody.reasoning_effort !== "max") {
+      throw new Error(`max-effort compaction must preserve reasoning_effort=max on retries, got ${request.bodyText}`);
+    }
   }
 
   // A completed explicit switch must select the same credentials for both a

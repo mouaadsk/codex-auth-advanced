@@ -49,7 +49,12 @@ import {
   resolvedClaudeGatewayModelId,
   rollingApiSpendFromTotal
 } from "./src/provider-policy.mjs";
-import { normalizeCompactionResponse, repairProviderProxyBodyPlaintext } from "./src/proxy-compaction.mjs";
+import {
+  fetchCompactionWithVsllmReasoningRetry,
+  isUnsupportedVsllmReasoningLevelResponse,
+  normalizeCompactionResponse,
+  repairProviderProxyBodyPlaintext
+} from "./src/proxy-compaction.mjs";
 import {
   decodeRemoteCompactionV2Summary,
   encodeRemoteCompactionV2Summary,
@@ -372,6 +377,110 @@ try {
   assert.equal(rewrittenJson.model, "gpt-5.5");
   assert.equal(rewrittenJson.client_metadata, undefined);
   assert.equal(rewrittenJson.reasoning.effort, "xhigh");
+
+  // VSLLM/New API can select a channel whose reasoning-level list is narrower
+  // than another channel serving the same model. Keep the requested high-end
+  // level unchanged and retry only the exact provider validation error; do not
+  // translate `max` to `xhigh` because neither value is universally supported
+  // by every channel.
+  assert.equal(
+    isUnsupportedVsllmReasoningLevelResponse(
+      JSON.stringify({ error: { message: 'level "max" not supported, valid levels: low, medium, high' } }),
+      "max"
+    ),
+    true
+  );
+  assert.equal(
+    isUnsupportedVsllmReasoningLevelResponse(
+      'level "max" not supported, valid levels: low, medium, high',
+      "xhigh"
+    ),
+    false
+  );
+
+  const retryTarget = {
+    apiTemplate: "vsllm",
+    account: { alias: "vsllm" },
+    url: "https://api.vsllm.com/v1/chat/completions"
+  };
+  const retryBodies = [];
+  let retryCalls = 0;
+  const retriedResponse = await fetchCompactionWithVsllmReasoningRetry(
+    retryTarget.url,
+    {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-5.6-sol", reasoning_effort: "max" })
+    },
+    {
+      target: retryTarget,
+      requestBody: { model: "gpt-5.6-sol", reasoning_effort: "max" },
+      timeoutMs: 0,
+      delayMs: 0,
+      fetchImpl: async (_url, init) => {
+        retryCalls += 1;
+        retryBodies.push(JSON.parse(init.body));
+        if (retryCalls < 3) {
+          return new Response(JSON.stringify({
+            error: { message: 'level "max" not supported, valid levels: low, medium, high' }
+          }), { status: 400, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    }
+  );
+  assert.equal(retriedResponse.status, 200);
+  assert.equal(retryCalls, 3);
+  assert.deepEqual(retryBodies, [
+    { model: "gpt-5.6-sol", reasoning_effort: "max" },
+    { model: "gpt-5.6-sol", reasoning_effort: "max" },
+    { model: "gpt-5.6-sol", reasoning_effort: "max" }
+  ]);
+
+  let cappedRetryCalls = 0;
+  const cappedResponse = await fetchCompactionWithVsllmReasoningRetry(
+    retryTarget.url,
+    { method: "POST", body: "{}" },
+    {
+      target: retryTarget,
+      requestBody: { reasoning_effort: "xhigh" },
+      timeoutMs: 0,
+      delayMs: 0,
+      fetchImpl: async () => {
+        cappedRetryCalls += 1;
+        return new Response(
+          JSON.stringify({ error: { message: 'level "xhigh" not supported, valid levels: low, medium, high' } }),
+          { status: 400 }
+        );
+      }
+    }
+  );
+  assert.equal(cappedResponse.status, 400);
+  assert.equal(cappedRetryCalls, 3, "reasoning retry must remain bounded");
+
+  let nonVsllmCalls = 0;
+  const nonVsllmResponse = await fetchCompactionWithVsllmReasoningRetry(
+    "https://api.example.com/v1/chat/completions",
+    { method: "POST", body: "{}" },
+    {
+      target: {
+        apiTemplate: "openai",
+        account: { alias: "openai" },
+        url: "https://api.example.com/v1/chat/completions"
+      },
+      requestBody: { reasoning_effort: "max" },
+      timeoutMs: 0,
+      delayMs: 0,
+      fetchImpl: async () => {
+        nonVsllmCalls += 1;
+        return new Response(
+          JSON.stringify({ error: { message: 'level "max" not supported, valid levels: low, medium, high' } }),
+          { status: 400 }
+        );
+      }
+    }
+  );
+  assert.equal(nonVsllmResponse.status, 400);
+  assert.equal(nonVsllmCalls, 1, "non-VSLLM requests must not receive this retry");
 
   const repairRequest = {
     model: "gpt-5.5",

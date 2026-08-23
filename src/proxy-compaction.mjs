@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   isVsllmApiAccount,
+  providerSlugForTarget,
   remappedProxyRequestModel,
   resolvedClaudeGatewayModelId
 } from "./provider-policy.mjs";
@@ -26,6 +27,83 @@ const compactionFailurePriorities = {
   upstream_rejected: 70,
   invalid_response: 50
 };
+
+// New API can route two requests for the same public model to different
+// upstream channels. Some channels validate reasoning_effort against a
+// narrower capability list and return HTTP 400 for a high-end level such as
+// `max`, `xhigh`, or `ultra`, while another channel behind the same VSLLM
+// account accepts it. The request is a local, non-streaming summarization
+// call, so a small bounded retry is safe and does not change the requested
+// effort or silently downgrade quality.
+const vsllmReasoningLevelMaxRetries = 2;
+const vsllmReasoningLevelRetryDelayMs = 150;
+const vsllmReasoningRetryEfforts = new Set(["max", "xhigh", "ultra"]);
+
+function reasoningEffortFromRequestBody(body) {
+  if (!body || typeof body !== "object") return "";
+  const effort = body.reasoning_effort ?? body.reasoning?.effort;
+  return typeof effort === "string" ? effort.trim().toLowerCase() : "";
+}
+
+function isVsllmReasoningRetryTarget(target) {
+  return providerSlugForTarget(target, target?.account) === "vsllm";
+}
+
+export function isUnsupportedVsllmReasoningLevelResponse(text, requestedEffort = "max") {
+  const expected = String(requestedEffort || "").trim().toLowerCase();
+  if (!expected) return false;
+  const raw = String(text || "");
+  let source = raw;
+  try {
+    const parsed = JSON.parse(raw);
+    source = String(parsed?.error?.message ?? parsed?.message ?? raw);
+  } catch {
+    // Some gateways prefix/suffix their JSON error. Match the raw body below.
+  }
+  const match = source.match(/level\s+["']([^"']+)["']\s+not\s+supported\b/i);
+  if (!match || String(match[1] || "").trim().toLowerCase() !== expected) return false;
+  return /valid\s+levels?\s*:/i.test(source);
+}
+
+export async function fetchCompactionWithVsllmReasoningRetry(url, init, {
+  target,
+  requestBody,
+  timeoutMs,
+  label = "summarization",
+  // Tests can inject a fetcher and zero-delay sleeper. Production callers use
+  // the global fetch and a short delay so New API can select another channel.
+  fetchImpl = globalThis.fetch,
+  delayMs = vsllmReasoningLevelRetryDelayMs,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+} = {}) {
+  const requestedEffort = reasoningEffortFromRequestBody(requestBody);
+  const eligible = isVsllmReasoningRetryTarget(target)
+    && vsllmReasoningRetryEfforts.has(requestedEffort);
+  const maxRetries = eligible ? vsllmReasoningLevelMaxRetries : 0;
+  let response = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const attemptInit = { ...init };
+    if (Number.isFinite(Number(timeoutMs))
+      && Number(timeoutMs) > 0
+      && typeof AbortSignal !== "undefined"
+      && typeof AbortSignal.timeout === "function") {
+      attemptInit.signal = AbortSignal.timeout(Number(timeoutMs));
+    }
+    response = await fetchImpl(url, attemptInit);
+    if (!eligible || response.status !== 400 || attempt >= maxRetries) return response;
+
+    const errorText = await response.clone().text().catch(() => "");
+    if (!isUnsupportedVsllmReasoningLevelResponse(errorText, requestedEffort)) return response;
+
+    console.warn(
+      `[Proxy Local Compaction] VSLLM rejected reasoning level ${JSON.stringify(requestedEffort)} for ${label}; retrying through the provider channel selector (${attempt + 1}/${maxRetries}).`
+    );
+    await sleep(Math.max(0, Number(delayMs) || 0));
+  }
+
+  return response;
+}
 
 function resetCompactionFailure(target) {
   if (target && typeof target === "object") compactionFailures.delete(target);
@@ -649,11 +727,15 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
   if (!summarizeBody) return null;
   const authHeaders = sanitizeRequestHeaders(headers, target, { omitContentEncoding: true });
   try {
-    const res = await fetch(shapeUrl, {
+    const res = await fetchCompactionWithVsllmReasoningRetry(shapeUrl, {
       method: "POST",
       headers: buildJsonRequestHeaders(authHeaders),
-      body: JSON.stringify(summarizeBody),
-      signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(60000) : undefined
+      body: JSON.stringify(summarizeBody)
+    }, {
+      target,
+      requestBody: summarizeBody,
+      timeoutMs: 60000,
+      label: `${shape} shape`
     });
     const summaryText = await readShapeSummarizeResponse({ shape, res });
     if (!summaryText) {
@@ -792,11 +874,15 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       messages: [{ role: "user", content: transcript }]
     });
     try {
-      const res = await fetch(completionsUrl, {
+      const res = await fetchCompactionWithVsllmReasoningRetry(completionsUrl, {
         method: "POST",
         headers: buildJsonRequestHeaders(authHeaders),
-        body: JSON.stringify(completionBody),
-        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
+        body: JSON.stringify(completionBody)
+      }, {
+        target,
+        requestBody: completionBody,
+        timeoutMs: 90000,
+        label: "chat completions"
       });
       if (res.status !== 200) {
         recordCompactionHttpFailure(target, res.status);
@@ -824,41 +910,48 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   console.log(`[Proxy Local Compaction Debug] fallbackModel=${fallbackModel}, parsedModel=${parsed?.model}, originalModel=${options.originalModel}, textLen=${conversationText.length}`);
   const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
 
-  const completionBody = applyReasoningEffort({
-    model: fallbackModel,
-    messages: [
-      { role: "system", content: summarizeSystemPrompt },
-      { role: "user", content: userPrompt }
-    ]
-  });
-
   let summaryText = "";
 
   async function trySummarizeViaResponses() {
     const responsesUrl = compactionResponsesUrl(target);
     if (!responsesUrl) return "";
+    const responsesBody = {
+      model: fallbackModel,
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `${summarizeSystemPrompt}\n\n${userPrompt}`
+            }
+          ]
+        }
+      ],
+      max_output_tokens: 1500
+    };
+    // Keep the same VSLLM reasoning level on the Responses fallback as on
+    // Chat Completions. The retry helper below handles a channel that rejects
+    // `max`; silently dropping the value would change the user's setting.
+    if (isVsllmApiAccount(target?.account, target?.upstreamBaseUrl || target?.url || "")
+      && typeof reasoningEffort === "string" && reasoningEffort.trim()) {
+      responsesBody.reasoning = {
+        effort: reasoningEffort.trim(),
+        summary: "auto"
+      };
+    }
     try {
       console.log(`[Proxy Local Compaction] Attempting summarization on ${responsesUrl} with model ${fallbackModel}...`);
-      const responsesRes = await fetch(responsesUrl, {
+      const responsesRes = await fetchCompactionWithVsllmReasoningRetry(responsesUrl, {
         method: "POST",
         headers: buildJsonRequestHeaders(authHeaders),
-        body: JSON.stringify({
-          model: fallbackModel,
-          input: [
-            {
-              type: "message",
-              role: "user",
-              content: [
-                {
-                  type: "input_text",
-                  text: `${summarizeSystemPrompt}\n\n${userPrompt}`
-                }
-              ]
-            }
-          ],
-          max_output_tokens: 1500
-        }),
-        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(120000) : undefined
+        body: JSON.stringify(responsesBody)
+      }, {
+        target,
+        requestBody: responsesBody,
+        timeoutMs: 120000,
+        label: "Responses"
       });
 
       if (responsesRes.status === 200) {
@@ -909,11 +1002,15 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     });
     try {
       console.log(`[Proxy Local Compaction] Attempting summarization on ${completionsUrl} with model ${fallbackModel}...`);
-      const res = await fetch(completionsUrl, {
+      const res = await fetchCompactionWithVsllmReasoningRetry(completionsUrl, {
         method: "POST",
         headers: buildJsonRequestHeaders(authHeaders),
-        body: JSON.stringify(currentCompletionBody),
-        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(30000) : undefined
+        body: JSON.stringify(currentCompletionBody)
+      }, {
+        target,
+        requestBody: currentCompletionBody,
+        timeoutMs: 30000,
+        label: "chat completions"
       });
 
       if (res.status === 200) {

@@ -515,7 +515,7 @@ Claude model routing is separate from the Codex table:
 | `VSLLM: grok-4.5` | VSLLM `grok-4.5` | VSLLM `/v1/responses` through the Claude bridge |
 | `VSLLM: grok-4.6` | VSLLM `grok-4.6` | VSLLM `/v1/responses` through the Claude bridge |
 
-The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded as `reasoning_effort` to the fallback completion request.
+The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded to the fallback request (`reasoning_effort` for Chat Completions and `reasoning.effort` for Responses). Chat Completions does not automatically mean `xhigh`, and the proxy does not translate `max` to `xhigh`: VSLLM/New API channels can advertise different supported effort sets. If a VSLLM summarization channel returns the exact unsupported-level validation error, the proxy retries that idempotent summarization call up to two times so New API can select another channel; ordinary chat requests and other HTTP 400 errors are not retried by this rule.
 
 ### Compact Requests
 
