@@ -66,7 +66,8 @@ export function createCliService({
   ensureAutoSwitchManagerRunning,
   stopAutoSwitchManager,
   childEnvForArgv,
-  exitFromChild
+  exitFromChild,
+  readSwitchSelection = null
 }) {
   const providerProxyBaseUrl = providerProxy.baseUrl;
   const providerProxyAccountBaseUrl = providerProxy.accountBaseUrl;
@@ -92,6 +93,7 @@ export function createCliService({
     accountShouldAutoSwitch,
     sortedRegistryAccounts,
     findAccountForSwitch,
+    reconcileRegistryActiveAccount,
     switchToStoredAccount,
     activeRegistryAccountFromRegistry,
     firstUsableSwitchCandidate,
@@ -296,22 +298,49 @@ export function createCliService({
     return null;
   }
 
-  function hasUnsupportedSwitchFlags(args) {
-    return args.some((arg) => arg === "--api" || arg === "--skip-api");
-  }
-
   function switchFlags(args) {
     const flags = {
       live: false,
       auto: false,
+      api: false,
+      skipApi: false,
+      unknown: [],
       selectors: []
     };
     for (const arg of args) {
       if (arg === "--live") flags.live = true;
       else if (arg === "--auto") flags.auto = true;
+      else if (arg === "--api") flags.api = true;
+      else if (arg === "--skip-api") flags.skipApi = true;
+      else if (arg.startsWith("--")) flags.unknown.push(arg);
       else flags.selectors.push(arg);
     }
     return flags;
+  }
+
+  function accountFilterForFlags(flags) {
+    if (flags?.api) return "api";
+    if (flags?.skipApi) return "non_api";
+    return "all";
+  }
+
+  function accountsForFilter(accounts, filter = "all") {
+    if (!Array.isArray(accounts) || filter === "all") return accounts || [];
+    if (filter === "api") return accounts.filter((account) => account?.auth_mode === "apikey");
+    if (filter === "non_api") return accounts.filter((account) => account?.auth_mode !== "apikey");
+    return accounts;
+  }
+
+  function registryForAccountFilter(registry, filter = "all") {
+    if (!registry || filter === "all") return registry;
+    return { ...registry, accounts: accountsForFilter(registry.accounts, filter) };
+  }
+
+  async function commitStoredAccountSwitch(codexHome, account) {
+    // Copy any shared per-account config only after the user has made an
+    // explicit selection. Opening and cancelling the picker remains read-only.
+    syncMissingApiKeyConfigsAllGroups();
+    await switchToStoredAccount(codexHome, account);
   }
 
   function renderSwitchRows(accounts, activeAccountKey, { includeExhausted = true } = {}) {
@@ -407,14 +436,16 @@ export function createCliService({
     return `${prefix}${keys.map((key) => pad(row[key], widths[key])).join("  ")}`;
   }
 
-  function renderLocalList(groups) {
+  function renderLocalList(groups, { filter = "all" } = {}) {
     const rows = [];
     const grouped = groups.length > 1;
     for (const group of loadRegistryRecordsForGroups(groups)) {
       const { registry } = group;
-      for (const [index, account] of sortedRegistryAccounts(registry).entries()) {
+      const active = activeRegistryAccountFromRegistry(registry);
+      const accounts = accountsForFilter(sortedRegistryAccounts(registry), filter);
+      for (const [index, account] of accounts.entries()) {
         rows.push({
-          marker: account.account_key === registry.active_account_key ? "*" : " ",
+          marker: account.account_key === active?.account_key ? "*" : " ",
           index: String(index + 1).padStart(2, "0"),
           group: group.name,
           account: accountLabel(account),
@@ -442,32 +473,59 @@ export function createCliService({
     }
   }
 
-  function parseListLiveCommand(argv) {
-    if (argv[0] === "list" && argv.includes("--live")) {
-      return { groups: loadManagedGroups() };
+  function parseStoredListCommand(argv) {
+    if (argv[0] === "list") {
+      const args = argv.slice(1);
+      const allowed = new Set(["--live", "--api", "--skip-api"]);
+      if (args.some((arg) => !allowed.has(arg))) return null;
+      if (args.includes("--api") && args.includes("--skip-api")) return null;
+      return {
+        groups: loadManagedGroups(),
+        live: args.includes("--live"),
+        filter: args.includes("--api") ? "api" : args.includes("--skip-api") ? "non_api" : "all"
+      };
     }
-    if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "list" && argv.includes("--live")) {
-      return { groups: [{ name: argv[1], codexHome: managedGroupCodexHome(argv[1]) }] };
+
+    let name = null;
+    let args = null;
+    if (argv[0] === "group" && typeof argv[1] === "string" && argv[2] === "list") {
+      name = argv[1];
+      args = argv.slice(3);
+    } else if (argv[0] === "group" && argv[1] === "list" && typeof argv[2] === "string") {
+      name = argv[2];
+      args = argv.slice(3);
+    } else {
+      return null;
     }
-    if (argv[0] === "group" && argv[1] === "list" && typeof argv[2] === "string" && argv.includes("--live")) {
-      return { groups: [{ name: argv[2], codexHome: managedGroupCodexHome(argv[2]) }] };
-    }
-    return null;
+
+    const allowed = new Set(["--live", "--api", "--skip-api"]);
+    if (args.some((arg) => !allowed.has(arg))) return null;
+    if (args.includes("--api") && args.includes("--skip-api")) return null;
+    return {
+      groups: [{ name, codexHome: managedGroupCodexHome(name) }],
+      live: args.includes("--live"),
+      filter: args.includes("--api") ? "api" : args.includes("--skip-api") ? "non_api" : "all"
+    };
   }
 
-  async function maybeHandleStoredListLive(argv) {
-    const command = parseListLiveCommand(argv);
+  async function maybeHandleStoredList(argv) {
+    const command = parseStoredListCommand(argv);
     if (!command) return false;
-    const hasApiKeyAccounts = command.groups.some((group) => {
-      const registry = readJsonFile(registryPath(group.codexHome));
-      return registry?.accounts?.some((account) => account?.auth_mode === "apikey");
-    });
-    if (!hasApiKeyAccounts) return false;
+    if (!command.groups.some((group) => readJsonFile(registryPath(group.codexHome))?.accounts)) return false;
+
+    if (!command.live) {
+      renderLocalList(command.groups, { filter: command.filter });
+      return true;
+    }
+    if (!process.stdout.isTTY) {
+      console.error("Live list requires a terminal.");
+      process.exit(1);
+    }
 
     while (true) {
       await syncApiKeySpendLimits();
       clearScreen();
-      renderLocalList(command.groups);
+      renderLocalList(command.groups, { filter: command.filter });
       process.stdout.write("\nRefreshing every 5s. Press Ctrl-C to stop.\n");
       sleep(5000);
     }
@@ -475,26 +533,31 @@ export function createCliService({
 
   async function maybeHandleStoredSwitch(argv) {
     const command = parseSwitchCommand(argv);
-    if (!command || hasUnsupportedSwitchFlags(command.args)) return false;
+    if (!command) return false;
 
-    const registry = readJsonFile(registryPath(command.codexHome));
+    const registry = reconcileRegistryActiveAccount(
+      command.codexHome,
+      readJsonFile(registryPath(command.codexHome))
+    );
     if (!registry || !Array.isArray(registry.accounts)) return false;
-    if (!registry.accounts.some((account) => account?.auth_mode === "apikey")) return false;
 
     const flags = switchFlags(command.args);
+    if (flags.unknown.length > 0 || (flags.api && flags.skipApi)) return false;
     if (flags.auto && !flags.live) {
       console.error("--auto requires --live.");
       process.exit(1);
     }
 
     if (flags.live) {
-      await handleLiveStoredSwitch(command.codexHome, flags.auto);
+      await handleLiveStoredSwitch(command.codexHome, flags.auto, accountFilterForFlags(flags));
       return true;
     }
 
+    const filter = accountFilterForFlags(flags);
+    const filteredRegistry = registryForAccountFilter(registry, filter);
     const query = flags.selectors.join(" ").trim();
     if (query) {
-      const result = findAccountForSwitch(registry, query);
+      const result = findAccountForSwitch(filteredRegistry, query);
       if (result.ambiguous) {
         console.error(`Multiple accounts matched "${query}". Use a more specific alias, email, account_key, or row number.`);
         process.exit(1);
@@ -503,19 +566,25 @@ export function createCliService({
         console.error(`No account matched "${query}".`);
         process.exit(1);
       }
-      await switchToStoredAccount(command.codexHome, result.account);
+      await commitStoredAccountSwitch(command.codexHome, result.account);
       return true;
     }
 
-    if (!process.stdin.isTTY) return false;
-    const accounts = sortedRegistryAccounts(registry);
-    renderSwitchRows(accounts, registry.active_account_key);
-    const selected = readLineFromTty("Switch to account number, alias, or email [q to quit]: ");
+    if (!readSwitchSelection && (!process.stdin.isTTY || !process.stderr.isTTY)) {
+      console.error("Interactive switch requires a terminal; choose an account with `switch <row|alias|email|account-key>`. ");
+      process.exit(1);
+    }
+    const accounts = sortedRegistryAccounts(filteredRegistry);
+    const active = activeRegistryAccountFromRegistry(registry);
+    renderSwitchRows(accounts, active?.account_key || null);
+    const selected = readSwitchSelection
+      ? readSwitchSelection("Switch to account number, alias, or email [q to quit]: ")
+      : readLineFromTty("Switch to account number, alias, or email [q to quit]: ");
     if (!selected || selected.toLowerCase() === "q") {
       process.stdout.write("No account switched.\n");
       return true;
     }
-    const result = findAccountForSwitch(registry, selected);
+    const result = findAccountForSwitch(filteredRegistry, selected);
     if (result.ambiguous) {
       console.error(`Multiple accounts matched "${selected}". Use a more specific selector.`);
       process.exit(1);
@@ -524,7 +593,7 @@ export function createCliService({
       console.error(`No account matched "${selected}".`);
       process.exit(1);
     }
-    await switchToStoredAccount(command.codexHome, result.account);
+    await commitStoredAccountSwitch(command.codexHome, result.account);
     return true;
   }
 
@@ -538,23 +607,28 @@ export function createCliService({
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   }
 
-  async function handleLiveStoredSwitch(codexHome, auto) {
+  async function handleLiveStoredSwitch(codexHome, auto, filter = "all") {
     while (true) {
-      const registry = readJsonFile(registryPath(codexHome));
+      const registry = reconcileRegistryActiveAccount(
+        codexHome,
+        readJsonFile(registryPath(codexHome))
+      );
       if (!registry || !Array.isArray(registry.accounts)) {
         console.error(`No registry found at ${registryPath(codexHome)}.`);
         process.exit(1);
       }
       clearScreen();
-      renderSwitchRows(sortedRegistryAccounts(registry), registry.active_account_key);
+      const active = activeRegistryAccountFromRegistry(registry);
+      const filteredRegistry = registryForAccountFilter(registry, filter);
+      renderSwitchRows(sortedRegistryAccounts(filteredRegistry), active?.account_key || null);
       process.stdout.write(`\n${auto ? "Auto-switch is watching usable accounts. Press Ctrl-C to stop." : "Enter a selector to switch, or q to quit."}\n`);
 
       if (auto) {
         const active = activeRegistryAccountFromRegistry(registry);
         if (accountShouldAutoSwitch(active, registry)) {
-          const candidate = firstUsableSwitchCandidate(registry, { preferredAuthMode: active?.auth_mode || null });
+          const candidate = firstUsableSwitchCandidate(filteredRegistry, { preferredAuthMode: active?.auth_mode || null });
           if (candidate) {
-            await switchToStoredAccount(codexHome, candidate);
+            await commitStoredAccountSwitch(codexHome, candidate);
           } else {
             process.stdout.write("No usable switch candidate found.\n");
           }
@@ -563,12 +637,14 @@ export function createCliService({
         continue;
       }
 
-      const selected = readLineFromTty("Switch to account number, alias, or email [q to quit]: ");
+      const selected = readSwitchSelection
+        ? readSwitchSelection("Switch to account number, alias, or email [q to quit]: ")
+        : readLineFromTty("Switch to account number, alias, or email [q to quit]: ");
       if (!selected || selected.toLowerCase() === "q") {
         process.stdout.write("No account switched.\n");
         return;
       }
-      const result = findAccountForSwitch(registry, selected);
+      const result = findAccountForSwitch(filteredRegistry, selected);
       if (result.ambiguous) {
         process.stderr.write(`Multiple accounts matched "${selected}". Use a more specific selector.\n`);
         sleep(1200);
@@ -579,7 +655,7 @@ export function createCliService({
         sleep(1200);
         continue;
       }
-      await switchToStoredAccount(codexHome, result.account);
+      await commitStoredAccountSwitch(codexHome, result.account);
       sleep(1200);
     }
   }
@@ -694,7 +770,10 @@ export function createCliService({
   }
 
   async function autoSwitchCycleForGroup(group) {
-    const registry = readJsonFile(registryPath(group.codexHome));
+    const registry = reconcileRegistryActiveAccount(
+      group.codexHome,
+      readJsonFile(registryPath(group.codexHome))
+    );
     if (!registry || !Array.isArray(registry.accounts) || !autoSwitchEnabled(registry)) return;
     const active = activeRegistryAccountFromRegistry(registry);
     if (!accountShouldAutoSwitch(active, registry)) return;
@@ -1401,7 +1480,7 @@ export function createCliService({
     parseApiSpendLimitArgs,
     importCommandInfo,
     applyApiSpendLimitToImportedAccounts,
-    maybeHandleStoredListLive,
+    maybeHandleStoredList,
     maybeHandleStoredSwitch,
     sleep,
     maybeHandleAutoConfig,

@@ -39,6 +39,7 @@ import {
   repairProviderProxyBodyPlaintext
 } from "./proxy-compaction.mjs";
 import {
+  describeCompactionFailure,
   runLocalCompactionFallback,
   summarizeViaShape
 } from "./proxy-compaction.mjs";
@@ -682,8 +683,9 @@ export function createProviderProxy(options) {
             }
           );
           if (!localCompacted) {
-            console.warn("[Proxy] Remote compaction v2 fallback failed; leaving the original request intact.");
-            return writeProxyError(res, 502, "Provider-compatible summarization failed; compaction was not applied.");
+            const reason = describeCompactionFailure(target);
+            console.warn(`[Proxy] Remote compaction v2 fallback failed: ${reason}; leaving the original request intact.`);
+            return writeProxyError(res, 502, `Provider-compatible summarization failed: ${reason}; compaction was not applied.`);
           }
           upstream = localCompacted;
           break;
@@ -726,8 +728,9 @@ export function createProviderProxy(options) {
             { originalModel: originalRequestModel }
           );
           if (!localCompacted) {
-            console.warn(`[Proxy] Local compaction fallback failed during error handler; leaving the original request intact.`);
-            return writeProxyError(res, 502, "Compaction summarization failed; compaction was not applied.");
+            const reason = describeCompactionFailure(target);
+            console.warn(`[Proxy] Local compaction fallback failed during error handler: ${reason}; leaving the original request intact.`);
+            return writeProxyError(res, 502, `Compaction summarization failed: ${reason}; compaction was not applied.`);
           }
           if (localCompacted) {
             upstream = localCompacted;
@@ -745,8 +748,9 @@ export function createProviderProxy(options) {
             sanitizeProxyRequestHeaders
           );
           if (!localCompacted) {
-            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler; leaving the original request intact.`);
-            return writeProxyError(res, 502, "Compaction summarization failed; compaction was not applied.");
+            const reason = describeCompactionFailure(target);
+            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler: ${reason}; leaving the original request intact.`);
+            return writeProxyError(res, 502, `Compaction summarization failed: ${reason}; compaction was not applied.`);
           }
           if (localCompacted) {
             upstream = localCompacted;

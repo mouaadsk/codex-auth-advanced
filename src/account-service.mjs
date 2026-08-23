@@ -70,7 +70,8 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
   }
 
   function loadRegistryRecordForGroup(group) {
-    const registry = readJsonFile(registryPath(group.codexHome));
+    const filePath = registryPath(group.codexHome);
+    const registry = reconcileRegistryActiveAccount(group.codexHome, readJsonFile(filePath));
     if (!registry || !Array.isArray(registry.accounts)) return null;
     return { ...group, registry };
   }
@@ -220,7 +221,7 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
   }
 
   function activeApiProxyTarget(codexHome) {
-    const registry = readJsonFile(registryPath(codexHome));
+    const registry = reconcileRegistryActiveAccount(codexHome, readJsonFile(registryPath(codexHome)));
     return apiProxyTargetForAccount(codexHome, activeRegistryAccountFromRegistry(registry));
   }
 
@@ -386,6 +387,127 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     return [...registry.accounts].sort((a, b) => accountSortTime(b) - accountSortTime(a));
   }
 
+  function accountForKey(registry, accountKey) {
+    if (!registry || !Array.isArray(registry.accounts) || typeof accountKey !== "string") return null;
+    return registry.accounts.find((account) => account?.account_key === accountKey) ?? null;
+  }
+
+  // `active_account_key` is the canonical field used by the proxy. Older
+  // native registries may also carry `activeAccountKey` or per-account
+  // `active` flags; use those only as migration fallbacks when the canonical
+  // key is absent or points at an account that no longer exists.
+  function activeAccountKeyFromRegistry(registry) {
+    if (!registry || !Array.isArray(registry.accounts)) return null;
+    const canonical = typeof registry.active_account_key === "string"
+      ? registry.active_account_key.trim()
+      : "";
+    if (canonical && accountForKey(registry, canonical)) return canonical;
+
+    const legacy = typeof registry.activeAccountKey === "string"
+      ? registry.activeAccountKey.trim()
+      : "";
+    if (legacy && accountForKey(registry, legacy)) return legacy;
+
+    const flagged = registry.accounts.find((account) => account?.active === true);
+    return typeof flagged?.account_key === "string" ? flagged.account_key : null;
+  }
+
+  function synchronizeActiveAccountMetadata(registry, accountKey) {
+    if (!registry || !Array.isArray(registry.accounts) || !accountForKey(registry, accountKey)) return false;
+    let changed = false;
+    if (registry.active_account_key !== accountKey) {
+      registry.active_account_key = accountKey;
+      changed = true;
+    }
+
+    const hasLegacyKey = Object.prototype.hasOwnProperty.call(registry, "activeAccountKey");
+    const hasActiveFlags = registry.accounts.some((account) => Object.prototype.hasOwnProperty.call(account || {}, "active"));
+    if (hasLegacyKey && registry.activeAccountKey !== accountKey) {
+      registry.activeAccountKey = accountKey;
+      changed = true;
+    }
+    if (hasActiveFlags) {
+      for (const account of registry.accounts) {
+        const next = account?.account_key === accountKey;
+        if (account.active !== next) {
+          account.active = next;
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  function rootAuthAccountKey(registry, rootAuth) {
+    if (!registry || !Array.isArray(registry.accounts) || !rootAuth || typeof rootAuth !== "object") return "";
+    const explicit = typeof rootAuth.account_key === "string" ? rootAuth.account_key.trim() : "";
+    if (explicit && accountForKey(registry, explicit)) return explicit;
+
+    const accountId = typeof rootAuth.tokens?.account_id === "string" ? rootAuth.tokens.account_id.trim() : "";
+    if (accountId) {
+      const matches = registry.accounts.filter((account) => account?.chatgpt_account_id === accountId);
+      if (matches.length === 1) return matches[0].account_key;
+    }
+
+    const email = typeof rootAuth.email === "string" ? rootAuth.email.trim().toLowerCase() : "";
+    if (email) {
+      const matches = registry.accounts.filter((account) => typeof account?.email === "string" && account.email.trim().toLowerCase() === email);
+      if (matches.length === 1) return matches[0].account_key;
+    }
+    return "";
+  }
+
+  // auth.json is the credential identity Codex presents as active. Native
+  // activation writes it without changing the wrapper's activation timestamp;
+  // use that timestamp to distinguish a native switch from a deliberately
+  // rewritten test/registry state or a stale auth file.
+  function reconcileRegistryActiveAccount(codexHome, registry, options = {}) {
+    if (!registry || !Array.isArray(registry.accounts)) return registry;
+    const persist = options.persist !== false;
+    const rootAuthPath = path.join(codexHome, "auth.json");
+    const rootAuth = readJsonFile(rootAuthPath);
+    const rootKey = rootAuthAccountKey(registry, rootAuth);
+    if (!rootKey) return registry;
+
+    const registryKey = activeAccountKeyFromRegistry(registry);
+    let rootMtimeMs = 0;
+    try {
+      rootMtimeMs = Number(fs.statSync(rootAuthPath).mtimeMs) || 0;
+    } catch {
+      return registry;
+    }
+    if (registryKey === rootKey) {
+      // Repair legacy markers even when the canonical key is already right.
+      if (synchronizeActiveAccountMetadata(registry, rootKey)) {
+        if (persist) writeJsonFile(registryPath(codexHome), registry);
+      }
+      return registry;
+    }
+
+    const activatedAtMs = Number(registry.active_account_activated_at_ms) || 0;
+    if (registryKey && activatedAtMs <= 0) {
+      // Pre-timestamp registries can still reconcile a native activation when
+      // auth.json is the newer file. Otherwise keep the registry authoritative.
+      let registryMtimeMs = 0;
+      try {
+        registryMtimeMs = Number(fs.statSync(registryPath(codexHome)).mtimeMs) || 0;
+      } catch {
+        return registry;
+      }
+      if (rootMtimeMs <= registryMtimeMs) return registry;
+    }
+    if (activatedAtMs > 0 && rootMtimeMs <= activatedAtMs) return registry;
+
+    if (synchronizeActiveAccountMetadata(registry, rootKey)) {
+      registry.active_account_activated_at_ms = Math.max(Date.now(), Math.ceil(rootMtimeMs));
+      if (persist) {
+        writeJsonFile(registryPath(codexHome), registry);
+        try { fs.chmodSync(registryPath(codexHome), 0o600); } catch { /* best effort */ }
+      }
+    }
+    return registry;
+  }
+
   function findAccountForSwitch(registry, query) {
     const accounts = sortedRegistryAccounts(registry);
     if (/^\d+$/.test(String(query || ""))) {
@@ -399,6 +521,15 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
   }
 
   async function switchToStoredAccount(codexHome, account) {
+    const registryFile = registryPath(codexHome);
+    const registry = readJsonFile(registryFile);
+    const storedAccount = accountForKey(registry, account?.account_key);
+    if (!storedAccount) {
+      console.error(`Account is not present in the registry: ${accountLabel(account)}.`);
+      process.exit(1);
+    }
+    account = storedAccount;
+
     const authPath = accountAuthPath(codexHome, account.account_key);
     if (!fs.existsSync(authPath)) {
       console.error(`Missing auth file for ${accountLabel(account)}: ${authPath}`);
@@ -447,10 +578,8 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
       fs.chmodSync(rootAuthPath, 0o600);
     }
 
-    const registryFile = registryPath(codexHome);
-    const registry = readJsonFile(registryFile);
     if (registry && Array.isArray(registry.accounts)) {
-      registry.active_account_key = account.account_key;
+      synchronizeActiveAccountMetadata(registry, account.account_key);
       registry.active_account_activated_at_ms = Date.now();
       const existing = registry.accounts.find((item) => item?.account_key === account.account_key);
       if (existing) existing.last_used_at = Math.floor(Date.now() / 1000);
@@ -461,12 +590,12 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
   }
 
   function activeRegistryAccountFromRegistry(registry) {
-    if (!registry || !Array.isArray(registry.accounts) || typeof registry.active_account_key !== "string") return null;
-    return registry.accounts.find((account) => account?.account_key === registry.active_account_key) ?? null;
+    const activeKey = activeAccountKeyFromRegistry(registry);
+    return accountForKey(registry, activeKey);
   }
 
   function firstUsableSwitchCandidate(registry, { preferredAuthMode = null, excludeAccountKeys = null } = {}) {
-    const active = registry.active_account_key;
+    const active = activeAccountKeyFromRegistry(registry);
     const excluded = new Set(excludeAccountKeys || []);
     const candidates = sortedRegistryAccounts(registry)
       .filter((account) => account.account_key !== active && !excluded.has(account.account_key) && accountIsSwitchCandidate(account));
@@ -510,6 +639,7 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     accountShouldAutoSwitch,
     sortedRegistryAccounts,
     findAccountForSwitch,
+    reconcileRegistryActiveAccount,
     switchToStoredAccount,
     activeRegistryAccountFromRegistry,
     firstUsableSwitchCandidate,

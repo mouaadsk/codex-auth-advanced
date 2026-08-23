@@ -29,15 +29,22 @@ export function createClientConfigService({ providerProxy, accountService }) {
   const providerProxyBaseUrl = providerProxy.baseUrl;
   const ensureProviderProxyRunning = providerProxy.ensureRunning;
   const activeRegistryAccountFromRegistry = accountService.activeRegistryAccountFromRegistry;
+  const reconcileRegistryActiveAccount = accountService.reconcileRegistryActiveAccount;
   const apiKeyProxyConfig = accountService.apiKeyProxyConfig;
   const loadManagedRegistryRecords = accountService.loadManagedRegistryRecords;
   const accountLabel = accountService.accountLabel;
 
   function activeRegistryAccount(codexHome) {
-    return activeRegistryAccountFromRegistry(readJsonFile(registryPath(codexHome)));
+    return activeRegistryAccountFromRegistry(
+      reconcileRegistryActiveAccount(codexHome, readJsonFile(registryPath(codexHome)))
+    );
   }
 
-  function ensureActiveAccountConfig(codexHome, registry = readJsonFile(registryPath(codexHome)), options = {}) {
+  function ensureActiveAccountConfig(codexHome, registry = null, options = {}) {
+    registry = reconcileRegistryActiveAccount(
+      codexHome,
+      registry || readJsonFile(registryPath(codexHome))
+    );
     const active = activeRegistryAccountFromRegistry(registry);
     if (!active || active.auth_mode !== "apikey") {
       return { configured: false, changed: false, reason: active ? "active_account_is_not_api_key" : "no_active_account" };

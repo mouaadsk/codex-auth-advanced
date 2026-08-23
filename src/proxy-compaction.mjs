@@ -12,6 +12,85 @@ import {
   stripEncryptedContentFromProxyBody
 } from "./proxy-body-transforms.mjs";
 
+const compactionFailures = new WeakMap();
+const compactionFailurePriorities = {
+  invalid_request: 120,
+  missing_conversation: 120,
+  configuration: 115,
+  access: 100,
+  quota: 100,
+  timeout: 90,
+  network: 85,
+  upstream_unavailable: 80,
+  unsupported_endpoint: 75,
+  upstream_rejected: 70,
+  invalid_response: 50
+};
+
+function resetCompactionFailure(target) {
+  if (target && typeof target === "object") compactionFailures.delete(target);
+}
+
+function recordCompactionFailure(target, kind, status = null) {
+  if (!target || typeof target !== "object") return;
+  const numericStatus = status == null ? null : Number(status);
+  const next = {
+    kind,
+    status: Number.isFinite(numericStatus) ? numericStatus : null
+  };
+  const current = compactionFailures.get(target);
+  const currentPriority = compactionFailurePriorities[current?.kind] ?? 0;
+  const nextPriority = compactionFailurePriorities[next.kind] ?? 0;
+  if (!current || nextPriority > currentPriority) compactionFailures.set(target, next);
+}
+
+function compactionFailureKindForStatus(status) {
+  if (status === 401 || status === 403) return "access";
+  if (status === 402 || status === 429) return "quota";
+  if (status === 408 || status === 504 || status === 524) return "timeout";
+  if (status === 404 || status === 405) return "unsupported_endpoint";
+  if (status >= 500) return "upstream_unavailable";
+  return "upstream_rejected";
+}
+
+function recordCompactionHttpFailure(target, status) {
+  recordCompactionFailure(target, compactionFailureKindForStatus(Number(status)), status);
+}
+
+function recordCompactionFailureIfUnset(target, kind, status = null) {
+  if (!target || typeof target !== "object" || compactionFailures.has(target)) return;
+  recordCompactionFailure(target, kind, status);
+}
+
+function recordCompactionFetchFailure(target, error) {
+  const name = String(error?.name || "").toLowerCase();
+  const message = String(error?.message || "").toLowerCase();
+  recordCompactionFailure(
+    target,
+    name.includes("timeout") || name.includes("abort") || message.includes("timed out") || message.includes("timeout")
+      ? "timeout"
+      : "network"
+  );
+}
+
+export function describeCompactionFailure(target) {
+  const failure = target && typeof target === "object" ? compactionFailures.get(target) : null;
+  if (!failure) return "the provider returned no usable summary";
+  const http = failure.status == null ? "" : ` (HTTP ${failure.status})`;
+  if (failure.kind === "access") return `provider authentication or account access was rejected${http}`;
+  if (failure.kind === "quota") return `the provider quota or billing limit was reached${http}`;
+  if (failure.kind === "timeout") return `the provider summarization request timed out${http}`;
+  if (failure.kind === "unsupported_endpoint") return `the provider has no compatible summarization endpoint${http}`;
+  if (failure.kind === "upstream_unavailable") return `the provider summarization service was unavailable${http}`;
+  if (failure.kind === "upstream_rejected") return `the provider rejected the summarization request${http}`;
+  if (failure.kind === "invalid_request") return "the compaction request body could not be parsed";
+  if (failure.kind === "missing_conversation") return "the request contained no readable conversation text";
+  if (failure.kind === "configuration") return "no compatible provider summarization endpoint could be derived";
+  if (failure.kind === "network") return "the provider summarization request failed before a response";
+  if (failure.kind === "invalid_response") return "the provider response contained no usable summary";
+  return "the provider returned no usable summary";
+}
+
 
 export function isCompactProxyTarget(target) {
   try {
@@ -529,20 +608,26 @@ function codexCompactResponse(summaryText, parsed) {
 // non-Responses shape). The summary text is wrapped in Codex-compact format.
 export async function summarizeViaShape({ shape, target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {} }) {
   if (!shape || shape === "responses") return null;
+  resetCompactionFailure(target);
   const startTime = Date.now();
   const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
   let parsed = null;
-  try { parsed = JSON.parse(decoded.body.toString("utf8")); } catch { return null; }
+  try { parsed = JSON.parse(decoded.body.toString("utf8")); } catch {
+    recordCompactionFailure(target, "invalid_request");
+    return null;
+  }
   const fallbackModel = typeof options.originalModel === "string" && options.originalModel.trim()
     ? options.originalModel.trim()
     : extractModelFromRequest(parsed) || "gpt-5.6-sol";
   const conversationText = extractCompactConversationText(parsed);
   if (!conversationText) {
+    recordCompactionFailure(target, "missing_conversation");
     console.error(`[Proxy Compact Shape] No conversation text found for shape ${shape} on ${target?.url}.`);
     return null;
   }
   const shapeUrl = compactionShapeUrl(target, shape, fallbackModel);
   if (!shapeUrl) {
+    recordCompactionFailure(target, "configuration");
     console.error(`[Proxy Compact Shape] Cannot derive ${shape} URL from ${target?.url}.`);
     return null;
   }
@@ -564,6 +649,8 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
     });
     const summaryText = await readShapeSummarizeResponse({ shape, res });
     if (!summaryText) {
+      if (res.status === 200) recordCompactionFailure(target, "invalid_response");
+      else recordCompactionHttpFailure(target, res.status);
       console.error(`[Proxy Compact Shape] ${shape} endpoint returned status ${res.status} or empty summary.`);
       return null;
     }
@@ -578,6 +665,7 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
       })
     });
   } catch (err) {
+    recordCompactionFetchFailure(target, err);
     console.error(`[Proxy Compact Shape] ${shape} fallback failed:`, err?.message || err);
     return null;
   }
@@ -603,10 +691,12 @@ function buildJsonRequestHeaders(authHeaders) {
 }
 
 export async function runLocalCompactionFallback(target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {}) {
+  resetCompactionFailure(target);
   const startTime = Date.now();
   const completionsUrl = compactionCompletionsUrl(target);
   const preferResponsesFirst = target?.account?.api_template === "llmapi";
   if (!completionsUrl && !preferResponsesFirst) {
+    recordCompactionFailure(target, "configuration");
     console.error(`[Proxy Local Compaction] Cannot derive an upstream summarization endpoint from ${target?.url}`);
     return null;
   }
@@ -618,6 +708,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   try {
     parsed = JSON.parse(decoded.body.toString("utf8"));
   } catch (err) {
+    recordCompactionFailure(target, "invalid_request");
     console.error(`[Proxy Local Compaction] Failed to parse request body as JSON:`, err);
     return null;
   }
@@ -657,6 +748,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   if (claudeFormat) {
     const transcript = claudeCompactionTranscriptText(parsed);
     if (!transcript) {
+      recordCompactionFailure(target, "missing_conversation");
       console.error(`[Proxy Local Compaction] Claude compaction request had no transcript text.`);
       return null;
     }
@@ -668,6 +760,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       buildBody: (body) => applyReasoningEffort(body)
     });
     if (!summaryText.trim()) {
+      recordCompactionFailureIfUnset(target, "invalid_response");
       console.error(`[Proxy Local Compaction] chat completions endpoint returned an empty summary.`);
       return null;
     }
@@ -695,12 +788,14 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(90000) : undefined
       });
       if (res.status !== 200) {
+        recordCompactionHttpFailure(target, res.status);
         const errText = await res.text().catch(() => "");
         console.error(`[Proxy Local Compaction] completions endpoint failed with status ${res.status}: ${errText.slice(0, 200)}`);
         return "";
       }
       return await readChatCompletionSummary(res);
     } catch (err) {
+      recordCompactionFetchFailure(target, err);
       console.error(`[Proxy Local Compaction] completions endpoint failed:`, err?.message || err);
       return "";
     }
@@ -711,6 +806,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   // dropping, no per-item truncation — so the summary reflects everything.
   const conversationText = extractCompactConversationText(parsed);
   if (!conversationText) {
+    recordCompactionFailure(target, "missing_conversation");
     console.error(`[Proxy Local Compaction] No conversation text found in compact payload.`);
     return null;
   }
@@ -785,11 +881,14 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
           // summarization prompt without the upstream's tool artifacts.
           if (messageText && !hasNonTextPart) return messageText;
         }
+        recordCompactionFailureIfUnset(target, "invalid_response");
       } else {
+        recordCompactionHttpFailure(target, responsesRes.status);
         const errText = await responsesRes.text().catch(() => "");
         console.warn(`[Proxy Local Compaction] responses endpoint with model ${fallbackModel} returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
       }
     } catch (err) {
+      recordCompactionFetchFailure(target, err);
       console.warn(`[Proxy Local Compaction] responses endpoint with model ${fallbackModel} failed: ${err.message}`);
     }
     return "";
@@ -816,11 +915,14 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       if (res.status === 200) {
         const text = (await readChatCompletionSummary(res)).trim();
         if (text) return text;
+        recordCompactionFailureIfUnset(target, "invalid_response");
       } else {
+        recordCompactionHttpFailure(target, res.status);
         const errText = await res.text().catch(() => "");
         console.warn(`[Proxy Local Compaction] completions endpoint with model ${fallbackModel} returned status ${res.status}: ${errText.slice(0, 150)}`);
       }
     } catch (err) {
+      recordCompactionFetchFailure(target, err);
       console.warn(`[Proxy Local Compaction] completions endpoint with model ${fallbackModel} failed: ${err.message}`);
     }
     return "";
@@ -841,6 +943,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   }
 
   if (!summaryText) {
+    recordCompactionFailureIfUnset(target, "invalid_response");
     console.error(`[Proxy Local Compaction] All summarization methods failed to generate a summary.`);
     return null;
   }

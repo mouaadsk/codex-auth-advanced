@@ -323,7 +323,7 @@ const {
   parseApiSpendLimitArgs,
   importCommandInfo,
   applyApiSpendLimitToImportedAccounts,
-  maybeHandleStoredListLive,
+  maybeHandleStoredList,
   maybeHandleStoredSwitch,
   sleep,
   maybeHandleAutoConfig,
@@ -384,17 +384,17 @@ if (await maybeHandleDaemon(argv)) {
   process.exit(0);
 }
 
+if (await maybeHandleStoredSwitch(argv)) {
+  process.exit(0);
+}
+
 syncMissingApiKeyConfigsAllGroups();
 
 if (!apiSpendLimitImportInfo) {
   await syncApiKeySpendLimits();
 }
 
-if (await maybeHandleStoredListLive(argv)) {
-  process.exit(0);
-}
-
-if (await maybeHandleStoredSwitch(argv)) {
+if (await maybeHandleStoredList(argv)) {
   process.exit(0);
 }
 

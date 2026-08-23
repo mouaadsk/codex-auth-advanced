@@ -25,7 +25,8 @@ export function createManagerService({
   const {
     accountLabel,
     accountPlanLabel,
-    activeRegistryAccountFromRegistry
+    activeRegistryAccountFromRegistry,
+    reconcileRegistryActiveAccount
   } = accountService;
 
   function sleep(ms) {
@@ -286,7 +287,10 @@ export function createManagerService({
 
   function activeAccountStatusLine(codexHome) {
     if (!codexHome) return null;
-    const registry = readJsonFile(registryPath(codexHome));
+    const registry = reconcileRegistryActiveAccount(
+      codexHome,
+      readJsonFile(registryPath(codexHome))
+    );
     const active = activeRegistryAccountFromRegistry(registry);
     if (!active) return null;
     const plan = accountPlanLabel(active);
@@ -335,4 +339,3 @@ export function createManagerService({
     maybeRunStatus
   };
 }
-

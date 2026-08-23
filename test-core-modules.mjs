@@ -502,6 +502,12 @@ try {
     auth_mode: "apikey",
     created_at: 20
   };
+  const chatgptAccount = {
+    account_key: "chatgpt-personal",
+    alias: "chatgpt-personal",
+    auth_mode: "chatgpt",
+    created_at: 5
+  };
   writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
     active_account_key: activeAccount.account_key,
     auto_switch: { enabled: true },
@@ -546,6 +552,194 @@ try {
     fallbackAccount.account_key
   );
   assert.equal(accountService.accountShouldAutoSwitch(exhaustedAccount, { auto_switch: { enabled: true } }), true);
+
+  writeJsonFile(path.join(serviceAccountsDir, `${fallbackAccount.account_key}.auth.json`), {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "fallback-secret",
+    alias: fallbackAccount.alias,
+    account_key: fallbackAccount.account_key
+  });
+  writeTextFilePrivate(path.join(serviceAccountsDir, `${fallbackAccount.account_key}.config.toml`), [
+    'model_provider = "OpenAI"',
+    "",
+    "[model_providers.OpenAI]",
+    'base_url = "https://vsllm.com/v1"',
+    'wire_api = "responses"',
+    ""
+  ].join("\n"));
+  writeJsonFile(path.join(serviceHome, "auth.json"), {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "primary-secret",
+    alias: activeAccount.alias,
+    account_key: activeAccount.account_key
+  });
+
+  const switchAccountService = createAccountService({
+    providerProxy: {
+      ...proxy,
+      ensureRunning: async () => true
+    },
+    chatgptCodexBaseUrl: "https://chatgpt.com/backend-api/codex"
+  });
+  writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
+    active_account_key: activeAccount.account_key,
+    activeAccountKey: exhaustedAccount.account_key,
+    active_account_activated_at_ms: Date.now(),
+    auto_switch: { enabled: true },
+    accounts: [
+      { ...activeAccount, active: true },
+      { ...exhaustedAccount, active: false },
+      { ...fallbackAccount, active: false },
+      { ...chatgptAccount, active: false }
+    ]
+  });
+  await switchAccountService.switchToStoredAccount(serviceHome, fallbackAccount);
+  const switchedRegistry = readJsonFile(path.join(serviceAccountsDir, "registry.json"));
+  assert.equal(switchedRegistry.active_account_key, fallbackAccount.account_key);
+  assert.equal(switchedRegistry.activeAccountKey, fallbackAccount.account_key);
+  assert.equal(switchedRegistry.accounts.find((account) => account.account_key === fallbackAccount.account_key)?.active, true);
+  assert.equal(switchedRegistry.accounts.find((account) => account.account_key === activeAccount.account_key)?.active, false);
+  assert.equal(readJsonFile(path.join(serviceHome, "auth.json")).account_key, fallbackAccount.account_key);
+
+  // Simulate a native activation: auth.json changes after the wrapper's last
+  // activation timestamp, but the proxy-facing registry key is still stale.
+  switchedRegistry.active_account_key = fallbackAccount.account_key;
+  switchedRegistry.activeAccountKey = fallbackAccount.account_key;
+  switchedRegistry.active_account_activated_at_ms = Date.now() - 5_000;
+  writeJsonFile(path.join(serviceAccountsDir, "registry.json"), switchedRegistry);
+  writeJsonFile(path.join(serviceHome, "auth.json"), {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "primary-secret",
+    alias: activeAccount.alias,
+    account_key: activeAccount.account_key
+  });
+  const reconciledTarget = switchAccountService.activeApiProxyTarget(serviceHome);
+  assert.equal(reconciledTarget.account.account_key, activeAccount.account_key);
+  assert.equal(reconciledTarget.apiKey, "primary-secret");
+  const reconciledRegistry = readJsonFile(path.join(serviceAccountsDir, "registry.json"));
+  assert.equal(reconciledRegistry.active_account_key, activeAccount.account_key);
+  assert.equal(reconciledRegistry.activeAccountKey, activeAccount.account_key);
+  assert.equal(reconciledRegistry.accounts.find((account) => account.account_key === activeAccount.account_key)?.active, true);
+  assert.equal(reconciledRegistry.accounts.find((account) => account.account_key === fallbackAccount.account_key)?.active, false);
+
+  // Native ChatGPT auth files may identify the account only through
+  // tokens.account_id; reconciliation should still update the canonical key.
+  const chatgptRegistry = {
+    ...reconciledRegistry,
+    active_account_key: activeAccount.account_key,
+    activeAccountKey: activeAccount.account_key,
+    active_account_activated_at_ms: Date.now() - 5_000,
+    accounts: [
+      ...reconciledRegistry.accounts,
+      { ...chatgptAccount, chatgpt_account_id: "chatgpt-account-id", active: false }
+    ]
+  };
+  writeJsonFile(path.join(serviceAccountsDir, "registry.json"), chatgptRegistry);
+  writeJsonFile(path.join(serviceHome, "auth.json"), {
+    auth_mode: "chatgpt",
+    tokens: { account_id: "chatgpt-account-id", access_token: "chatgpt-token" }
+  });
+  const reconciledChatgptRegistry = switchAccountService.reconcileRegistryActiveAccount(
+    serviceHome,
+    readJsonFile(path.join(serviceAccountsDir, "registry.json"))
+  );
+  assert.equal(reconciledChatgptRegistry.active_account_key, chatgptAccount.account_key);
+  assert.equal(reconciledChatgptRegistry.activeAccountKey, chatgptAccount.account_key);
+
+  // Restore the API account fixture used by the CLI and client-config tests.
+  writeJsonFile(path.join(serviceAccountsDir, "registry.json"), reconciledRegistry);
+  writeJsonFile(path.join(serviceHome, "auth.json"), {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "primary-secret",
+    alias: activeAccount.alias,
+    account_key: activeAccount.account_key
+  });
+
+  const originalCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = serviceHome;
+  try {
+    const selectedAccountKeys = [];
+    const cliAccountService = {
+      ...switchAccountService,
+      switchToStoredAccount: async (_codexHome, account) => {
+        selectedAccountKeys.push(account.account_key);
+      }
+    };
+    const cliDependencies = {
+      providerProxy: { ...proxy, ensureRunning: async () => true },
+      accountService: cliAccountService,
+      clientConfigService: {
+        ensureAllActiveAccountConfigs: () => {},
+        ensureProviderProxyForActiveApiAccounts: async () => {}
+      },
+      writeManagerPidFile: () => {},
+      removeManagerPidFile: () => {},
+      ensureAutoSwitchManagerRunning: () => {},
+      stopAutoSwitchManager: () => {},
+      childEnvForArgv: () => process.env,
+      exitFromChild: () => {}
+    };
+    const originalStdoutWrite = process.stdout.write;
+    let listOutput = "";
+    let switchOutput = "";
+    try {
+      process.stdout.write = (chunk) => {
+        listOutput += String(chunk);
+        return true;
+      };
+      const listCli = createCliService(cliDependencies);
+      assert.equal(await listCli.maybeHandleStoredList(["group", "default", "list"]), true);
+
+      process.stdout.write = (chunk) => {
+        switchOutput += String(chunk);
+        return true;
+      };
+      const registryBeforeCancel = readTextFile(path.join(serviceAccountsDir, "registry.json"));
+      const cancelCli = createCliService({ ...cliDependencies, readSwitchSelection: () => "q" });
+      assert.equal(await cancelCli.maybeHandleStoredSwitch(["group", "default", "switch"]), true);
+      assert.equal(readTextFile(path.join(serviceAccountsDir, "registry.json")), registryBeforeCancel);
+      assert.deepEqual(selectedAccountKeys, []);
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+    }
+
+    const tableAccountOrder = (output) => [...output.matchAll(/^[* ]\s+\d+\s+(\S+)/gm)].map((match) => match[1]);
+    assert.deepEqual(tableAccountOrder(listOutput), tableAccountOrder(switchOutput));
+    assert.match(switchOutput, /No account switched\./);
+
+    let apiListOutput = "";
+    let apiSwitchOutput = "";
+    try {
+      process.stdout.write = (chunk) => {
+        apiListOutput += String(chunk);
+        return true;
+      };
+      const listCli = createCliService(cliDependencies);
+      assert.equal(await listCli.maybeHandleStoredList(["group", "default", "list", "--api"]), true);
+
+      process.stdout.write = (chunk) => {
+        apiSwitchOutput += String(chunk);
+        return true;
+      };
+      const cancelApiCli = createCliService({ ...cliDependencies, readSwitchSelection: () => "q" });
+      assert.equal(await cancelApiCli.maybeHandleStoredSwitch(["group", "default", "switch", "--api"]), true);
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+    }
+    assert.deepEqual(tableAccountOrder(apiListOutput), tableAccountOrder(apiSwitchOutput));
+    assert.doesNotMatch(apiListOutput, /chatgpt-personal/);
+    assert.doesNotMatch(apiSwitchOutput, /chatgpt-personal/);
+
+    const selectCli = createCliService({
+      ...cliDependencies,
+      readSwitchSelection: () => fallbackAccount.alias
+    });
+    assert.equal(await selectCli.maybeHandleStoredSwitch(["group", "default", "switch"]), true);
+    assert.deepEqual(selectedAccountKeys, [fallbackAccount.account_key]);
+  } finally {
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
+  }
 
   const clientConfig = createClientConfigService({
     providerProxy: proxy,

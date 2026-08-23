@@ -28,6 +28,7 @@ let headerStallConnectionCloseCount = 0;
 // proxy accepts v2-incompatible upstreams' text summary directly instead of
 // triggering a second /v1/chat/completions round-trip.
 let compactionTriggerReturnsMessageOutput = false;
+let summarizationFailureMode = null;
 const claudeSseBody = [
   "event: message_start",
   `data: ${JSON.stringify({
@@ -105,6 +106,38 @@ const upstream = http.createServer(async (req, res) => {
     contentEncoding: req.headers["content-encoding"],
     bodyText
   });
+  const isProviderSummarizationRequest = (req.url.endsWith("/chat/completions") || req.url.endsWith("/responses"))
+    && bodyText.includes("Here is the conversation history to summarize:");
+  if (isProviderSummarizationRequest && summarizationFailureMode) {
+    const mode = summarizationFailureMode;
+    if (mode === "access") {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "account access denied", code: "forbidden" } }));
+      return;
+    }
+    if (mode === "quota") {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "quota reached", code: "rate_limit_exceeded" } }));
+      return;
+    }
+    if (mode === "timeout") {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "summarization timed out", code: "gateway_timeout" } }));
+      return;
+    }
+    if (mode === "unsupported") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "endpoint not found", code: "not_found" } }));
+      return;
+    }
+    if (mode === "invalid_response") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(req.url.endsWith("/chat/completions")
+        ? JSON.stringify({ choices: [{ message: { role: "assistant", content: "" } }] })
+        : JSON.stringify({ id: "resp_no_summary", output: [{ type: "function_call", name: "noop", arguments: "{}" }] }));
+      return;
+    }
+  }
   const compactFailure = req.url.endsWith("/compact") ? compactFailures.shift() : null;
   if (req.method === "GET" && req.url.startsWith("/v1/usage?")) {
     const total = usageTotalsByBearer.get(req.headers.authorization) ?? 0;
@@ -715,7 +748,18 @@ const accounts = [
 function setActive(accountKey, autoSwitch = false) {
   fs.writeFileSync(
     path.join(accountsDir, "registry.json"),
-    JSON.stringify({ active_account_key: accountKey, auto_switch: { enabled: autoSwitch }, accounts }, null, 2),
+    JSON.stringify({ active_account_key: accountKey, activeAccountKey: accountKey, auto_switch: { enabled: autoSwitch }, accounts }, null, 2),
+    { mode: 0o600 }
+  );
+}
+
+function writeRootAuth(accountKey) {
+  const account = accounts.find((item) => item.account_key === accountKey);
+  if (!account) throw new Error(`missing account fixture ${accountKey}`);
+  const stored = JSON.parse(fs.readFileSync(path.join(accountsDir, `${accountKey}.auth.json`), "utf8"));
+  fs.writeFileSync(
+    path.join(codexHome, "auth.json"),
+    JSON.stringify({ ...stored, auth_mode: account.auth_mode, account_key: accountKey, alias: account.alias, email: account.email }, null, 2),
     { mode: 0o600 }
   );
 }
@@ -973,6 +1017,31 @@ try {
     throw new Error(`remote compaction v2 should emit one response.completed event, got:\n${remoteCompactionV2Text}`);
   }
 
+  // A completed explicit switch must select the same credentials for both a
+  // normal chat request and the provider-compatible compaction request.
+  writeRootAuth("apikey-vsllm");
+  setActive("apikey-vsllm");
+  await runWrapper(["switch", "vsllm-2"]);
+  const beforeSelectedAccountTraffic = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", aliasedModelBody);
+  const selectedAccountCompaction = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+  const selectedAccountCompactionText = await selectedAccountCompaction.text();
+  if (selectedAccountCompaction.status !== 200) {
+    throw new Error(`selected-account compaction should return 200, got ${selectedAccountCompaction.status}:\n${selectedAccountCompactionText}`);
+  }
+  const selectedAccountRequests = upstreamRequests.slice(beforeSelectedAccountTraffic);
+  if (selectedAccountRequests.length !== 2
+    || selectedAccountRequests.some((request) => request.authorization !== "Bearer vsllm-2-secret")) {
+    throw new Error(`chat and compaction should both use the explicitly selected account, got ${JSON.stringify(selectedAccountRequests)}`);
+  }
+  const selectedRegistry = readRegistry();
+  if (selectedRegistry.active_account_key !== "apikey-vsllm-2"
+    || selectedRegistry.activeAccountKey !== "apikey-vsllm-2") {
+    throw new Error(`explicit switch should synchronize active account metadata, got ${JSON.stringify(selectedRegistry)}`);
+  }
+  setActive("apikey-vsllm");
+  writeRootAuth("apikey-vsllm");
+
   const beforeCompactedFollowUp = upstreamRequests.length;
   await proxyRequest(proxyPort, "/responses", {
     model: "gpt-5.6-sol",
@@ -1042,8 +1111,26 @@ try {
   const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
   if (remoteCompactionDummy.status !== 502
     || upstreamRequests.length < beforeRemoteCompactionDummy + 1
+    || !remoteCompactionDummyText.includes("provider summarization service was unavailable")
     || !remoteCompactionDummyText.includes("compaction was not applied")) {
     throw new Error(`remote compaction v2 failure should return a non-lossy error, got ${remoteCompactionDummy.status}:\n${remoteCompactionDummyText}`);
+  }
+
+  const diagnosticCases = [
+    ["access", "provider authentication or account access was rejected (HTTP 403)"],
+    ["quota", "provider quota or billing limit was reached (HTTP 429)"],
+    ["timeout", "provider summarization request timed out (HTTP 504)"],
+    ["unsupported", "provider has no compatible summarization endpoint (HTTP 404)"],
+    ["invalid_response", "provider response contained no usable summary"]
+  ];
+  for (const [mode, expected] of diagnosticCases) {
+    summarizationFailureMode = mode;
+    const failed = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+    const failedText = await failed.text();
+    summarizationFailureMode = null;
+    if (failed.status !== 502 || !failedText.includes(expected) || !failedText.includes("compaction was not applied")) {
+      throw new Error(`remote compaction ${mode} diagnostic was not specific enough, got ${failed.status}:\n${failedText}`);
+    }
   }
 
   const compactRes1 = await proxyRequest(proxyPort, "/responses/compact", body);
