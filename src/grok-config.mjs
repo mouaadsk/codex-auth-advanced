@@ -9,14 +9,16 @@ export const grokVsllmManagedModels = Object.freeze([
   {
     pickerId: "vsllm-grok-45",
     upstreamModel: "grok-4.5",
-    name: "VSLLM Grok 4.5",
+    name: "VSLLM Grok 4.5 (Chat Completions)",
+    apiBackend: "chat_completions",
     reasoningEfforts: ["low", "medium", "high"],
     defaultReasoningEffort: "high"
   },
   {
     pickerId: "vsllm-grok-46",
     upstreamModel: "grok-4.6",
-    name: "VSLLM Grok 4.6",
+    name: "VSLLM Grok 4.6 (Chat Completions)",
+    apiBackend: "chat_completions",
     reasoningEfforts: ["low", "medium", "high", "xhigh"],
     defaultReasoningEffort: "high"
   }
@@ -72,7 +74,6 @@ export function managedGrokConfigSections(baseUrl) {
     `[${grokVsllmProviderSection}]`,
     `base_url = ${JSON.stringify(proxyBaseUrl)}`,
     `api_key = ${JSON.stringify(grokProxyApiKeyMarker)}`,
-    'api_backend = "responses"',
     ""
   ];
   for (const model of grokVsllmManagedModels) {
@@ -81,7 +82,8 @@ export function managedGrokConfigSections(baseUrl) {
       'model_provider = "vsllm"',
       `model = ${JSON.stringify(model.upstreamModel)}`,
       `name = ${JSON.stringify(model.name)}`,
-      `description = ${JSON.stringify(`${model.upstreamModel} through codex-auth-advanced proxy`)}`,
+      `description = ${JSON.stringify(`${model.upstreamModel} through codex-auth-advanced proxy using Chat Completions`)}`,
+      `api_backend = ${JSON.stringify(model.apiBackend)}`,
       "context_window = 1000000",
       "max_completion_tokens = 65536",
       ""

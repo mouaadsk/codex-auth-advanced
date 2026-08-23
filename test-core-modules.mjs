@@ -324,10 +324,14 @@ try {
   ].join("\n"), grokProxyRoot);
   assert.match(grokConfigured, /\[model_providers\.vsllm\]/);
   assert.match(grokConfigured, /base_url = "http:\/\/127\.0\.0\.1:47778\/_codex-auth-advanced\/test-group\/v1"/);
+  assert.doesNotMatch(grokConfigured, /api_backend = "responses"/);
+  assert.equal(grokConfigured.match(/api_backend = "chat_completions"/g)?.length, 2);
   assert.match(grokConfigured, /\[model\.vsllm-grok-45\]/);
   assert.match(grokConfigured, /model = "grok-4.5"/);
+  assert.match(grokConfigured, /name = "VSLLM Grok 4.5 \(Chat Completions\)"/);
   assert.match(grokConfigured, /\[model\.vsllm-grok-46\]/);
   assert.match(grokConfigured, /model = "grok-4.6"/);
+  assert.match(grokConfigured, /name = "VSLLM Grok 4.6 \(Chat Completions\)"/);
   assert.match(grokConfigured, /\[cli\]/);
   assert.match(grokConfigured, /supports_reasoning_effort = true/);
   assert.match(grokConfigured, /\[\[model\.vsllm-grok-46\.reasoning_efforts\]\]/);
@@ -876,8 +880,11 @@ try {
   const expectedGrokBaseUrl = `${proxy.baseUrl(serviceHome)}/accounts/${activeAccount.account_key}/v1`;
   assert.equal(grokConfiguredClient.baseUrl, expectedGrokBaseUrl);
   assert.equal(grokConfiguredClient.models.length, 2);
+  assert.ok(grokConfiguredClient.models.every(({ apiBackend }) => apiBackend === "chat_completions"));
   const grokConfig = readTextFile(path.join(grokHome, "config.toml"));
   assert.ok(grokConfig.includes(`base_url = ${JSON.stringify(expectedGrokBaseUrl)}`));
+  assert.equal(grokConfig.match(/api_backend = "chat_completions"/g)?.length, 2);
+  assert.doesNotMatch(grokConfig, /api_backend = "responses"/);
   assert.match(grokConfig, /model = "grok-4.5"/);
   assert.match(grokConfig, /model = "grok-4.6"/);
 

@@ -298,7 +298,7 @@ For normal operations, prefer the lifecycle scripts described in [Operations](#o
 | `configure [all]` | Configure Codex, Claude Code, and Grok Build; `all` is the default when omitted. |
 | `configure codex` | Point Codex at the default proxy route for its active API-key account. |
 | `configure claude` | Merge the Claude Code gateway settings and independent VSLLM model discovery into `~/.claude/settings.json`. |
-| `configure grok` | Merge VSLLM Grok 4.5/4.6 Responses routes into `~/.grok/config.toml`. |
+| `configure grok` | Merge VSLLM Grok 4.5/4.6 Chat Completions routes into `~/.grok/config.toml`. |
 
 ## Account Storage
 
@@ -473,20 +473,21 @@ The command backs up an existing `~/.grok/config.toml`, preserves unrelated sett
 [model_providers.vsllm]
 base_url = "<default codex-auth-advanced proxy route>/accounts/<active-vsllm-account-key>/v1"
 api_key = "local-codex-auth-advanced"
-api_backend = "responses"
 
 [model.vsllm-grok-45]
 model_provider = "vsllm"
 model = "grok-4.5"
+api_backend = "chat_completions"
 
 [model.vsllm-grok-46]
 model_provider = "vsllm"
 model = "grok-4.6"
+api_backend = "chat_completions"
 ```
 
 Grok Build is pinned to the VSLLM account that is active when `configure grok` runs. Later default-group switches and automatic failover therefore cannot send Grok requests to LLMAPI or another provider. Run `configure grok` again to deliberately pin a newly active VSLLM account; if the active account is not VSLLM, the command leaves the existing Grok configuration unchanged.
 
-Grok Build sends Responses-compatible requests to the local proxy, so no Claude Messages bridge is required. The proxy keeps the existing VSLLM capability policy and translates Grok 4.5/4.6 upstream calls to Chat Completions. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models.
+Grok Build documents Chat Completions as its default custom-model backend while also supporting Responses and Anthropic Messages. The managed VSLLM Grok entries select `chat_completions` explicitly on each model, so Grok Build sends `/v1/chat/completions` directly instead of relying on a proxy-side Responses translation or a provider-wide backend setting. The shared `base_url` deliberately remains at the `/v1` root because Grok Build appends the endpoint selected by each model's `api_backend`. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`; their display names include `(Chat Completions)` so the endpoint is visible in the picker. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models.
 
 Use `/model vsllm-grok-46` or `grok -m vsllm-grok-46` after configuration. The marker `api_key` is not sent upstream; the local proxy replaces it with the stored VSLLM account key.
 

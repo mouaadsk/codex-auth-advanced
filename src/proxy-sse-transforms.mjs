@@ -34,7 +34,32 @@ export function createStreamDiagnostics(target, reqUrl) {
   };
 }
 
-export function createSseResponseTransformStream(target, isEventStream, diagnostics = null) {
+function normalizedFallbackModel(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+// Some OpenAI-compatible Responses implementations omit `model` from the
+// response object even though strict clients require it. Preserve an upstream
+// value when present and otherwise recover the model from the request that
+// produced the response.
+export function ensureResponsesModel(value, fallbackModel) {
+  const model = normalizedFallbackModel(fallbackModel);
+  if (!model || !value || typeof value !== "object") return false;
+
+  const response = value.object === "response"
+    ? value
+    : value.response && typeof value.response === "object"
+      ? value.response
+      : null;
+  if (!response) return false;
+  if (typeof response.model === "string" && response.model.trim()) return false;
+
+  response.model = model;
+  return true;
+}
+
+export function createSseResponseTransformStream(target, isEventStream, diagnostics = null, options = {}) {
+  const fallbackModel = options?.fallbackModel;
   let buffer = "";
   return new Transform({
     transform(chunk, encoding, callback) {
@@ -53,6 +78,7 @@ export function createSseResponseTransformStream(target, isEventStream, diagnost
                 diagnostics?.mark(parsed);
                 normalizeCompactionResponse(parsed);
                 ensureEncryptedContent(parsed);
+                ensureResponsesModel(parsed, fallbackModel);
                 out += `data: ${JSON.stringify(parsed)}\n`;
                 continue;
               } catch {
@@ -65,6 +91,7 @@ export function createSseResponseTransformStream(target, isEventStream, diagnost
               diagnostics?.mark(parsed);
               normalizeCompactionResponse(parsed);
               ensureEncryptedContent(parsed);
+              ensureResponsesModel(parsed, fallbackModel);
               out += JSON.stringify(parsed) + "\n";
               continue;
             } catch {
@@ -95,6 +122,7 @@ export function createSseResponseTransformStream(target, isEventStream, diagnost
                 diagnostics?.mark(parsed);
                 normalizeCompactionResponse(parsed);
                 ensureEncryptedContent(parsed);
+                ensureResponsesModel(parsed, fallbackModel);
                 out = `data: ${JSON.stringify(parsed)}`;
               } catch {
                 // Ignore
@@ -106,6 +134,7 @@ export function createSseResponseTransformStream(target, isEventStream, diagnost
               diagnostics?.mark(parsed);
               normalizeCompactionResponse(parsed);
               ensureEncryptedContent(parsed);
+              ensureResponsesModel(parsed, fallbackModel);
               out = JSON.stringify(parsed);
             } catch {
               // Ignore
@@ -122,6 +151,7 @@ export function createSseResponseTransformStream(target, isEventStream, diagnost
             diagnostics?.mark(parsed);
             normalizeCompactionResponse(parsed);
             ensureEncryptedContent(parsed);
+            ensureResponsesModel(parsed, fallbackModel);
             out = JSON.stringify(parsed);
           } catch (e) {
             console.error("[Proxy Transform] Failed to parse/normalize unary JSON response:", e.message);

@@ -220,10 +220,11 @@ export function createClientConfigService({ providerProxy, accountService }) {
       provider,
       configPath,
       baseUrl: grokProxyBaseUrl(pinnedBaseUrl),
-      models: grokVsllmManagedModels.map(({ pickerId, upstreamModel, name }) => ({
+      models: grokVsllmManagedModels.map(({ pickerId, upstreamModel, name, apiBackend }) => ({
         pickerId,
         upstreamModel,
-        name
+        name,
+        apiBackend
       }))
     };
   }

@@ -328,17 +328,22 @@ for (const expected of [
   'installer = "internal"',
   "[model_providers.vsllm]",
   `base_url = "${expectedGrokBaseUrl}"`,
-  'api_backend = "responses"',
   "[model.vsllm-grok-45]",
   'model = "grok-4.5"',
+  'name = "VSLLM Grok 4.5 (Chat Completions)"',
   "[model.vsllm-grok-46]",
   'model = "grok-4.6"',
+  'name = "VSLLM Grok 4.6 (Chat Completions)"',
   "supports_reasoning_effort = true",
   'reasoning_effort = "high"',
   "[[model.vsllm-grok-46.reasoning_efforts]]",
   'value = "xhigh"'
 ]) {
   if (!grokConfig.includes(expected)) throw new Error(`Grok config is missing ${expected}:\n${grokConfig}`);
+}
+if (grokConfig.includes('api_backend = "responses"')
+  || grokConfig.match(/api_backend = "chat_completions"/g)?.length !== 2) {
+  throw new Error(`Grok models should explicitly select Chat Completions independently:\n${grokConfig}`);
 }
 
 const plistPath = path.join(home, "Library", "LaunchAgents", "com.mouaadsk.codex-auth-advanced.proxy.plist");

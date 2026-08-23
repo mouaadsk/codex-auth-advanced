@@ -1023,7 +1023,12 @@ export function createProviderProxy(options) {
         responseStream = responseStream.pipe(sseTransform);
         responseStream.on("data", (c) => console.log(`[DEBUG sse->res] chunk len=${c.length}, sample=${c.toString().slice(0, 100)}`));
       } else if (shouldTransformOpenAiResponse) {
-        responseStream = responseStream.pipe(createSseResponseTransformStream(target, contentType.includes("event-stream"), diagnostics));
+        responseStream = responseStream.pipe(createSseResponseTransformStream(
+          target,
+          contentType.includes("event-stream"),
+          diagnostics,
+          { fallbackModel: originalRequestModel }
+        ));
       }
       responseStream.on("end", () => finishDiagnostics("end"));
       responseStream.on("close", () => finishDiagnostics("close"));
