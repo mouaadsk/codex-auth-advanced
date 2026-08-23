@@ -784,17 +784,12 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   resetCompactionFailure(target);
   const startTime = Date.now();
   const completionsUrl = compactionCompletionsUrl(target);
-  const preferResponsesFirst = target?.account?.api_template === "llmapi"
-    || target?.wireApi === "responses"
-    || /llmapi/i.test(String(target?.upstreamBaseUrl || target?.url || ""));
-  if (!completionsUrl && !preferResponsesFirst) {
+  const responsesEndpointUrl = compactionResponsesUrl(target);
+  if (!responsesEndpointUrl && !completionsUrl) {
     recordCompactionFailure(target, "configuration");
     console.error(`[Proxy Local Compaction] Cannot derive an upstream summarization endpoint from ${target?.url}`);
     return null;
   }
-  const responsesEndpointUrl = compactionResponsesUrl(target);
-  const targetDesc = preferResponsesFirst ? responsesEndpointUrl : completionsUrl;
-  console.log(`[Proxy Local Compaction] Starting provider summarization on ${targetDesc}...`);
 
   const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
   let parsed = null;
@@ -819,13 +814,12 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     return completionBody;
   };
 
-  // Codex /responses/compact path: the native compact endpoint failed, so we
-  // re-summarize via chat completions. A dedicated compact model id is the
-  // wrong choice here — it was sized for the small condensed payload, not the
-  // full conversation — so reuse the request's own model. Prefer the
-  // pre-rewrite original model (the proxy body may already have been remapped
-  // to the compact-specific id), falling back to the non-compact remap only
-  // when the request omitted a model.
+  // Codex compaction reuses the request's own model for provider-compatible
+  // summarization. A dedicated compact model id is the wrong choice here — it
+  // was sized for the small condensed payload, not the full conversation.
+  // Prefer the pre-rewrite original model (the proxy body may already have
+  // been remapped to a compact-specific id), falling back to the non-compact
+  // remap only when the request omitted a model.
   const fallbackModel = typeof options.originalModel === "string" && options.originalModel.trim()
     ? options.originalModel.trim()
     : typeof parsed?.model === "string" && parsed.model.trim()
@@ -845,6 +839,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
       console.error(`[Proxy Local Compaction] Claude compaction request had no transcript text.`);
       return null;
     }
+    console.log(`[Proxy Local Compaction] Starting Claude provider summarization on ${completionsUrl}...`);
     const summaryText = await summarizeCompactViaChatCompletions({
       target,
       model: fallbackModel,
@@ -898,9 +893,10 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     }
   }
 
-  // Codex /responses/compact path: the native compact endpoint failed, so we
-  // re-summarize via chat completions. Send the FULL conversation — no item
-  // dropping, no per-item truncation — so the summary reflects everything.
+  // Codex local compaction follows the same wire-shape priority as normal
+  // Codex requests: /v1/responses first, then /v1/chat/completions only when
+  // Responses fails or contains no usable summary. Send the full readable
+  // conversation so the summary reflects the complete retained context.
   const conversationText = extractCompactConversationText(parsed);
   if (!conversationText) {
     recordCompactionFailure(target, "missing_conversation");
@@ -908,12 +904,13 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     return null;
   }
   console.log(`[Proxy Local Compaction Debug] fallbackModel=${fallbackModel}, parsedModel=${parsed?.model}, originalModel=${options.originalModel}, textLen=${conversationText.length}`);
+  console.log(`[Proxy Local Compaction] Starting Codex provider summarization on ${responsesEndpointUrl || completionsUrl}...`);
   const userPrompt = `Here is the conversation history to summarize:\n\n${conversationText}`;
 
   let summaryText = "";
 
   async function trySummarizeViaResponses() {
-    const responsesUrl = compactionResponsesUrl(target);
+    const responsesUrl = responsesEndpointUrl;
     if (!responsesUrl) return "";
     const responsesBody = {
       model: fallbackModel,
@@ -1029,18 +1026,12 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
     return "";
   }
 
-  if (preferResponsesFirst) {
+  if (responsesEndpointUrl) {
     summaryText = await trySummarizeViaResponses();
-    if (!summaryText) {
-      console.log(`[Proxy Local Compaction] Falling back to completions endpoint ${completionsUrl}...`);
-      summaryText = await trySummarizeViaCompletions();
-    }
-  } else {
+  }
+  if (!summaryText && completionsUrl) {
+    console.log(`[Proxy Local Compaction] Responses summarization failed; falling back to Chat Completions endpoint ${completionsUrl}...`);
     summaryText = await trySummarizeViaCompletions();
-    if (!summaryText) {
-      console.log(`[Proxy Local Compaction] Falling back to responses endpoint...`);
-      summaryText = await trySummarizeViaResponses();
-    }
   }
 
   if (!summaryText) {
@@ -1051,28 +1042,24 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
 
   console.log(`[Proxy Local Compaction] Summary successfully generated in ${((Date.now() - startTime) / 1000).toFixed(2)}s. Summary size: ${summaryText.length} chars.`);
 
-    if (claudeFormat) {
-      return claudeMessagesCompactionResponse(summaryText, parsed?.model);
-    }
+  if (remoteCompactionV2) {
+    return remoteCompactionV2Response(summaryText);
+  }
 
-    if (remoteCompactionV2) {
-      return remoteCompactionV2Response(summaryText);
-    }
+  const compactedMessage = compactTextMessage(summaryText);
+  const compactionResponse = {
+    type: "response.compaction",
+    encrypted_content: "",
+    messages: [compactedMessage],
+    output: [compactedMessage]
+  };
 
-    const compactedMessage = compactTextMessage(summaryText);
-    const compactionResponse = {
-      type: "response.compaction",
-      encrypted_content: "",
-      messages: [compactedMessage],
-      output: [compactedMessage]
-    };
-
-    return new Response(JSON.stringify(compactionResponse), {
-      status: 200,
-      headers: new Headers({
-        "content-type": "application/json; charset=utf-8"
-      })
-    });
+  return new Response(JSON.stringify(compactionResponse), {
+    status: 200,
+    headers: new Headers({
+      "content-type": "application/json; charset=utf-8"
+    })
+  });
 }
 
 function claudeMessagesJsonResponse(body, extraHeaders = {}) {

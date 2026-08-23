@@ -23,6 +23,7 @@ const responseFailures = [];
 const claudeCompactionFailures = [];
 const claudeMessageFailures = [];
 const reasoningLevelFailures = [];
+const responsesSummarizationFailures = [];
 let headerStallConnectionCloseCount = 0;
 // When true, the upstream /v1/responses handler returns a type:"message" output
 // for any request whose input contains a compaction_trigger. Used to assert the
@@ -109,6 +110,14 @@ const upstream = http.createServer(async (req, res) => {
   });
   const isProviderSummarizationRequest = (req.url.endsWith("/chat/completions") || req.url.endsWith("/responses"))
     && bodyText.includes("Here is the conversation history to summarize:");
+  if (isProviderSummarizationRequest && req.url.endsWith("/responses") && responsesSummarizationFailures.length > 0) {
+    const failure = responsesSummarizationFailures.shift();
+    if (failure === "unsupported") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "Responses summarization endpoint not found", code: "not_found" } }));
+      return;
+    }
+  }
   if (isProviderSummarizationRequest && reasoningLevelFailures.length > 0) {
     const rejectedLevel = reasoningLevelFailures.shift();
     res.writeHead(400, { "content-type": "application/json" });
@@ -138,6 +147,11 @@ const upstream = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "summarization timed out", code: "gateway_timeout" } }));
       return;
     }
+    if (mode === "unavailable") {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "summarization unavailable", code: "service_unavailable" } }));
+      return;
+    }
     if (mode === "unsupported") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "endpoint not found", code: "not_found" } }));
@@ -150,6 +164,25 @@ const upstream = http.createServer(async (req, res) => {
         : JSON.stringify({ id: "resp_no_summary", output: [{ type: "function_call", name: "noop", arguments: "{}" }] }));
       return;
     }
+  }
+  if (isProviderSummarizationRequest && req.url.endsWith("/responses")) {
+    const summaryText = compactionTriggerReturnsMessageOutput
+      ? "upstream returned this compaction summary directly"
+      : "compacted message text";
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "resp_upstream_summary",
+      object: "response",
+      status: "completed",
+      output: [{
+        id: "msg_upstream_summary_0",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: summaryText }]
+      }]
+    }));
+    return;
   }
   const compactFailure = req.url.endsWith("/compact") ? compactFailures.shift() : null;
   if (req.method === "GET" && req.url.startsWith("/v1/usage?")) {
@@ -291,11 +324,6 @@ const upstream = http.createServer(async (req, res) => {
         { type: "message", role: "assistant", content: "compacted message text" }
       ]
     }));
-  } else if (req.url.endsWith("/chat/completions") && compactionTriggerReturnsMessageOutput) {
-    console.log("[fixture] blocking /v1/chat/completions to force /v1/responses fallback");
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "fixture forces fallback to /v1/responses" } }));
-    return;
   } else if (req.url.endsWith("/chat/completions")) {
     if (claudeCompactionFailures[0] === "unreachable") {
       claudeCompactionFailures.shift();
@@ -314,26 +342,6 @@ const upstream = http.createServer(async (req, res) => {
         }
       ]
     }));
-  } else if (req.url.endsWith("/responses") && compactionTriggerReturnsMessageOutput) {
-    // Simulate an llmapi-style upstream that produces a real summary but
-    // ships it as type:"message" instead of type:"compaction". The proxy
-    // should accept that text directly so we don't waste a round-trip on
-    // /v1/chat/completions.
-    console.log("[fixture] /v1/responses with flag, body len:", bodyText.length);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      id: "resp_upstream_summary",
-      object: "response",
-      status: "completed",
-      output: [{
-        id: "msg_upstream_summary_0",
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: "upstream returned this compaction summary directly" }]
-      }]
-    }));
-    return;
   } else if (req.url.endsWith("/responses")) {
     const responseFailure = responseFailures.shift();
     if (responseFailure === "no_active_subscription") {
@@ -1001,14 +1009,14 @@ try {
     throw new Error(`remote compaction v2 should make one provider-compatible summarization request, got ${upstreamRequests.length - beforeRemoteCompactionV2}`);
   }
   const remoteCompactionFallbackRequest = upstreamRequests.at(-1);
-  if (!remoteCompactionFallbackRequest?.url.endsWith("/chat/completions")) {
-    throw new Error(`remote compaction v2 should use chat completions, got ${remoteCompactionFallbackRequest?.url}`);
+  if (!remoteCompactionFallbackRequest?.url.endsWith("/responses")) {
+    throw new Error(`remote compaction v2 should use Responses first, got ${remoteCompactionFallbackRequest?.url}`);
   }
   const remoteCompactionFallbackBody = JSON.parse(remoteCompactionFallbackRequest.bodyText);
   if (remoteCompactionFallbackBody.model !== "gpt-5.6-sol") {
     throw new Error(`remote compaction v2 should preserve the selected model, got ${remoteCompactionFallbackRequest.bodyText}`);
   }
-  if (remoteCompactionFallbackBody.reasoning_effort !== "ultra") {
+  if (remoteCompactionFallbackBody.reasoning?.effort !== "ultra") {
     throw new Error(`remote compaction v2 should preserve Codex reasoning effort, got ${remoteCompactionFallbackRequest.bodyText}`);
   }
   const remoteCompactionFallbackSerialized = JSON.stringify(remoteCompactionFallbackBody);
@@ -1030,6 +1038,29 @@ try {
     throw new Error(`remote compaction v2 should emit one response.completed event, got:\n${remoteCompactionV2Text}`);
   }
 
+  // Codex compaction follows the same endpoint chain as normal Codex turns:
+  // Responses first, then Chat Completions on the same selected account.
+  responsesSummarizationFailures.push("unsupported");
+  const beforeRemoteCompactionChatFallback = upstreamRequests.length;
+  const remoteCompactionChatFallback = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+  const remoteCompactionChatFallbackText = await remoteCompactionChatFallback.text();
+  if (remoteCompactionChatFallback.status !== 200) {
+    throw new Error(`remote compaction should fall back to chat completions after Responses fails, got ${remoteCompactionChatFallback.status}:\n${remoteCompactionChatFallbackText}`);
+  }
+  const remoteCompactionChatFallbackRequests = upstreamRequests.slice(beforeRemoteCompactionChatFallback);
+  if (remoteCompactionChatFallbackRequests.length !== 2
+    || !remoteCompactionChatFallbackRequests[0]?.url.endsWith("/responses")
+    || !remoteCompactionChatFallbackRequests[1]?.url.endsWith("/chat/completions")
+    || remoteCompactionChatFallbackRequests.some((request) => request.authorization !== "Bearer vsllm-secret")) {
+    throw new Error(`remote compaction should use Responses then Chat Completions on the same account, got ${JSON.stringify(remoteCompactionChatFallbackRequests)}`);
+  }
+  const remoteCompactionResponsesBody = JSON.parse(remoteCompactionChatFallbackRequests[0].bodyText);
+  const remoteCompactionChatBody = JSON.parse(remoteCompactionChatFallbackRequests[1].bodyText);
+  if (remoteCompactionResponsesBody.reasoning?.effort !== "ultra"
+    || remoteCompactionChatBody.reasoning_effort !== "ultra") {
+    throw new Error(`remote compaction fallback should preserve effort across both wire shapes, got ${JSON.stringify(remoteCompactionChatFallbackRequests)}`);
+  }
+
   // A VSLLM/New API channel may reject `max` even though another channel for
   // the same model accepts it. The proxy must retry the provider summarizer,
   // preserve `max` on every attempt, and stop after the bounded retry budget.
@@ -1046,13 +1077,13 @@ try {
   }
   const maxReasoningRequests = upstreamRequests.slice(beforeMaxReasoningCompaction);
   if (maxReasoningRequests.length !== 3
-    || maxReasoningRequests.some((request) => request.authorization !== "Bearer vsllm-secret")) {
+    || maxReasoningRequests.some((request) => request.authorization !== "Bearer vsllm-secret" || !request.url.endsWith("/responses"))) {
     throw new Error(`max-effort compaction should make exactly two retries on the same VSLLM account, got ${JSON.stringify(maxReasoningRequests)}`);
   }
   for (const request of maxReasoningRequests) {
     const requestBody = JSON.parse(request.bodyText);
-    if (requestBody.reasoning_effort !== "max") {
-      throw new Error(`max-effort compaction must preserve reasoning_effort=max on retries, got ${request.bodyText}`);
+    if (requestBody.reasoning?.effort !== "max") {
+      throw new Error(`max-effort compaction must preserve reasoning.effort=max on Responses retries, got ${request.bodyText}`);
     }
   }
 
@@ -1105,12 +1136,11 @@ try {
     throw new Error(`a proxy-generated compaction item should expand into readable provider context, got ${upstreamRequests.at(-1).bodyText}`);
   }
 
-  // v2-incompatible upstream (e.g. llmapi) returns type:"message" for the
-  // /v1/responses call even though it produced a real summary. The proxy should
-  // accept that text directly and wrap it in a type:"compaction" envelope, so
-  // Codex sees exactly one upstream request, not two. Switch the active
-  // account to llmapi so the proxy uses preferResponsesFirst=true and the
-  // first /v1/responses attempt is the one we expect to succeed.
+  // A v2-incompatible upstream may return type:"message" for the
+  // /v1/responses summarization call even though it produced a real summary.
+  // The proxy should accept that text directly and wrap it in a
+  // type:"compaction" envelope, so Codex sees exactly one upstream request.
+  // Use llmapi here to verify the Responses-first rule is provider-independent.
   setActive("apikey-llmapi");
   compactionTriggerReturnsMessageOutput = true;
   const beforeAcceptMessage = upstreamRequests.length;
@@ -1143,14 +1173,15 @@ try {
   // they used before this branch was introduced.
   setActive("apikey-vsllm");
 
-  claudeCompactionFailures.push("unreachable");
+  summarizationFailureMode = "unavailable";
   const beforeRemoteCompactionDummy = upstreamRequests.length;
   const remoteCompactionDummy = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
   const remoteCompactionDummyText = await remoteCompactionDummy.text();
+  summarizationFailureMode = null;
   const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
   if (remoteCompactionDummy.status !== 502
     || upstreamRequests.length < beforeRemoteCompactionDummy + 1
-    || !remoteCompactionDummyText.includes("provider summarization service was unavailable")
+    || !remoteCompactionDummyText.includes("provider summarization service was unavailable (HTTP 503)")
     || !remoteCompactionDummyText.includes("compaction was not applied")) {
     throw new Error(`remote compaction v2 failure should return a non-lossy error, got ${remoteCompactionDummy.status}:\n${remoteCompactionDummyText}`);
   }
@@ -1188,15 +1219,15 @@ try {
   }
   assertRequestAt(beforeVsllmFallback, { label: "vsllm compact first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true, expectedReasoningEffort: "xhigh" });
   const vsllmFallbackReq = upstreamRequests.at(-1);
-  if (!vsllmFallbackReq || !vsllmFallbackReq.url.endsWith("/chat/completions")) {
-    throw new Error(`expected vsllm compact fallback to use chat completions, got url: ${vsllmFallbackReq?.url}`);
+  if (!vsllmFallbackReq || !vsllmFallbackReq.url.endsWith("/responses")) {
+    throw new Error(`expected vsllm compact fallback to use Responses first, got url: ${vsllmFallbackReq?.url}`);
   }
   const vsllmFallbackReqBody = JSON.parse(vsllmFallbackReq.bodyText);
   if (vsllmFallbackReqBody.stream === true) {
-    throw new Error(`expected vsllm compact fallback to use non-streaming chat completions, got: ${vsllmFallbackReq.bodyText}`);
+    throw new Error(`expected vsllm compact fallback to use non-streaming Responses, got: ${vsllmFallbackReq.bodyText}`);
   }
-  if (!Array.isArray(vsllmFallbackReqBody.messages) || vsllmFallbackReqBody.messages.length !== 2) {
-    throw new Error(`expected vsllm compact fallback to send chat messages, got: ${vsllmFallbackReq.bodyText}`);
+  if (!Array.isArray(vsllmFallbackReqBody.input) || vsllmFallbackReqBody.input.length !== 1) {
+    throw new Error(`expected vsllm compact fallback to send Responses input, got: ${vsllmFallbackReq.bodyText}`);
   }
   assertLatestRequest({ label: "vsllm compact fallback", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false, expectedReasoningEffort: "xhigh" });
   assertCompactResponseTextContent("vsllm compact fallback response", compactRes1Fallback);

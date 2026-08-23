@@ -515,7 +515,7 @@ Claude model routing is separate from the Codex table:
 | `VSLLM: grok-4.5` | VSLLM `grok-4.5` | VSLLM `/v1/responses` through the Claude bridge |
 | `VSLLM: grok-4.6` | VSLLM `grok-4.6` | VSLLM `/v1/responses` through the Claude bridge |
 
-The request's `reasoning.effort` or `reasoning_effort` value is preserved. During local compact fallback, the same value is forwarded to the fallback request (`reasoning_effort` for Chat Completions and `reasoning.effort` for Responses). Chat Completions does not automatically mean `xhigh`, and the proxy does not translate `max` to `xhigh`: VSLLM/New API channels can advertise different supported effort sets. If a VSLLM summarization channel returns the exact unsupported-level validation error, the proxy retries that idempotent summarization call up to two times so New API can select another channel; ordinary chat requests and other HTTP 400 errors are not retried by this rule.
+The request's `reasoning.effort` or `reasoning_effort` value is preserved. Codex local compaction follows the same endpoint priority as normal Codex traffic: it tries `/v1/responses` first, then `/v1/chat/completions` only when Responses fails or returns no usable summary. The same effort is forwarded in the shape each endpoint expects (`reasoning.effort` for Responses and `reasoning_effort` for Chat Completions). Chat Completions does not automatically mean `xhigh`, and the proxy does not translate `max` to `xhigh`: VSLLM/New API channels can advertise different supported effort sets. If a VSLLM summarization channel returns the exact unsupported-level validation error, the proxy retries that idempotent summarization call up to two times so New API can select another channel; ordinary chat requests and other HTTP 400 errors are not retried by this rule.
 
 ### Compact Requests
 
@@ -525,7 +525,7 @@ Codex compact requests are sent to:
 /v1/responses/compact
 ```
 
-The proxy first uses the provider-native endpoint. If it is missing, unavailable, or times out, the proxy creates a summary through `/v1/chat/completions` and returns it in Codex compact-response format.
+The proxy first uses the provider-native endpoint. If it is missing, unavailable, or times out, the proxy creates a summary through `/v1/responses`, then falls back to `/v1/chat/completions` when Responses cannot produce a usable summary, and returns it in Codex compact-response format. Remote compaction v2, which Codex sends through the ordinary `/responses` route, follows the same Responses-first ordering.
 
 For provider/account transitions that cannot decrypt earlier reasoning state, the compatibility path can remove encrypted reasoning content and retry with plaintext conversation content. Normal response requests remain pass-through apart from model rewriting and required header normalization.
 
