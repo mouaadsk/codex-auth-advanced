@@ -471,7 +471,7 @@ The command backs up an existing `~/.grok/config.toml`, preserves unrelated sett
 
 ```toml
 [model_providers.vsllm]
-base_url = "<default codex-auth-advanced proxy route>/v1"
+base_url = "<default codex-auth-advanced proxy route>/accounts/<active-vsllm-account-key>/v1"
 api_key = "local-codex-auth-advanced"
 api_backend = "responses"
 
@@ -484,7 +484,9 @@ model_provider = "vsllm"
 model = "grok-4.6"
 ```
 
-Grok Build uses the OpenAI Responses API directly, so no Claude Messages bridge is required. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models.
+Grok Build is pinned to the VSLLM account that is active when `configure grok` runs. Later default-group switches and automatic failover therefore cannot send Grok requests to LLMAPI or another provider. Run `configure grok` again to deliberately pin a newly active VSLLM account; if the active account is not VSLLM, the command leaves the existing Grok configuration unchanged.
+
+Grok Build sends Responses-compatible requests to the local proxy, so no Claude Messages bridge is required. The proxy keeps the existing VSLLM capability policy and translates Grok 4.5/4.6 upstream calls to Chat Completions. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models.
 
 Use `/model vsllm-grok-46` or `grok -m vsllm-grok-46` after configuration. The marker `api_key` is not sent upstream; the local proxy replaces it with the stored VSLLM account key.
 

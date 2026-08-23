@@ -305,6 +305,10 @@ try {
     grokProxyBaseUrl(grokProxyRoot),
     "http://127.0.0.1:47778/_codex-auth-advanced/test-group/v1"
   );
+  assert.equal(
+    grokProxyBaseUrl(`${grokProxyRoot}/accounts/apikey-vsllm/v1`),
+    `${grokProxyRoot}/accounts/apikey-vsllm/v1`
+  );
   const grokConfigured = upsertGrokVsllmProxyConfig([
     "[cli]",
     'installer = "internal"',
@@ -758,10 +762,52 @@ try {
   fs.mkdirSync(grokHome, { recursive: true, mode: 0o700 });
   const grokConfiguredClient = clientConfig.configureGrokBuildClient(serviceHome, { grokHome });
   assert.equal(grokConfiguredClient.configured, true);
+  assert.equal(grokConfiguredClient.account.account_key, activeAccount.account_key);
+  assert.equal(grokConfiguredClient.provider, "vsllm");
+  const expectedGrokBaseUrl = `${proxy.baseUrl(serviceHome)}/accounts/${activeAccount.account_key}/v1`;
+  assert.equal(grokConfiguredClient.baseUrl, expectedGrokBaseUrl);
   assert.equal(grokConfiguredClient.models.length, 2);
   const grokConfig = readTextFile(path.join(grokHome, "config.toml"));
+  assert.ok(grokConfig.includes(`base_url = ${JSON.stringify(expectedGrokBaseUrl)}`));
   assert.match(grokConfig, /model = "grok-4.5"/);
   assert.match(grokConfig, /model = "grok-4.6"/);
+
+  const grokLlmapiAccount = {
+    account_key: "apikey-llmapi",
+    alias: "llmapi",
+    auth_mode: "apikey",
+    api_template: "llmapi",
+    created_at: 40
+  };
+  writeJsonFile(path.join(serviceAccountsDir, `${grokLlmapiAccount.account_key}.auth.json`), {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "llmapi-secret",
+    account_key: grokLlmapiAccount.account_key
+  });
+  writeTextFilePrivate(path.join(serviceAccountsDir, `${grokLlmapiAccount.account_key}.config.toml`), [
+    'model_provider = "OpenAI"',
+    "",
+    "[model_providers.OpenAI]",
+    'base_url = "https://llmapi.pro/v1"',
+    'wire_api = "responses"',
+    ""
+  ].join("\n"));
+  writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
+    active_account_key: grokLlmapiAccount.account_key,
+    active_account_activated_at_ms: Date.now(),
+    auto_switch: { enabled: true },
+    accounts: [activeAccount, exhaustedAccount, fallbackAccount, grokLlmapiAccount]
+  });
+  writeJsonFile(path.join(serviceHome, "auth.json"), {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "llmapi-secret",
+    alias: grokLlmapiAccount.alias,
+    account_key: grokLlmapiAccount.account_key
+  });
+  const skippedLlmapiGrokConfig = clientConfig.configureGrokBuildClient(serviceHome, { grokHome });
+  assert.equal(skippedLlmapiGrokConfig.configured, false);
+  assert.equal(skippedLlmapiGrokConfig.reason, "active_account_is_not_vsllm");
+  assert.equal(readTextFile(path.join(grokHome, "config.toml")), grokConfig);
 
   writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
     active_account_key: exhaustedAccount.account_key,

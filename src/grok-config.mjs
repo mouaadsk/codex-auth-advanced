@@ -63,7 +63,7 @@ export function grokConfigPath(grokHome = defaultGrokHome()) {
 
 export function grokProxyBaseUrl(providerProxyBaseUrl) {
   const base = String(providerProxyBaseUrl || "").trim().replace(/\/+$/, "");
-  return `${base}/v1`;
+  return base.endsWith("/v1") ? base : `${base}/v1`;
 }
 
 export function managedGrokConfigSections(baseUrl) {

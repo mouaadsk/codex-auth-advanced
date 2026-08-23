@@ -852,34 +852,27 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
 
       if (responsesRes.status === 200) {
         const responsesData = await responsesRes.json().catch(() => null);
-        const firstOutput = Array.isArray(responsesData?.output) ? responsesData.output[0] : null;
-        const firstContent = Array.isArray(firstOutput?.content) ? firstOutput.content[0] : null;
-        // The upstream honored the compaction trigger if the first output is a
-        // real compaction item, OR if it returned a single text message with no
-        // tool calls. The latter is what some v2-incompatible upstreams do
-        // (e.g. llmapi today): they recognize the trigger and produce a real
-        // summary but ship it as type:"message" instead of type:"compaction".
-        // We accept that text directly so we don't pay for a second round-trip
-        // to /v1/chat/completions. Outputs with function_call, web_search, etc.
-        // fall through to the chat completions fallback.
-        if (firstOutput?.type === "compaction") {
-          const extracted = firstContent?.text || firstOutput?.text || "";
-          const text = String(extracted).trim();
-          if (text) return text;
-        } else if (firstOutput?.type === "message") {
-          const allParts = Array.isArray(firstOutput?.content) ? firstOutput.content : [];
-          const hasNonTextPart = allParts.some((part) => part && typeof part === "object" && part.type && part.type !== "text" && part.type !== "output_text");
-          const messageText = allParts
-            .filter((part) => part && typeof part === "object" && (part.type === "text" || part.type === "output_text" || part.type === undefined))
-            .map((part) => String(part?.text ?? ""))
-            .join("\n")
-            .trim();
-          // Accept the upstream's text message as the summary only when there
-          // are no tool calls or other non-text output parts (e.g. function_call,
-          // web_search_call, image_generation_call). Anything those -> fall
-          // through to the chat completions fallback, which sends a clean
-          // summarization prompt without the upstream's tool artifacts.
-          if (messageText && !hasNonTextPart) return messageText;
+        const outputItems = Array.isArray(responsesData?.output) ? responsesData.output : [];
+        for (const item of outputItems) {
+          if (!item || typeof item !== "object") continue;
+          if (item.type === "compaction") {
+            const firstContent = Array.isArray(item.content) ? item.content[0] : null;
+            const extracted = firstContent?.text || item.text || "";
+            const text = String(extracted).trim();
+            if (text) return text;
+          } else if (item.type === "message") {
+            const allParts = Array.isArray(item.content) ? item.content : [];
+            const hasNonTextPart = allParts.some((part) => part && typeof part === "object" && part.type && part.type !== "text" && part.type !== "output_text");
+            const messageText = allParts
+              .filter((part) => part && typeof part === "object" && (part.type === "text" || part.type === "output_text" || part.type === undefined))
+              .map((part) => String(part?.text ?? ""))
+              .join("\n")
+              .trim();
+            if (messageText && !hasNonTextPart) return messageText;
+          } else if (item.type === "reasoning" && Array.isArray(item.summary)) {
+            const summaryPart = item.summary.find((s) => s && typeof s.text === "string" && s.text.trim());
+            if (summaryPart && summaryPart.text.trim()) return summaryPart.text.trim();
+          }
         }
         recordCompactionFailureIfUnset(target, "invalid_response");
       } else {

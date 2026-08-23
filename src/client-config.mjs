@@ -10,7 +10,8 @@ import {
 } from "./grok-config.mjs";
 import {
   encodedClaudeGatewayModelId,
-  encodedVsllmClaudeGatewayModelId
+  encodedVsllmClaudeGatewayModelId,
+  providerSlugForTarget
 } from "./provider-policy.mjs";
 import {
   accountConfigPath,
@@ -27,7 +28,9 @@ import {
 
 export function createClientConfigService({ providerProxy, accountService }) {
   const providerProxyBaseUrl = providerProxy.baseUrl;
+  const providerProxyAccountBaseUrl = providerProxy.accountBaseUrl;
   const ensureProviderProxyRunning = providerProxy.ensureRunning;
+  const activeApiProxyTarget = accountService.activeApiProxyTarget;
   const activeRegistryAccountFromRegistry = accountService.activeRegistryAccountFromRegistry;
   const reconcileRegistryActiveAccount = accountService.reconcileRegistryActiveAccount;
   const apiKeyProxyConfig = accountService.apiKeyProxyConfig;
@@ -158,10 +161,52 @@ export function createClientConfigService({ providerProxy, accountService }) {
   }
 
   function configureGrokBuildClient(codexHome, options = {}) {
+    const active = activeRegistryAccount(codexHome);
+    if (!active || active.auth_mode !== "apikey") {
+      return {
+        configured: false,
+        changed: false,
+        reason: active ? "active_account_is_not_api_key" : "no_active_account",
+        account: active
+      };
+    }
+
+    const target = activeApiProxyTarget(codexHome);
+    if (target?.error) {
+      return {
+        configured: false,
+        changed: false,
+        reason: "active_account_is_unavailable",
+        error: target.error,
+        account: active
+      };
+    }
+
+    const provider = providerSlugForTarget(target, active);
+    if (provider !== "vsllm") {
+      return {
+        configured: false,
+        changed: false,
+        reason: "active_account_is_not_vsllm",
+        provider,
+        account: active
+      };
+    }
+
+    const pinnedBaseUrl = providerProxyAccountBaseUrl(codexHome, active);
+    if (!pinnedBaseUrl) {
+      return {
+        configured: false,
+        changed: false,
+        reason: "active_account_cannot_be_pinned",
+        provider,
+        account: active
+      };
+    }
+
     const configPath = grokConfigPath(options.grokHome);
     const existingText = readTextFile(configPath);
-    const baseUrl = providerProxyBaseUrl(codexHome);
-    const nextText = upsertGrokVsllmProxyConfig(existingText, baseUrl);
+    const nextText = upsertGrokVsllmProxyConfig(existingText, pinnedBaseUrl);
     const changed = nextText !== existingText;
     if (changed) {
       ensureDir(path.dirname(configPath));
@@ -171,8 +216,10 @@ export function createClientConfigService({ providerProxy, accountService }) {
     return {
       configured: true,
       changed,
+      account: active,
+      provider,
       configPath,
-      baseUrl: grokProxyBaseUrl(baseUrl),
+      baseUrl: grokProxyBaseUrl(pinnedBaseUrl),
       models: grokVsllmManagedModels.map(({ pickerId, upstreamModel, name }) => ({
         pickerId,
         upstreamModel,
@@ -321,8 +368,12 @@ export function createClientConfigService({ providerProxy, accountService }) {
 
     if (target === "all" || target === "grok") {
       const result = configureGrokBuildClient(codexHome, { backup: true, grokHome: defaultGrokHome() });
-      process.stdout.write(`Grok Build: ${result.changed ? "configured" : "already configured"} at ${result.baseUrl}.\n`);
-      process.stdout.write(`Grok Build: ${result.models.map(({ pickerId }) => pickerId).join(", ")}.\n`);
+      if (result.configured) {
+        process.stdout.write(`Grok Build: ${result.changed ? "configured" : "already configured"} for ${accountLabel(result.account)} at ${result.baseUrl}.\n`);
+        process.stdout.write(`Grok Build: ${result.models.map(({ pickerId }) => pickerId).join(", ")}.\n`);
+      } else {
+        process.stdout.write(`Grok Build: skipped (${result.reason.replaceAll("_", " ")}).\n`);
+      }
     }
     return true;
   }

@@ -80,6 +80,11 @@ fs.writeFileSync(path.join(accountsDir, `${accountKey}.config.toml`), [
   'requires_openai_auth = true',
   ""
 ].join("\n"), { mode: 0o600 });
+fs.writeFileSync(path.join(accountsDir, `${accountKey}.auth.json`), JSON.stringify({
+  auth_mode: "apikey",
+  OPENAI_API_KEY: "vsllm-install-secret",
+  account_key: accountKey
+}, null, 2), { mode: 0o600 });
 fs.writeFileSync(path.join(accountsDir, "registry.json"), JSON.stringify({
   active_account_key: accountKey,
   accounts: [{
@@ -180,6 +185,7 @@ function backupCount(filePath) {
 
 const expectedGroupId = Buffer.from(path.resolve(codexHome), "utf8").toString("base64url");
 const expectedBaseUrl = `http://127.0.0.1:${proxyPort}/_codex-auth-advanced/${expectedGroupId}`;
+const expectedGrokBaseUrl = `${expectedBaseUrl}/accounts/${encodeURIComponent(accountKey)}/v1`;
 const expectedModelCatalogPath = path.join(codexHome, "model-catalogs", "codex-auth-advanced.json");
 const gatewayRequests = [];
 const gatewayProxy = http.createServer((req, res) => {
@@ -321,7 +327,7 @@ for (const expected of [
   "[cli]",
   'installer = "internal"',
   "[model_providers.vsllm]",
-  `base_url = "${expectedBaseUrl}/v1"`,
+  `base_url = "${expectedGrokBaseUrl}"`,
   'api_backend = "responses"',
   "[model.vsllm-grok-45]",
   'model = "grok-4.5"',
