@@ -355,6 +355,14 @@ function compactionCompletionsUrl(target) {
   return compactionShapeUrl(target, "chat_completions");
 }
 
+export function compactionResponsesUrl(target) {
+  const base = String(target?.upstreamBaseUrl || target?.url || "").replace(/\/+$/, "");
+  if (!base) return "";
+  if (base.endsWith("/v1")) return `${base}/responses`;
+  if (base.includes("/v1/")) return `${base.split("/v1/")[0]}/v1/responses`;
+  return `${base}/v1/responses`;
+}
+
 // Derive the per-shape URL on the same upstream for a compact fallback call.
 // VSLLM exposes the same model on every wire shape, so we just rewrite the
 // path. Antigravity uses Google's Gemini :generateContent envelope and is
@@ -694,13 +702,16 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   resetCompactionFailure(target);
   const startTime = Date.now();
   const completionsUrl = compactionCompletionsUrl(target);
-  const preferResponsesFirst = target?.account?.api_template === "llmapi";
+  const preferResponsesFirst = target?.account?.api_template === "llmapi"
+    || target?.wireApi === "responses"
+    || /llmapi/i.test(String(target?.upstreamBaseUrl || target?.url || ""));
   if (!completionsUrl && !preferResponsesFirst) {
     recordCompactionFailure(target, "configuration");
     console.error(`[Proxy Local Compaction] Cannot derive an upstream summarization endpoint from ${target?.url}`);
     return null;
   }
-  const targetDesc = preferResponsesFirst ? `${target?.upstreamBaseUrl || target?.url}/responses` : completionsUrl;
+  const responsesEndpointUrl = compactionResponsesUrl(target);
+  const targetDesc = preferResponsesFirst ? responsesEndpointUrl : completionsUrl;
   console.log(`[Proxy Local Compaction] Starting provider summarization on ${targetDesc}...`);
 
   const decoded = decodeProxyJsonBody(body, headers, { alreadyDecoded });
@@ -824,8 +835,8 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   let summaryText = "";
 
   async function trySummarizeViaResponses() {
-    if (!target.upstreamBaseUrl) return "";
-    const responsesUrl = `${target.upstreamBaseUrl.replace(/\/+$/, "")}/responses`;
+    const responsesUrl = compactionResponsesUrl(target);
+    if (!responsesUrl) return "";
     try {
       console.log(`[Proxy Local Compaction] Attempting summarization on ${responsesUrl} with model ${fallbackModel}...`);
       const responsesRes = await fetch(responsesUrl, {
@@ -902,7 +913,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         method: "POST",
         headers: buildJsonRequestHeaders(authHeaders),
         body: JSON.stringify(currentCompletionBody),
-        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(120000) : undefined
+        signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(30000) : undefined
       });
 
       if (res.status === 200) {
