@@ -137,7 +137,7 @@ Client configuration is separate from request routing. [`src/client-config.mjs`]
 | `src/provider-proxy-upgrade.mjs` | WebSocket upgrades and tunnels. |
 | `src/proxy-body-transforms.mjs` | JSON decoding, model/body rewrites, remote-compaction detection, encrypted-content tags. |
 | `src/proxy-compaction.mjs` | Compact detection, transcript extraction, provider summarization, retries, compact envelopes. |
-| `src/proxy-sse-transforms.mjs` | Responses stream normalization, fallback model injection, stream diagnostics. |
+| `src/proxy-sse-transforms.mjs` | Responses stream normalization, fallback model injection, stream diagnostics, and safe pre-output capacity detection. |
 | `src/endpoint-chain.mjs` | Ordered per-source shape attempts, pruned by account/model capabilities. |
 | `src/shape-translator.mjs` | Universal cross-shape request, response, bridge, and SSE dispatch. |
 | `src/shape-probe.mjs` | Minimal live probes for per-model endpoint support. |
@@ -315,7 +315,7 @@ VSLLM/New API may route identical model requests to channels with inconsistent v
 Provider errors are classified in `provider-policy.mjs` before mutation or failover.
 
 - A transient VSLLM usage-limit response is retried once on the same account while provider state says quota remains available.
-- Model-capacity responses are retried three times with 1s/2s/4s backoff by default.
+- Model-capacity responses are retried three times with bounded exponential backoff (1s/2s/4s base delays plus small jitter) by default. A valid `Retry-After` response header is honored up to one minute. This includes HTTP 503 errors and HTTP-200 SSE streams that immediately terminate with `server_overloaded` before producing output.
 - A classified per-key restriction can try another usable account for the current request without persisting an exhausted state.
 - Hard quota/subscription exhaustion is persisted and can switch the active account when auto-switching or the force rule permits it.
 - Generic 5xx errors do not automatically mark an account exhausted.
@@ -326,6 +326,8 @@ VSLLM is treated as a New API deployment. The authoritative fixed-window state c
 ## 11. Streaming and Stall Protection
 
 Normal Responses streams are passed or translated as SSE. The proxy sends headers promptly, records completion diagnostics, and watches raw upstream bytes. The default stream-stall watchdog is 90 seconds and can be changed with `CODEX_AUTH_ADVANCED_STREAM_STALL_WATCHDOG_MS`; `0` disables it.
+
+Some New API-compatible providers accept a Responses request with HTTP 200 and then emit `event: error` / `response.failed` carrying `server_overloaded`. Before forwarding an API-key provider stream, the proxy inspects a short clone of its SSE prelude. A capacity failure detected before any text, reasoning, or tool-call output is retried on the exact same account, URL, model, reasoning effort, headers, and body. Once meaningful output begins, the original stream is forwarded unchanged and is never replayed. The inspection window defaults to three seconds, is bounded by `CODEX_AUTH_ADVANCED_MODEL_CAPACITY_STREAM_PROBE_MS`, and can be disabled with `0`.
 
 If a stream sends no bytes within the watchdog, the proxy writes a terminal SSE error and closes the stalled upstream instead of leaving the client blocked indefinitely. A pre-header stall becomes a transient 524 so the endpoint chain can try the next compatible shape. Do not make locally generated heartbeats reset the upstream liveness timer—only real upstream bytes prove the provider is alive.
 

@@ -643,7 +643,9 @@ For VSLLM, the proxy distinguishes hard exhaustion from transient responses:
 
 - `You've hit your usage limit. Try again later.` and equivalent HTTP 429 responses are retried once on the same account while subscription quota remains available.
 - The Chinese temporary subscription-unavailable response is treated the same way when provider subscription data says the account remains usable.
-- HTTP 503 responses with `error.code = "server_is_overloaded"` or `"slow_down"` are retried three times on the same account with 1s, 2s, and 4s backoff.
+- HTTP 503 responses with `error.code = "server_is_overloaded"` or `"slow_down"` are retried three times on the same account with bounded 1s, 2s, and 4s base backoff plus small jitter; a valid `Retry-After` header is honored (up to one minute).
+- HTTP-200 SSE streams that terminate with `server_overloaded` before producing text, reasoning, or tool-call output receive the same bounded retry. The proxy never replays a stream after meaningful output begins.
+- The early-stream inspection window defaults to three seconds. Set `CODEX_AUTH_ADVANCED_MODEL_CAPACITY_STREAM_PROBE_MS=0` to disable it or provide another non-negative millisecond value.
 - After the same-account retry, a normal non-pinned route can try another usable account when auto-switching is enabled.
 - Model-capacity responses do not mark an account exhausted; unrelated HTTP 503 responses are not repeatedly sent to the same account.
 - A direct no-active-subscription rejection is treated as authoritative hard exhaustion and can trigger immediate failover on the default route.

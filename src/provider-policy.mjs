@@ -237,9 +237,34 @@ function responseBodySearchText(body, { includeParams = false } = {}) {
   if (typeof body === "string") return body;
   const code = typeof body?.code === "string" ? body.code : "";
   const message = typeof body?.message === "string" ? body.message : "";
+  const type = typeof body?.type === "string" ? body.type : "";
+  const codexErrorInfo = typeof body?.codex_error_info === "string" ? body.codex_error_info : "";
   const errorCode = typeof body?.error?.code === "string" ? body.error.code : "";
   const errorMessage = typeof body?.error?.message === "string" ? body.error.message : "";
-  const parts = [code, message, errorCode, errorMessage];
+  const errorType = typeof body?.error?.type === "string" ? body.error.type : "";
+  const errorCodexInfo = typeof body?.error?.codex_error_info === "string" ? body.error.codex_error_info : "";
+  const responseErrorCode = typeof body?.response?.error?.code === "string" ? body.response.error.code : "";
+  const responseErrorMessage = typeof body?.response?.error?.message === "string" ? body.response.error.message : "";
+  const responseErrorType = typeof body?.response?.error?.type === "string" ? body.response.error.type : "";
+  const responseCodexInfo = typeof body?.response?.codex_error_info === "string" ? body.response.codex_error_info : "";
+  const responseErrorCodexInfo = typeof body?.response?.error?.codex_error_info === "string"
+    ? body.response.error.codex_error_info
+    : "";
+  const parts = [
+    code,
+    message,
+    type,
+    codexErrorInfo,
+    errorCode,
+    errorMessage,
+    errorType,
+    errorCodexInfo,
+    responseErrorCode,
+    responseErrorMessage,
+    responseErrorType,
+    responseCodexInfo,
+    responseErrorCodexInfo
+  ];
   if (includeParams) {
     if (typeof body?.param === "string") parts.push(body.param);
     if (typeof body?.error?.param === "string") parts.push(body.error.param);
@@ -287,8 +312,16 @@ function isVsllmApiKeyRestrictionBody(body) {
 function isModelCapacityBody(body) {
   return responseBodyMatches(
     body,
-    /server[_ -]?is[_ -]?overloaded|slow[_ -]?down|selected model is at capacity|model.{0,40}at capacity/i
+    /server[_ -]?(?:is[_ -]?)?overloaded|slow[_ -]?down|selected model is at capacity|try a different model|model.{0,80}at capacity/i
   );
+}
+
+// Providers may report model capacity either as an HTTP 503 or inside a
+// successful Responses/Chat SSE stream. Keep the classifier shared so both
+// paths recognize the same transient condition without treating unrelated
+// 503 responses as retryable capacity failures.
+export function isModelCapacityResponseBody(body) {
+  return isModelCapacityBody(body);
 }
 
 function isInvalidApiKeyBody(body) {

@@ -44,6 +44,11 @@ const modelCapacityRetryBaseDelayMs = Number.isFinite(configuredModelCapacityRet
   && configuredModelCapacityRetryBaseDelayMs >= 0
   ? configuredModelCapacityRetryBaseDelayMs
   : 1000;
+const configuredModelCapacityStreamProbeMs = Number(process.env.CODEX_AUTH_ADVANCED_MODEL_CAPACITY_STREAM_PROBE_MS);
+const modelCapacityStreamProbeMs = Number.isFinite(configuredModelCapacityStreamProbeMs)
+  && configuredModelCapacityStreamProbeMs >= 0
+  ? configuredModelCapacityStreamProbeMs
+  : 3000;
 // Fail fast when a provider accepts an SSE request then goes silent (observed
 // with VSLLM gpt-5.6-sol on large contexts: no bytes, no PINGs, client hangs
 // until its own 5-minute SSE idle timeout). 90s is comfortably above the
@@ -68,6 +73,7 @@ const providerProxy = createProviderProxy({
   vsllmTransientUsageLimitRetryDelayMs,
   modelCapacityMaxRetries,
   modelCapacityRetryBaseDelayMs,
+  modelCapacityStreamProbeMs,
   streamStallWatchdogMs,
   officialAnthropicBaseUrl
 });

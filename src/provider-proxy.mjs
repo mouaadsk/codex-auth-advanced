@@ -29,7 +29,8 @@ import {
 } from "./provider-policy.mjs";
 import {
   createSseResponseTransformStream,
-  createStreamDiagnostics
+  createStreamDiagnostics,
+  inspectSsePreludeForModelCapacity
 } from "./proxy-sse-transforms.mjs";
 import { isResponsesProxyTarget } from "./proxy-sse-transforms.mjs";
 import { rewriteProviderProxyRequestBody } from "./proxy-body-transforms.mjs";
@@ -94,6 +95,41 @@ import { ensureDir, userHome } from "./storage.mjs";
 
 const providerProxyScriptPath = fileURLToPath(new URL("../bin/codex-auth-advanced.js", import.meta.url));
 const upstreamHeaderStallErrorCode = "CODEX_AUTH_ADVANCED_UPSTREAM_HEADER_STALL";
+const maxModelCapacityRetryDelayMs = 60_000;
+
+function retryAfterDelayMs(response) {
+  const raw = response?.headers?.get?.("retry-after");
+  if (raw == null) return null;
+  const value = String(raw).trim();
+  if (!value) return null;
+
+  // RFC 7231 permits either a delay in seconds or an HTTP date. Keep a
+  // provider-supplied delay bounded so a malformed/hostile gateway header
+  // cannot hold a Codex request indefinitely.
+  let delay = null;
+  if (/^\d+(?:\.\d+)?$/.test(value)) {
+    delay = Number(value) * 1000;
+  } else {
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) delay = timestamp - Date.now();
+  }
+  if (!Number.isFinite(delay)) return null;
+  return Math.max(0, Math.min(maxModelCapacityRetryDelayMs, Math.ceil(delay)));
+}
+
+export function modelCapacityRetryDelay(response, retryNumber, baseDelayMs) {
+  const providerDelay = retryAfterDelayMs(response);
+  if (providerDelay != null) return providerDelay;
+
+  const exponential = Math.max(0, Number(baseDelayMs) || 0) * (2 ** Math.max(0, retryNumber));
+  const bounded = Math.min(maxModelCapacityRetryDelayMs, exponential);
+  if (bounded <= 0) return 0;
+
+  // Add a small positive jitter to avoid several clients retrying the same
+  // overloaded channel in lockstep. The cap keeps the delay predictable.
+  const jitterMax = Math.min(1000, Math.max(1, Math.ceil(bounded * 0.25)));
+  return Math.min(maxModelCapacityRetryDelayMs, bounded + Math.floor(Math.random() * (jitterMax + 1)));
+}
 
 export function createProviderProxy(options) {
   const providerProxyHost = options.host;
@@ -108,6 +144,7 @@ export function createProviderProxy(options) {
   const vsllmTransientUsageLimitRetryDelayMs = options.vsllmTransientUsageLimitRetryDelayMs;
   const modelCapacityMaxRetries = options.modelCapacityMaxRetries;
   const modelCapacityRetryBaseDelayMs = options.modelCapacityRetryBaseDelayMs;
+  const modelCapacityStreamProbeMs = Math.max(0, Number(options.modelCapacityStreamProbeMs) || 0);
   // Watchdog for silent origins (e.g. VSLLM models that accept a request then
   // stream nothing — not even PING keep-alives). If an SSE stream produces no
   // upstream bytes for this long, we terminate it with an SSE error event so
@@ -518,6 +555,10 @@ export function createProviderProxy(options) {
       const transientUsageLimitRetries = new Map();
       const modelCapacityRetries = new Map();
       const reasoningLevelRetries = new Map();
+      const modelCapacityRetryKey = (currentTarget) => [
+        currentTarget.account?.account_key || currentTarget.account?.alias || currentTarget.url,
+        currentTarget.url
+      ].join("\u0000");
       let bodyAlreadyDecoded = false;
       let triedPlaintextCompactRepair = false;
       let claudeResponsesBridge = null;
@@ -662,6 +703,7 @@ export function createProviderProxy(options) {
       }
 
       while (true) {
+        let streamTransientRetryReason = null;
         if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
         const targetLabel = target.officialAnthropic
           ? "official Anthropic OAuth"
@@ -721,6 +763,42 @@ export function createProviderProxy(options) {
         if ((target.chatgpt || target.officialAnthropic) && !fetchFailed) {
           captureChatgptCloudflareCookies(upstream.headers);
           break;
+        }
+
+        if (!fetchFailed && requestIsStreaming && modelCapacityStreamProbeMs > 0) {
+          const inspected = await inspectSsePreludeForModelCapacity(upstream, {
+            // Never let the capacity prelude outlive the existing silent-stream
+            // watchdog. Otherwise a provider that sends headers and then goes
+            // completely quiet would be delayed by two independent timers.
+            timeoutMs: streamStallWatchdogMs > 0
+              ? Math.min(modelCapacityStreamProbeMs, streamStallWatchdogMs)
+              : modelCapacityStreamProbeMs
+          });
+          upstream = inspected.response;
+          if (inspected.modelCapacity) {
+            const retryKey = modelCapacityRetryKey(target);
+            const retries = modelCapacityRetries.get(retryKey) || 0;
+            if (retries < modelCapacityMaxRetries) {
+              modelCapacityRetries.set(retryKey, retries + 1);
+              const delayMs = modelCapacityRetryDelay(upstream, retries, modelCapacityRetryBaseDelayMs);
+              const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+              console.warn(
+                `[Proxy Stream] ${label} reported model capacity before output; retrying the exact same request in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).`
+              );
+              try { await upstream.body?.cancel(); } catch {}
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+              continue;
+            }
+            const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+            console.warn(
+              `[Proxy Stream] ${label} still reported model capacity after ${modelCapacityMaxRetries} retries; forwarding the terminal stream error without replaying partial output.`
+            );
+            // Keep the normal transient-failure path below active. It may try
+            // another usable account for a default route, while pinned routes
+            // remain on this exact stream and simply forward the terminal
+            // provider event after the bounded same-account budget.
+            streamTransientRetryReason = "model_capacity";
+          }
         }
 
         if (isCompactProxyTarget(target) && (fetchFailed
@@ -791,10 +869,17 @@ export function createProviderProxy(options) {
           reason: exhaustionReason,
           transientRetryReason
         } = await exhaustedApiResponse(upstream, target.account);
+        const effectiveResponseBody = streamTransientRetryReason ? {
+          error: {
+            code: "server_overloaded",
+            message: "Selected model is at capacity. Please try a different model."
+          }
+        } : responseBody;
+        const effectiveTransientRetryReason = streamTransientRetryReason || transientRetryReason;
         const requestedReasoningEffort = retryableVsllmReasoningEffort(target, body);
         if (upstream.status === 400
           && requestedReasoningEffort
-          && isUnsupportedVsllmReasoningLevelResponse(responseBody, requestedReasoningEffort)) {
+          && isUnsupportedVsllmReasoningLevelResponse(effectiveResponseBody, requestedReasoningEffort)) {
           const retryKey = [
             target.account?.account_key || target.account?.alias || target.url,
             target.url,
@@ -812,7 +897,7 @@ export function createProviderProxy(options) {
             continue;
           }
         }
-        if (transientRetryReason === "vsllm_usage_limit") {
+        if (effectiveTransientRetryReason === "vsllm_usage_limit") {
           const accountKey = target.account?.account_key || target.url;
           const retries = transientUsageLimitRetries.get(accountKey) || 0;
           if (retries < vsllmTransientUsageLimitMaxRetries) {
@@ -823,20 +908,21 @@ export function createProviderProxy(options) {
             continue;
           }
         }
-        if (transientRetryReason === "model_capacity") {
-          const accountKey = target.account?.account_key || target.url;
-          const retries = modelCapacityRetries.get(accountKey) || 0;
+        if (effectiveTransientRetryReason === "model_capacity") {
+          const retryKey = modelCapacityRetryKey(target);
+          const retries = modelCapacityRetries.get(retryKey) || 0;
           if (retries < modelCapacityMaxRetries) {
-            modelCapacityRetries.set(accountKey, retries + 1);
-            const delayMs = modelCapacityRetryBaseDelayMs * (2 ** retries);
+            modelCapacityRetries.set(retryKey, retries + 1);
+            const delayMs = modelCapacityRetryDelay(upstream, retries, modelCapacityRetryBaseDelayMs);
             const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
             console.warn(`[Proxy] ${label} reported model capacity; retrying the same account in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).`);
+            try { await upstream.body?.cancel(); } catch {}
             await new Promise((resolve) => setTimeout(resolve, delayMs));
             continue;
           }
         }
         if (route.accountSelector && exhausted) {
-          markApiAccountExhaustedFromProxy(route.codexHome, target.account, upstream.status, responseBody);
+          markApiAccountExhaustedFromProxy(route.codexHome, target.account, upstream.status, effectiveResponseBody);
         }
         // Per-account wire-shape chain walker: try other supported shapes on
         // the SAME account when the current shape failed with a shape-fallback
@@ -846,7 +932,7 @@ export function createProviderProxy(options) {
         let shapeCursor = shapesForAccount.indexOf(target.responseFromShape || planner.sourceShape);
         if (shapeCursor < 0) shapeCursor = shapesForAccount.indexOf(sourceShape);
         if (shapeCursor < 0) shapeCursor = -1;
-        const isShapeFallback = planner.shouldFailOverToNextShape({ status: upstream?.status, body: responseBody });
+        const isShapeFallback = planner.shouldFailOverToNextShape({ status: upstream?.status, body: effectiveResponseBody });
         if (!route.accountSelector && isShapeFallback && shapeCursor + 1 < shapesForAccount.length) {
           const nextShape = shapesForAccount[shapeCursor + 1];
           if (nextShape) {
@@ -908,13 +994,13 @@ export function createProviderProxy(options) {
         // active account. Bounded transient retries (model_capacity / vsllm
         // usage limit) on the SAME account falling through the shape chain
         // also need a transient-only failover to keep the request alive.
-        const transientExhausted = (transientRetryReason === "model_capacity" || transientRetryReason === "vsllm_usage_limit");
+        const transientExhausted = (effectiveTransientRetryReason === "model_capacity" || effectiveTransientRetryReason === "vsllm_usage_limit");
         const shouldFailOverAccount = !route.accountSelector
           && (exhausted || transientRetryReason === "api_key_restriction" || transientExhausted);
         if (!shouldFailOverAccount) break;
         let switched = false;
         if (exhausted) {
-          switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, responseBody, {
+          switched = await switchFromExhaustedApiAccount(route.codexHome, target.account, upstream.status, effectiveResponseBody, {
             excludeAccountKeys: attemptedAccountKeys,
             force: exhaustionReason === "no_active_subscription" || exhaustionReason === "quota_exhausted" || exhaustionReason === "provider_limit"
           });

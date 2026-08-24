@@ -88,6 +88,41 @@ function responsesBridgeSseBody(model) {
   ];
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
+function responsesCapacitySseBody({ afterOutput = false } = {}) {
+  const events = [
+    { type: "response.created", response: { id: "resp_capacity", object: "response", status: "in_progress" } }
+  ];
+  if (afterOutput) {
+    events.push({
+      type: "response.output_text.delta",
+      response: { id: "resp_capacity", object: "response" },
+      delta: "partial output that must never be replayed"
+    });
+  }
+  events.push(
+    {
+      type: "error",
+      error: {
+        type: "service_unavailable",
+        message: "Selected model is at capacity. Please try a different model.",
+        codex_error_info: "server_overloaded"
+      }
+    },
+    {
+      type: "response.failed",
+      response: {
+        id: "resp_capacity",
+        object: "response",
+        status: "failed",
+        error: {
+          code: "server_overloaded",
+          message: "Selected model is at capacity. Please try a different model."
+        }
+      }
+    }
+  );
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
 const usageTotalsByBearer = new Map([
   ["Bearer vsllm-secret", 28.097534],
   ["Bearer vsllm-2-secret", 96.242272]
@@ -411,6 +446,11 @@ const upstream = http.createServer(async (req, res) => {
       }));
       return;
     }
+    if (responseFailure === "stream_model_capacity" || responseFailure === "stream_model_capacity_after_output") {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.end(responsesCapacitySseBody({ afterOutput: responseFailure.endsWith("after_output") }));
+      return;
+    }
     if (responseFailure === "generic_service_unavailable") {
       res.writeHead(503, { "content-type": "application/json" });
       res.end(JSON.stringify({
@@ -488,6 +528,13 @@ const upstream = http.createServer(async (req, res) => {
           usage: { input_tokens: 9, output_tokens: 1 }
         }));
       }
+      return;
+    }
+    if (req.url.endsWith("/responses")
+      && parsedBody?.capacity_test === "stream_recovery"
+      && parsedBody?.stream === true) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(responsesBridgeSseBody(parsedBody.model || "gpt-5.6-sol"));
       return;
     }
     res.writeHead(200, { "content-type": "application/json" });
@@ -632,6 +679,12 @@ async function proxyRequest(port, suffix, body) {
     throw new Error(`proxy returned ${response.status}: ${await response.text()}`);
   }
   return response.json();
+}
+
+async function proxyStreamingResponse(port, suffix, body) {
+  const response = await proxyRawRequest(port, suffix, body);
+  const text = await response.text();
+  return { response, text };
 }
 
 function parseSseDataEvents(bodyText) {
@@ -874,6 +927,7 @@ const proxy = spawn(process.execPath, [wrapper, "proxy", "serve"], {
     CODEX_AUTH_ADVANCED_CHATGPT_BASE_URL: upstreamBaseUrl,
     CODEX_AUTH_ADVANCED_ANTHROPIC_BASE_URL: `${upstreamBaseUrl}${officialAnthropicPathPrefix}`,
     CODEX_AUTH_ADVANCED_MODEL_CAPACITY_RETRY_BASE_MS: "5",
+    CODEX_AUTH_ADVANCED_MODEL_CAPACITY_STREAM_PROBE_MS: "100",
     CODEX_AUTH_ADVANCED_STREAM_STALL_WATCHDOG_MS: "400",
     CODEX_AUTH_ADVANCED_DISABLE_SHAPE_PROBE: "1"
   },
@@ -1933,6 +1987,65 @@ try {
   const persistentCapacityAccount = persistentCapacityRegistry.accounts.find((account) => account.account_key === "apikey-vsllm");
   if (persistentCapacityAccount?.api_spend?.exhausted === true) {
     throw new Error(`persistent model capacity should not mark the account exhausted, got ${JSON.stringify(persistentCapacityAccount)}`);
+  }
+
+  // New API/VSLLM can return HTTP 200 and report capacity only inside the
+  // Responses SSE stream. Retry that terminal pre-output failure before any
+  // bytes reach Codex, preserving the exact account, URL, model, and body.
+  setActive("apikey-vsllm", false);
+  const streamCapacityBody = {
+    ...body,
+    model: "gpt-5.6-sol",
+    stream: true,
+    capacity_test: "stream_recovery"
+  };
+  responseFailures.push("stream_model_capacity");
+  const beforeStreamCapacityRecovery = upstreamRequests.length;
+  const streamCapacityRecovery = await proxyStreamingResponse(proxyPort, "/responses", streamCapacityBody);
+  if (streamCapacityRecovery.response.status !== 200
+    || !streamCapacityRecovery.response.headers.get("content-type")?.includes("text/event-stream")
+    || !streamCapacityRecovery.text.includes('"type":"response.completed"')) {
+    throw new Error(`expected pre-output SSE capacity to recover with a successful stream, got status=${streamCapacityRecovery.response.status}, content-type=${streamCapacityRecovery.response.headers.get("content-type")}, body=${streamCapacityRecovery.text}`);
+  }
+  const streamCapacityRecoveryRequests = upstreamRequests.slice(beforeStreamCapacityRecovery);
+  if (streamCapacityRecoveryRequests.length !== 2) {
+    throw new Error(`expected one SSE capacity retry followed by success, got ${streamCapacityRecoveryRequests.length} upstream requests`);
+  }
+  const firstStreamCapacityBody = streamCapacityRecoveryRequests[0].bodyText;
+  for (const [index, request] of streamCapacityRecoveryRequests.entries()) {
+    if (request.authorization !== "Bearer vsllm-secret"
+      || !request.url.endsWith("/responses")
+      || request.bodyText !== firstStreamCapacityBody) {
+      throw new Error(`SSE capacity retry must preserve account, endpoint, and body at attempt ${index + 1}: ${JSON.stringify(streamCapacityRecoveryRequests)}`);
+    }
+  }
+
+  // Once text/reasoning/tool output has begun, replaying could duplicate
+  // visible output or execute a tool twice. Pass that terminal stream through.
+  responseFailures.push("stream_model_capacity_after_output");
+  const beforeStreamCapacityAfterOutput = upstreamRequests.length;
+  const streamCapacityAfterOutput = await proxyStreamingResponse(proxyPort, "/responses", streamCapacityBody);
+  if (streamCapacityAfterOutput.response.status !== 200
+    || !streamCapacityAfterOutput.text.includes("partial output that must never be replayed")
+    || !streamCapacityAfterOutput.text.includes("server_overloaded")) {
+    throw new Error(`expected post-output capacity stream to pass through unchanged, got status=${streamCapacityAfterOutput.response.status}, body=${streamCapacityAfterOutput.text}`);
+  }
+  if (upstreamRequests.length !== beforeStreamCapacityAfterOutput + 1) {
+    throw new Error(`post-output SSE capacity must not retry after output started, got ${upstreamRequests.length - beforeStreamCapacityAfterOutput} upstream requests`);
+  }
+
+  // Repeated pre-output overloads remain bounded at the configured retry
+  // budget; the terminal provider stream is returned instead of looping.
+  responseFailures.push("stream_model_capacity", "stream_model_capacity", "stream_model_capacity", "stream_model_capacity");
+  const beforeStreamCapacityExhaustion = upstreamRequests.length;
+  const streamCapacityExhaustion = await proxyStreamingResponse(proxyPort, "/responses", streamCapacityBody);
+  const streamCapacityExhaustionRequests = upstreamRequests.slice(beforeStreamCapacityExhaustion);
+  if (streamCapacityExhaustionRequests.length !== 4
+    || !streamCapacityExhaustion.text.includes("server_overloaded")) {
+    throw new Error(`expected bounded SSE capacity retries to return the fourth terminal stream, got attempts=${streamCapacityExhaustionRequests.length}, body=${streamCapacityExhaustion.text}`);
+  }
+  if (streamCapacityExhaustionRequests.some((request) => request.authorization !== "Bearer vsllm-secret" || request.bodyText !== firstStreamCapacityBody)) {
+    throw new Error(`bounded SSE capacity retries must remain on the same account and body, got ${JSON.stringify(streamCapacityExhaustionRequests)}`);
   }
 
   setActive("apikey-vsllm", true);

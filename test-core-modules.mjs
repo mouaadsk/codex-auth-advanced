@@ -41,6 +41,7 @@ import {
   apiProviderTransientRetryReason,
   encodedClaudeGatewayModelId,
   encodedVsllmClaudeGatewayModelId,
+  isModelCapacityResponseBody,
   isVsllmApiAccount,
   isVsllmClaudeGatewayModelId,
   parseProviderUsageDetails,
@@ -62,7 +63,7 @@ import {
   encodeRemoteCompactionV2Summary,
   rewriteProviderProxyRequestBody
 } from "./src/proxy-body-transforms.mjs";
-import { createProviderProxy } from "./src/provider-proxy.mjs";
+import { createProviderProxy, modelCapacityRetryDelay } from "./src/provider-proxy.mjs";
 import { createAccountService } from "./src/account-service.mjs";
 import {
   grokProxyBaseUrl,
@@ -240,6 +241,49 @@ try {
   assert.equal(
     apiProviderTransientRetryReason(503, { error: { code: "server_is_overloaded" } }, vsllmAccount),
     "model_capacity"
+  );
+  assert.equal(
+    modelCapacityRetryDelay(new Response(null, { headers: { "retry-after": "2" } }), 0, 1000),
+    2000,
+    "model-capacity retry should honor Retry-After seconds"
+  );
+  assert.equal(
+    modelCapacityRetryDelay(new Response(null, { headers: { "retry-after": "120" } }), 0, 1000),
+    60000,
+    "provider Retry-After delays must remain bounded"
+  );
+  const jitteredCapacityDelay = modelCapacityRetryDelay(new Response(null), 1, 1000);
+  assert.ok(
+    jitteredCapacityDelay >= 2000 && jitteredCapacityDelay <= 2500,
+    `expected bounded jitter on exponential model-capacity retry, got ${jitteredCapacityDelay}`
+  );
+  assert.equal(
+    isModelCapacityResponseBody({
+      type: "error",
+      error: {
+        message: "Selected model is at capacity. Please try a different model.",
+        codex_error_info: "server_overloaded"
+      }
+    }),
+    true
+  );
+  assert.equal(
+    isModelCapacityResponseBody({
+      type: "response.failed",
+      response: {
+        status: "failed",
+        error: { code: "server_overloaded", message: "Please try a different model." }
+      }
+    }),
+    true
+  );
+  assert.equal(
+    isModelCapacityResponseBody({
+      type: "response.output_text.delta",
+      delta: "I am analyzing the string server_overloaded from the user's report."
+    }),
+    false,
+    "ordinary model output that mentions the error must not be classified as capacity"
   );
   assert.equal(
     apiProviderTransientRetryReason(403, { error: { message: "IP access denied by API-Key restriction" } }, vsllmAccount),
@@ -644,7 +688,8 @@ try {
     vsllmTransientUsageLimitMaxRetries: 1,
     vsllmTransientUsageLimitRetryDelayMs: 0,
     modelCapacityMaxRetries: 3,
-    modelCapacityRetryBaseDelayMs: 0
+    modelCapacityRetryBaseDelayMs: 0,
+    modelCapacityStreamProbeMs: 0
   });
   const groupId = Buffer.from(path.resolve(tempRoot), "utf8").toString("base64url");
   assert.equal(proxy.groupId(tempRoot), groupId);
