@@ -32,16 +32,63 @@ const compactionFailurePriorities = {
 // upstream channels. Some channels validate reasoning_effort against a
 // narrower capability list and return HTTP 400 for a high-end level such as
 // `max`, `xhigh`, or `ultra`, while another channel behind the same VSLLM
-// account accepts it. The request is a local, non-streaming summarization
-// call, so a small bounded retry is safe and does not change the requested
-// effort or silently downgrade quality.
-const vsllmReasoningLevelMaxRetries = 2;
-const vsllmReasoningLevelRetryDelayMs = 150;
+// account accepts it. A small bounded retry is safe because it preserves the
+// request and lets the provider select another channel without silently
+// downgrading quality.
+export const vsllmReasoningLevelMaxRetries = 2;
+export const vsllmReasoningLevelRetryDelayMs = 150;
 const vsllmReasoningRetryEfforts = new Set(["max", "xhigh", "ultra"]);
 
-function reasoningEffortFromRequestBody(body) {
-  if (!body || typeof body !== "object") return "";
-  const effort = body.reasoning_effort ?? body.reasoning?.effort;
+// Provider-compatible compaction is a one-shot, non-streaming summary request,
+// so retrying the exact payload is safe. Keep the transient budget deliberately
+// small: one retry is enough to let a New API/Cloudflare request land on a
+// healthy channel without turning a provider outage into an unbounded loop.
+export const compactionTransientMaxRetries = 1;
+export const compactionTransientRetryDelayMs = 500;
+
+export function isRetryableCompactionStatus(status) {
+  const numericStatus = Number(status);
+  return numericStatus === 408 || numericStatus === 425
+    || (numericStatus >= 500 && numericStatus <= 599);
+}
+
+export function isRetryableCompactionFetchError(error) {
+  const name = String(error?.name || "").toLowerCase();
+  const code = String(error?.cause?.code || error?.code || "").toUpperCase();
+  const message = String(error?.message || error || "").toLowerCase();
+  if (name.includes("timeout") || name.includes("abort")) return true;
+  if ([
+    "ECONNABORTED",
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "EAI_AGAIN",
+    "EPIPE",
+    "ETIMEDOUT",
+    "ENETUNREACH",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_SOCKET"
+  ].includes(code)) return true;
+  return message.includes("fetch failed")
+    || message.includes("network error")
+    || message.includes("socket")
+    || message.includes("timed out")
+    || message.includes("timeout");
+}
+
+export function reasoningEffortFromRequestBody(body) {
+  let parsed = body;
+  if (Buffer.isBuffer(parsed)) parsed = parsed.toString("utf8");
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return "";
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return "";
+  const effort = parsed.reasoning_effort ?? parsed.reasoning?.effort;
   return typeof effort === "string" ? effort.trim().toLowerCase() : "";
 }
 
@@ -49,13 +96,23 @@ function isVsllmReasoningRetryTarget(target) {
   return providerSlugForTarget(target, target?.account) === "vsllm";
 }
 
+export function retryableVsllmReasoningEffort(target, requestBody) {
+  const requestedEffort = reasoningEffortFromRequestBody(requestBody);
+  return isVsllmReasoningRetryTarget(target)
+    && vsllmReasoningRetryEfforts.has(requestedEffort)
+    ? requestedEffort
+    : "";
+}
+
 export function isUnsupportedVsllmReasoningLevelResponse(text, requestedEffort = "max") {
   const expected = String(requestedEffort || "").trim().toLowerCase();
   if (!expected) return false;
-  const raw = String(text || "");
+  const raw = typeof text === "string" ? text : (() => {
+    try { return JSON.stringify(text ?? ""); } catch { return String(text || ""); }
+  })();
   let source = raw;
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = typeof text === "object" && text !== null ? text : JSON.parse(raw);
     source = String(parsed?.error?.message ?? parsed?.message ?? raw);
   } catch {
     // Some gateways prefix/suffix their JSON error. Match the raw body below.
@@ -65,45 +122,137 @@ export function isUnsupportedVsllmReasoningLevelResponse(text, requestedEffort =
   return /valid\s+levels?\s*:/i.test(source);
 }
 
-export async function fetchCompactionWithVsllmReasoningRetry(url, init, {
+async function discardRetryResponse(response) {
+  try {
+    await response?.body?.cancel();
+  } catch {
+    // The upstream may already have closed the body. There is nothing else to
+    // preserve because this response is being discarded before a retry.
+  }
+}
+
+function fetchAttemptSignal(originalSignal, timeoutMs) {
+  const numericTimeout = Number(timeoutMs);
+  const timeoutSignal = Number.isFinite(numericTimeout)
+    && numericTimeout > 0
+    && typeof AbortSignal !== "undefined"
+    && typeof AbortSignal.timeout === "function"
+    ? AbortSignal.timeout(numericTimeout)
+    : null;
+  if (!originalSignal) return timeoutSignal;
+  if (!timeoutSignal) return originalSignal;
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([originalSignal, timeoutSignal]);
+  }
+  return timeoutSignal;
+}
+
+function compactionFetchFailureDescription(error) {
+  const name = String(error?.name || "").toLowerCase();
+  const message = String(error?.message || error || "").toLowerCase();
+  return name.includes("timeout") || name.includes("abort") || message.includes("timed out") || message.includes("timeout")
+    ? "request timed out"
+    : `request failed before a response (${error?.cause?.code || error?.code || error?.message || error})`;
+}
+
+export async function fetchCompactionWithRetry(url, init, {
   target,
   requestBody,
   timeoutMs,
+  retryTimeoutMs = timeoutMs,
   label = "summarization",
+  maxTransientRetries = compactionTransientMaxRetries,
+  transientDelayMs = compactionTransientRetryDelayMs,
   // Tests can inject a fetcher and zero-delay sleeper. Production callers use
-  // the global fetch and a short delay so New API can select another channel.
+  // the global fetch and short delays so New API can select another channel.
   fetchImpl = globalThis.fetch,
   delayMs = vsllmReasoningLevelRetryDelayMs,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 } = {}) {
-  const requestedEffort = reasoningEffortFromRequestBody(requestBody);
-  const eligible = isVsllmReasoningRetryTarget(target)
-    && vsllmReasoningRetryEfforts.has(requestedEffort);
-  const maxRetries = eligible ? vsllmReasoningLevelMaxRetries : 0;
-  let response = null;
+  const requestedEffort = retryableVsllmReasoningEffort(target, requestBody);
+  const reasoningEligible = Boolean(requestedEffort);
+  const transientRetryLimit = Math.max(0, Number(maxTransientRetries) || 0);
+  let reasoningRetries = 0;
+  let transientRetries = 0;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+  while (true) {
     const attemptInit = { ...init };
-    if (Number.isFinite(Number(timeoutMs))
-      && Number(timeoutMs) > 0
-      && typeof AbortSignal !== "undefined"
-      && typeof AbortSignal.timeout === "function") {
-      attemptInit.signal = AbortSignal.timeout(Number(timeoutMs));
+    const attemptTimeoutMs = transientRetries > 0 ? retryTimeoutMs : timeoutMs;
+    const signal = fetchAttemptSignal(init?.signal, attemptTimeoutMs);
+    if (signal) attemptInit.signal = signal;
+
+    let response = null;
+    try {
+      response = await fetchImpl(url, attemptInit);
+    } catch (error) {
+      if (init?.signal?.aborted
+        || !isRetryableCompactionFetchError(error)
+        || transientRetries >= transientRetryLimit) throw error;
+      transientRetries += 1;
+      console.warn(
+        `[Proxy Local Compaction] ${label} ${compactionFetchFailureDescription(error)}; retrying the same provider endpoint (${transientRetries}/${transientRetryLimit}).`
+      );
+      const retryDelay = Math.max(0, Number(transientDelayMs) || 0) * (2 ** (transientRetries - 1));
+      await sleep(retryDelay);
+      continue;
     }
-    response = await fetchImpl(url, attemptInit);
-    if (!eligible || response.status !== 400 || attempt >= maxRetries) return response;
 
-    const errorText = await response.clone().text().catch(() => "");
-    if (!isUnsupportedVsllmReasoningLevelResponse(errorText, requestedEffort)) return response;
+    // `fetch()` resolves as soon as headers arrive. Force a clone to consume
+    // successful bodies here so a provider that sends headers and then stalls
+    // is retried as a timeout instead of escaping to the caller's JSON/SSE
+    // parser without another attempt. The original response remains readable.
+    if (response.status >= 200 && response.status < 300 && typeof response.clone === "function") {
+      try {
+        await response.clone().arrayBuffer();
+      } catch (error) {
+        await discardRetryResponse(response);
+        if (init?.signal?.aborted
+          || !isRetryableCompactionFetchError(error)
+          || transientRetries >= transientRetryLimit) throw error;
+        transientRetries += 1;
+        console.warn(
+          `[Proxy Local Compaction] ${label} ${compactionFetchFailureDescription(error)} while reading the response; retrying the same provider endpoint (${transientRetries}/${transientRetryLimit}).`
+        );
+        const retryDelay = Math.max(0, Number(transientDelayMs) || 0) * (2 ** (transientRetries - 1));
+        await sleep(retryDelay);
+        continue;
+      }
+    }
 
-    console.warn(
-      `[Proxy Local Compaction] VSLLM rejected reasoning level ${JSON.stringify(requestedEffort)} for ${label}; retrying through the provider channel selector (${attempt + 1}/${maxRetries}).`
-    );
-    await sleep(Math.max(0, Number(delayMs) || 0));
+    if (reasoningEligible
+      && response.status === 400
+      && reasoningRetries < vsllmReasoningLevelMaxRetries) {
+      const errorText = await response.clone().text().catch(() => "");
+      if (isUnsupportedVsllmReasoningLevelResponse(errorText, requestedEffort)) {
+        reasoningRetries += 1;
+        await discardRetryResponse(response);
+        console.warn(
+          `[Proxy Local Compaction] VSLLM rejected reasoning level ${JSON.stringify(requestedEffort)} for ${label}; retrying through the provider channel selector (${reasoningRetries}/${vsllmReasoningLevelMaxRetries}).`
+        );
+        await sleep(Math.max(0, Number(delayMs) || 0));
+        continue;
+      }
+    }
+
+    if (isRetryableCompactionStatus(response.status) && transientRetries < transientRetryLimit) {
+      const failedStatus = response.status;
+      transientRetries += 1;
+      await discardRetryResponse(response);
+      console.warn(
+        `[Proxy Local Compaction] ${label} returned transient HTTP ${failedStatus}; retrying the same provider endpoint (${transientRetries}/${transientRetryLimit}).`
+      );
+      const retryDelay = Math.max(0, Number(transientDelayMs) || 0) * (2 ** (transientRetries - 1));
+      await sleep(retryDelay);
+      continue;
+    }
+
+    return response;
   }
-
-  return response;
 }
+
+// Backward-compatible internal export for callers/tests written before the
+// helper also covered transport failures and transient HTTP responses.
+export const fetchCompactionWithVsllmReasoningRetry = fetchCompactionWithRetry;
 
 function resetCompactionFailure(target) {
   if (target && typeof target === "object") compactionFailures.delete(target);
@@ -735,6 +884,7 @@ export async function summarizeViaShape({ shape, target, body, headers, alreadyD
       target,
       requestBody: summarizeBody,
       timeoutMs: 60000,
+      retryTimeoutMs: 60000,
       label: `${shape} shape`
     });
     const summaryText = await readShapeSummarizeResponse({ shape, res });
@@ -877,6 +1027,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         target,
         requestBody: completionBody,
         timeoutMs: 90000,
+        retryTimeoutMs: 90000,
         label: "chat completions"
       });
       if (res.status !== 200) {
@@ -948,6 +1099,10 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         target,
         requestBody: responsesBody,
         timeoutMs: 120000,
+        // A healthy VSLLM summary in a large context can take ~96 seconds;
+        // keep the retry budget at the same 120-second ceiling instead of
+        // turning a slow-but-valid provider response into a second timeout.
+        retryTimeoutMs: 120000,
         label: "Responses"
       });
 
@@ -1007,6 +1162,7 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         target,
         requestBody: currentCompletionBody,
         timeoutMs: 30000,
+        retryTimeoutMs: 30000,
         label: "chat completions"
       });
 

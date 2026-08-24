@@ -36,7 +36,12 @@ import { rewriteProviderProxyRequestBody } from "./proxy-body-transforms.mjs";
 import {
   isClaudeMessagesCompactionTarget,
   isCompactProxyTarget,
-  repairProviderProxyBodyPlaintext
+  isRetryableCompactionStatus,
+  isUnsupportedVsllmReasoningLevelResponse,
+  repairProviderProxyBodyPlaintext,
+  retryableVsllmReasoningEffort,
+  vsllmReasoningLevelMaxRetries,
+  vsllmReasoningLevelRetryDelayMs
 } from "./proxy-compaction.mjs";
 import {
   describeCompactionFailure,
@@ -512,6 +517,7 @@ export function createProviderProxy(options) {
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
       const modelCapacityRetries = new Map();
+      const reasoningLevelRetries = new Map();
       let bodyAlreadyDecoded = false;
       let triedPlaintextCompactRepair = false;
       let claudeResponsesBridge = null;
@@ -717,7 +723,9 @@ export function createProviderProxy(options) {
           break;
         }
 
-        if (isCompactProxyTarget(target) && (fetchFailed || [502, 503, 504, 524, 404, 405].includes(upstream.status))) {
+        if (isCompactProxyTarget(target) && (fetchFailed
+          || isRetryableCompactionStatus(upstream?.status)
+          || [404, 405, 524].includes(upstream?.status))) {
           console.log(`[Proxy] Compaction failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
           let localCompacted = await runLocalCompactionFallback(
             target,
@@ -783,6 +791,27 @@ export function createProviderProxy(options) {
           reason: exhaustionReason,
           transientRetryReason
         } = await exhaustedApiResponse(upstream, target.account);
+        const requestedReasoningEffort = retryableVsllmReasoningEffort(target, body);
+        if (upstream.status === 400
+          && requestedReasoningEffort
+          && isUnsupportedVsllmReasoningLevelResponse(responseBody, requestedReasoningEffort)) {
+          const retryKey = [
+            target.account?.account_key || target.account?.alias || target.url,
+            target.url,
+            requestedReasoningEffort
+          ].join("\u0000");
+          const retries = reasoningLevelRetries.get(retryKey) || 0;
+          if (retries < vsllmReasoningLevelMaxRetries) {
+            reasoningLevelRetries.set(retryKey, retries + 1);
+            const label = target.account?.alias || target.account?.email || target.account?.account_key || "VSLLM";
+            console.warn(
+              `[Proxy] ${label} rejected reasoning level ${JSON.stringify(requestedReasoningEffort)}; retrying the same account through the provider channel selector (${retries + 1}/${vsllmReasoningLevelMaxRetries}).`
+            );
+            try { await upstream.body?.cancel(); } catch {}
+            await new Promise((resolve) => setTimeout(resolve, vsllmReasoningLevelRetryDelayMs));
+            continue;
+          }
+        }
         if (transientRetryReason === "vsllm_usage_limit") {
           const accountKey = target.account?.account_key || target.url;
           const retries = transientUsageLimitRetries.get(accountKey) || 0;

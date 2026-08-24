@@ -50,6 +50,8 @@ import {
   rollingApiSpendFromTotal
 } from "./src/provider-policy.mjs";
 import {
+  compactionTransientMaxRetries,
+  fetchCompactionWithRetry,
   fetchCompactionWithVsllmReasoningRetry,
   isUnsupportedVsllmReasoningLevelResponse,
   normalizeCompactionResponse,
@@ -396,6 +398,13 @@ try {
   );
   assert.equal(
     isUnsupportedVsllmReasoningLevelResponse(
+      { error: { message: 'level "max" not supported, valid levels: low, medium, high' } },
+      "max"
+    ),
+    true
+  );
+  assert.equal(
+    isUnsupportedVsllmReasoningLevelResponse(
       'level "max" not supported, valid levels: low, medium, high',
       "xhigh"
     ),
@@ -485,6 +494,82 @@ try {
   );
   assert.equal(nonVsllmResponse.status, 400);
   assert.equal(nonVsllmCalls, 1, "non-VSLLM requests must not receive this retry");
+
+  // Provider gateways can return a transient 5xx or abort a slow request
+  // before the same payload succeeds on a healthy channel. Compaction retries
+  // exactly once by default and keeps the request body unchanged.
+  assert.equal(compactionTransientMaxRetries, 1);
+  const transientBodies = [];
+  let transientCalls = 0;
+  const transientResponse = await fetchCompactionWithRetry(
+    retryTarget.url,
+    {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: "summary" })
+    },
+    {
+      target: retryTarget,
+      requestBody: { model: "gpt-5.6-sol", input: "summary" },
+      timeoutMs: 0,
+      transientDelayMs: 0,
+      delayMs: 0,
+      fetchImpl: async (_url, init) => {
+        transientCalls += 1;
+        transientBodies.push(JSON.parse(init.body));
+        if (transientCalls === 1) {
+          return new Response(JSON.stringify({ error: { message: "gateway timeout" } }), { status: 504 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    }
+  );
+  assert.equal(transientResponse.status, 200);
+  assert.equal(transientCalls, 2);
+  assert.deepEqual(transientBodies, [
+    { model: "gpt-5.6-sol", input: "summary" },
+    { model: "gpt-5.6-sol", input: "summary" }
+  ]);
+
+  let timeoutCalls = 0;
+  const timeoutRecovery = await fetchCompactionWithRetry(
+    retryTarget.url,
+    { method: "POST", body: "{}" },
+    {
+      target: retryTarget,
+      requestBody: {},
+      timeoutMs: 0,
+      transientDelayMs: 0,
+      fetchImpl: async () => {
+        timeoutCalls += 1;
+        if (timeoutCalls === 1) {
+          const error = new Error("The operation was aborted due to timeout");
+          error.name = "TimeoutError";
+          throw error;
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    }
+  );
+  assert.equal(timeoutRecovery.status, 200);
+  assert.equal(timeoutCalls, 2);
+
+  let quotaCalls = 0;
+  const quotaResponse = await fetchCompactionWithRetry(
+    retryTarget.url,
+    { method: "POST", body: "{}" },
+    {
+      target: retryTarget,
+      requestBody: {},
+      timeoutMs: 0,
+      transientDelayMs: 0,
+      fetchImpl: async () => {
+        quotaCalls += 1;
+        return new Response(JSON.stringify({ error: { message: "quota reached" } }), { status: 429 });
+      }
+    }
+  );
+  assert.equal(quotaResponse.status, 429);
+  assert.equal(quotaCalls, 1, "quota responses must not be mistaken for transient server failures");
 
   const repairRequest = {
     model: "gpt-5.5",

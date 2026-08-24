@@ -20,10 +20,12 @@ fs.writeFileSync(path.join(fakeBinDir, "launchctl"), "#!/bin/sh\nexit 1\n", { mo
 const upstreamRequests = [];
 const compactFailures = [];
 const responseFailures = [];
+const chatReasoningLevelFailures = [];
 const claudeCompactionFailures = [];
 const claudeMessageFailures = [];
 const reasoningLevelFailures = [];
 const responsesSummarizationFailures = [];
+const transientSummarizationFailures = [];
 let headerStallConnectionCloseCount = 0;
 // When true, the upstream /v1/responses handler returns a type:"message" output
 // for any request whose input contains a compaction_trigger. Used to assert the
@@ -110,6 +112,19 @@ const upstream = http.createServer(async (req, res) => {
   });
   const isProviderSummarizationRequest = (req.url.endsWith("/chat/completions") || req.url.endsWith("/responses"))
     && bodyText.includes("Here is the conversation history to summarize:");
+  if (isProviderSummarizationRequest && transientSummarizationFailures.length > 0) {
+    const failure = transientSummarizationFailures.shift();
+    if (failure === "timeout") {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "temporary summarization timeout", code: "gateway_timeout" } }));
+      return;
+    }
+    if (failure === "unavailable") {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "temporary summarization outage", code: "service_unavailable" } }));
+      return;
+    }
+  }
   if (isProviderSummarizationRequest && req.url.endsWith("/responses") && responsesSummarizationFailures.length > 0) {
     const failure = responsesSummarizationFailures.shift();
     if (failure === "unsupported") {
@@ -325,6 +340,18 @@ const upstream = http.createServer(async (req, res) => {
       ]
     }));
   } else if (req.url.endsWith("/chat/completions")) {
+    if (chatReasoningLevelFailures.length > 0) {
+      chatReasoningLevelFailures.shift();
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: 'level "max" not supported, valid levels: low, medium, high',
+          type: "invalid_request_error",
+          code: null
+        }
+      }));
+      return;
+    }
     if (claudeCompactionFailures[0] === "unreachable") {
       claudeCompactionFailures.shift();
       res.writeHead(503, { "content-type": "application/json" });
@@ -390,6 +417,17 @@ const upstream = http.createServer(async (req, res) => {
         error: {
           message: "Scheduled maintenance.",
           code: "service_unavailable"
+        }
+      }));
+      return;
+    }
+    if (responseFailure === "unsupported_reasoning_max") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: 'level "max" not supported, valid levels: low, medium, high',
+          type: "invalid_request_error",
+          code: null
         }
       }));
       return;
@@ -966,6 +1004,52 @@ try {
     expectedReasoningEffort: "xhigh"
   });
 
+  // New API may route a normal Codex turn to a channel whose reasoning-level
+  // validator rejects `max`, even though the next channel accepts the exact
+  // same request. Keep the session alive by retrying inside the proxy before
+  // the HTTP 400 reaches Codex.
+  responseFailures.push("unsupported_reasoning_max", "unsupported_reasoning_max");
+  const beforeNormalReasoningRetry = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", {
+    ...body,
+    stream: true,
+    reasoning: { effort: "max", summary: "auto" }
+  });
+  const normalReasoningRetryRequests = upstreamRequests.slice(beforeNormalReasoningRetry);
+  if (normalReasoningRetryRequests.length !== 3
+    || normalReasoningRetryRequests.some((request) => request.authorization !== "Bearer vsllm-secret" || !request.url.endsWith("/responses"))) {
+    throw new Error(`normal max-effort request should retry twice on the same VSLLM account, got ${JSON.stringify(normalReasoningRetryRequests)}`);
+  }
+  for (const request of normalReasoningRetryRequests) {
+    const requestBody = JSON.parse(request.bodyText);
+    if (requestBody.reasoning?.effort !== "max") {
+      throw new Error(`normal reasoning retries must preserve reasoning.effort=max, got ${request.bodyText}`);
+    }
+  }
+
+  chatReasoningLevelFailures.push("max", "max");
+  const beforeChatReasoningRetry = upstreamRequests.length;
+  const chatReasoningRetry = await proxyRequest(proxyPort, "/chat/completions", {
+    model: "gpt-5.6-sol",
+    messages: [{ role: "user", content: "Reply exactly OK." }],
+    stream: false,
+    reasoning_effort: "max"
+  });
+  if (chatReasoningRetry?.choices?.[0]?.message?.content !== "compacted message text") {
+    throw new Error(`normal chat-completions reasoning retry should return the provider response, got ${JSON.stringify(chatReasoningRetry)}`);
+  }
+  const chatReasoningRetryRequests = upstreamRequests.slice(beforeChatReasoningRetry);
+  if (chatReasoningRetryRequests.length !== 3
+    || chatReasoningRetryRequests.some((request) => request.authorization !== "Bearer vsllm-secret" || !request.url.endsWith("/chat/completions"))) {
+    throw new Error(`normal chat-completions max-effort request should retry twice on the same VSLLM account, got ${JSON.stringify(chatReasoningRetryRequests)}`);
+  }
+  for (const request of chatReasoningRetryRequests) {
+    const requestBody = JSON.parse(request.bodyText);
+    if (requestBody.reasoning_effort !== "max") {
+      throw new Error(`normal chat-completions retries must preserve reasoning_effort=max, got ${request.bodyText}`);
+    }
+  }
+
   const remoteCompactionV2Body = {
     model: "gpt-5.6-sol",
     stream: true,
@@ -1087,6 +1171,25 @@ try {
     }
   }
 
+  // A transient gateway timeout during provider-compatible compaction should
+  // be absorbed by the proxy. Retry the identical Responses summarization on
+  // the same selected account before considering the Chat Completions shape.
+  transientSummarizationFailures.push("timeout");
+  const beforeTransientCompaction = upstreamRequests.length;
+  const transientCompaction = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
+  const transientCompactionText = await transientCompaction.text();
+  if (transientCompaction.status !== 200) {
+    throw new Error(`transient summarization timeout should recover inside the proxy, got ${transientCompaction.status}:\n${transientCompactionText}`);
+  }
+  const transientCompactionRequests = upstreamRequests.slice(beforeTransientCompaction);
+  if (transientCompactionRequests.length !== 2
+    || transientCompactionRequests.some((request) => !request.url.endsWith("/responses") || request.authorization !== "Bearer vsllm-secret")) {
+    throw new Error(`transient compaction should retry Responses once on the same account, got ${JSON.stringify(transientCompactionRequests)}`);
+  }
+  if (transientCompactionRequests[0].bodyText !== transientCompactionRequests[1].bodyText) {
+    throw new Error(`transient compaction retry must preserve the exact summarization payload, got ${JSON.stringify(transientCompactionRequests)}`);
+  }
+
   // A completed explicit switch must select the same credentials for both a
   // normal chat request and the provider-compatible compaction request.
   writeRootAuth("apikey-vsllm");
@@ -1180,7 +1283,7 @@ try {
   summarizationFailureMode = null;
   const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
   if (remoteCompactionDummy.status !== 502
-    || upstreamRequests.length < beforeRemoteCompactionDummy + 1
+    || upstreamRequests.length !== beforeRemoteCompactionDummy + 4
     || !remoteCompactionDummyText.includes("provider summarization service was unavailable (HTTP 503)")
     || !remoteCompactionDummyText.includes("compaction was not applied")) {
     throw new Error(`remote compaction v2 failure should return a non-lossy error, got ${remoteCompactionDummy.status}:\n${remoteCompactionDummyText}`);
@@ -1194,12 +1297,18 @@ try {
     ["invalid_response", "provider response contained no usable summary"]
   ];
   for (const [mode, expected] of diagnosticCases) {
+    const beforeDiagnostic = upstreamRequests.length;
     summarizationFailureMode = mode;
     const failed = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
     const failedText = await failed.text();
     summarizationFailureMode = null;
     if (failed.status !== 502 || !failedText.includes(expected) || !failedText.includes("compaction was not applied")) {
       throw new Error(`remote compaction ${mode} diagnostic was not specific enough, got ${failed.status}:\n${failedText}`);
+    }
+    const diagnosticRequestCount = upstreamRequests.length - beforeDiagnostic;
+    const expectedRequestCount = mode === "timeout" ? 4 : 2;
+    if (diagnosticRequestCount !== expectedRequestCount) {
+      throw new Error(`remote compaction ${mode} used ${diagnosticRequestCount} upstream requests; expected ${expectedRequestCount}`);
     }
   }
 
