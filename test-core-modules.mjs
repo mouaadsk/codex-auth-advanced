@@ -56,7 +56,8 @@ import {
   fetchCompactionWithVsllmReasoningRetry,
   isUnsupportedVsllmReasoningLevelResponse,
   normalizeCompactionResponse,
-  repairProviderProxyBodyPlaintext
+  repairProviderProxyBodyPlaintext,
+  vsllmReasoningLevelMaxRetries
 } from "./src/proxy-compaction.mjs";
 import {
   decodeRemoteCompactionV2Summary,
@@ -371,13 +372,18 @@ try {
   assert.match(grokConfigured, /\[model_providers\.vsllm\]/);
   assert.match(grokConfigured, /base_url = "http:\/\/127\.0\.0\.1:47778\/_codex-auth-advanced\/test-group\/v1"/);
   assert.doesNotMatch(grokConfigured, /api_backend = "responses"/);
-  assert.equal(grokConfigured.match(/api_backend = "chat_completions"/g)?.length, 2);
+  assert.equal(grokConfigured.match(/api_backend = "chat_completions"/g)?.length, 3);
   assert.match(grokConfigured, /\[model\.vsllm-grok-45\]/);
   assert.match(grokConfigured, /model = "grok-4.5"/);
   assert.match(grokConfigured, /name = "VSLLM Grok 4.5 \(Chat Completions\)"/);
   assert.match(grokConfigured, /\[model\.vsllm-grok-46\]/);
   assert.match(grokConfigured, /model = "grok-4.6"/);
   assert.match(grokConfigured, /name = "VSLLM Grok 4.6 \(Chat Completions\)"/);
+  assert.match(grokConfigured, /\[model\.vsllm-ox-alpha\]/);
+  assert.match(grokConfigured, /model = "stealth\/ox-alpha"/);
+  assert.match(grokConfigured, /name = "VSLLM Ox Alpha \(Chat Completions, Free\)"/);
+  assert.match(grokConfigured, /context_window = 1048576/);
+  assert.match(grokConfigured, /max_completion_tokens = 131072/);
   assert.match(grokConfigured, /\[cli\]/);
   assert.match(grokConfigured, /supports_reasoning_effort = true/);
   assert.match(grokConfigured, /\[\[model\.vsllm-grok-46\.reasoning_efforts\]\]/);
@@ -386,6 +392,7 @@ try {
   const grokReconfigured = upsertGrokVsllmProxyConfig(grokConfigured, `${grokProxyRoot}-updated`);
   assert.match(grokReconfigured, /test-group-updated\/v1"/);
   assert.equal(grokReconfigured.match(/\[model\.vsllm-grok-45\]/g)?.length, 1);
+  assert.equal(grokReconfigured.match(/\[model\.vsllm-ox-alpha\]/g)?.length, 1);
 
   const rolling = rollingApiSpendFromTotal({
     api_spend_window: {
@@ -512,7 +519,7 @@ try {
     }
   );
   assert.equal(cappedResponse.status, 400);
-  assert.equal(cappedRetryCalls, 3, "reasoning retry must remain bounded");
+  assert.equal(cappedRetryCalls, 1 + vsllmReasoningLevelMaxRetries, "reasoning retry must remain bounded");
 
   let nonVsllmCalls = 0;
   const nonVsllmResponse = await fetchCompactionWithVsllmReasoningRetry(
@@ -1009,14 +1016,15 @@ try {
   assert.equal(grokConfiguredClient.provider, "vsllm");
   const expectedGrokBaseUrl = `${proxy.baseUrl(serviceHome)}/accounts/${activeAccount.account_key}/v1`;
   assert.equal(grokConfiguredClient.baseUrl, expectedGrokBaseUrl);
-  assert.equal(grokConfiguredClient.models.length, 2);
+  assert.equal(grokConfiguredClient.models.length, 3);
   assert.ok(grokConfiguredClient.models.every(({ apiBackend }) => apiBackend === "chat_completions"));
   const grokConfig = readTextFile(path.join(grokHome, "config.toml"));
   assert.ok(grokConfig.includes(`base_url = ${JSON.stringify(expectedGrokBaseUrl)}`));
-  assert.equal(grokConfig.match(/api_backend = "chat_completions"/g)?.length, 2);
+  assert.equal(grokConfig.match(/api_backend = "chat_completions"/g)?.length, 3);
   assert.doesNotMatch(grokConfig, /api_backend = "responses"/);
   assert.match(grokConfig, /model = "grok-4.5"/);
   assert.match(grokConfig, /model = "grok-4.6"/);
+  assert.match(grokConfig, /model = "stealth\/ox-alpha"/);
 
   const grokLlmapiAccount = {
     account_key: "apikey-llmapi",

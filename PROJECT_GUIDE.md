@@ -268,7 +268,7 @@ Native Anthropic-compatible VSLLM models use `/v1/messages`. Models exposed thro
 
 ### Grok Build
 
-`configure grok` requires the currently active account to be VSLLM and writes a pinned route for that exact account. Managed picker entries are `vsllm-grok-45` and `vsllm-grok-46`; each explicitly declares `api_backend = "chat_completions"`, so Grok Build appends `/v1/chat/completions` to the shared `/v1` base URL. Re-run configuration to deliberately pin another VSLLM account.
+`configure grok` requires the currently active account to be VSLLM and writes a pinned route for that exact account. Managed picker entries are `vsllm-grok-45`, `vsllm-grok-46`, and `vsllm-ox-alpha` (upstream `stealth/ox-alpha`); each explicitly declares `api_backend = "chat_completions"`, so Grok Build appends `/v1/chat/completions` to the shared `/v1` base URL. Re-run configuration to deliberately pin another VSLLM account.
 
 ## 9. Compaction Contract
 
@@ -308,7 +308,7 @@ Do not apply this generic policy to normal streaming turns. A replay after parti
 
 ### VSLLM reasoning-level retry policy
 
-VSLLM/New API may route identical model requests to channels with inconsistent validators. If the exact error says that the requested `max`, `xhigh`, or `ultra` level is unsupported and lists valid levels, the proxy retries the unchanged request up to two times. This narrow rule applies to normal Responses/Chat requests and compaction summaries. It does not translate the effort and does not catch unrelated HTTP 400 responses.
+VSLLM/New API may route identical model requests to channels with inconsistent validators. If the exact error says that the requested `max`, `xhigh`, or `ultra` level is unsupported and lists valid levels, the proxy retries the unchanged request up to five times. This narrow rule applies to normal Responses/Chat requests and compaction summaries. It does not translate the effort and does not catch unrelated HTTP 400 responses.
 
 ## 10. Provider and Account Failure Policy
 
@@ -457,7 +457,7 @@ This is usually a VSLLM/New API channel inconsistency, not proof that the public
 
 ### Grok Build reports a missing `model` field
 
-Confirm the selected Grok picker entry is the managed `vsllm-grok-45` or `vsllm-grok-46`, not an official model entry. Confirm `~/.grok/config.toml` has the pinned VSLLM `/v1` base and per-model `api_backend = "chat_completions"`, then gracefully restart the proxy if code—not just configuration—changed.
+Confirm the selected Grok picker entry is a managed entry (`vsllm-grok-45`, `vsllm-grok-46`, or `vsllm-ox-alpha`), not an official model entry. Confirm `~/.grok/config.toml` has the pinned VSLLM `/v1` base and per-model `api_backend = "chat_completions"`, then gracefully restart the proxy if code—not just configuration—changed.
 
 ### Account list and switch disagree
 

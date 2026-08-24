@@ -300,7 +300,7 @@ For normal operations, prefer the lifecycle scripts described in [Operations](#o
 | `configure [all]` | Configure Codex, Claude Code, and Grok Build; `all` is the default when omitted. |
 | `configure codex` | Point Codex at the default proxy route for its active API-key account. |
 | `configure claude` | Merge the Claude Code gateway settings and independent VSLLM model discovery into `~/.claude/settings.json`. |
-| `configure grok` | Merge VSLLM Grok 4.5/4.6 Chat Completions routes into `~/.grok/config.toml`. |
+| `configure grok` | Merge VSLLM Grok 4.5, Grok 4.6, and Ox Alpha Chat Completions routes into `~/.grok/config.toml`. |
 
 ## Account Storage
 
@@ -485,13 +485,18 @@ api_backend = "chat_completions"
 model_provider = "vsllm"
 model = "grok-4.6"
 api_backend = "chat_completions"
+
+[model.vsllm-ox-alpha]
+model_provider = "vsllm"
+model = "stealth/ox-alpha"
+api_backend = "chat_completions"
 ```
 
 Grok Build is pinned to the VSLLM account that is active when `configure grok` runs. Later default-group switches and automatic failover therefore cannot send Grok requests to LLMAPI or another provider. Run `configure grok` again to deliberately pin a newly active VSLLM account; if the active account is not VSLLM, the command leaves the existing Grok configuration unchanged.
 
-Grok Build documents Chat Completions as its default custom-model backend while also supporting Responses and Anthropic Messages. The managed VSLLM Grok entries select `chat_completions` explicitly on each model, so Grok Build sends `/v1/chat/completions` directly instead of relying on a proxy-side Responses translation or a provider-wide backend setting. The shared `base_url` deliberately remains at the `/v1` root because Grok Build appends the endpoint selected by each model's `api_backend`. The managed picker IDs are `vsllm-grok-45` and `vsllm-grok-46` because TOML section names cannot contain dots such as `4.5`; their display names include `(Chat Completions)` so the endpoint is visible in the picker. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models.
+Grok Build documents Chat Completions as its default custom-model backend while also supporting Responses and Anthropic Messages. The managed VSLLM entries select `chat_completions` explicitly on each model, so Grok Build sends `/v1/chat/completions` directly instead of relying on a proxy-side Responses translation or a provider-wide backend setting. The shared `base_url` deliberately remains at the `/v1` root because Grok Build appends the endpoint selected by each model's `api_backend`. The managed picker IDs are `vsllm-grok-45`, `vsllm-grok-46`, and `vsllm-ox-alpha`; their display names include `(Chat Completions)` so the endpoint is visible in the picker. Each managed model also declares a `reasoning_efforts` menu (`low`/`medium`/`high`, plus `xhigh` on Grok 4.6) so `/effort` and the session config picker work like native Grok models. Ox Alpha is sent upstream as `stealth/ox-alpha` and is labeled free to reflect the zero-cost VSLLM catalog entry.
 
-Use `/model vsllm-grok-46` or `grok -m vsllm-grok-46` after configuration. The marker `api_key` is not sent upstream; the local proxy replaces it with the stored VSLLM account key.
+Use `/model vsllm-ox-alpha` (or `grok -m vsllm-ox-alpha`) to try Ox Alpha after configuration. The marker `api_key` is not sent upstream; the local proxy replaces it with the stored VSLLM account key.
 
 ## VSLLM Integration
 
@@ -518,7 +523,7 @@ Claude model routing is separate from the Codex table:
 | `VSLLM: grok-4.5` | VSLLM `grok-4.5` | VSLLM `/v1/responses` through the Claude bridge |
 | `VSLLM: grok-4.6` | VSLLM `grok-4.6` | VSLLM `/v1/responses` through the Claude bridge |
 
-The request's `reasoning.effort` or `reasoning_effort` value is preserved. Codex local compaction follows the same endpoint priority as normal Codex traffic: it tries `/v1/responses` first, then `/v1/chat/completions` only when Responses fails or returns no usable summary. The same effort is forwarded in the shape each endpoint expects (`reasoning.effort` for Responses and `reasoning_effort` for Chat Completions). Chat Completions does not automatically mean `xhigh`, and the proxy does not translate `max` to `xhigh`: VSLLM/New API channels can advertise different supported effort sets. If a VSLLM channel returns the exact unsupported-level validation error for `max`, `xhigh`, or `ultra`, the proxy retries the unchanged request up to two times so New API can select another channel. This applies to both normal Codex turns and provider-compatible compaction; unrelated HTTP 400 responses are not retried by this rule.
+The request's `reasoning.effort` or `reasoning_effort` value is preserved. Codex local compaction follows the same endpoint priority as normal Codex traffic: it tries `/v1/responses` first, then `/v1/chat/completions` only when Responses fails or returns no usable summary. The same effort is forwarded in the shape each endpoint expects (`reasoning.effort` for Responses and `reasoning_effort` for Chat Completions). Chat Completions does not automatically mean `xhigh`, and the proxy does not translate `max` to `xhigh`: VSLLM/New API channels can advertise different supported effort sets. If a VSLLM channel returns the exact unsupported-level validation error for `max`, `xhigh`, or `ultra`, the proxy retries the unchanged request up to five times so New API can select another channel. This applies to both normal Codex turns and provider-compatible compaction; unrelated HTTP 400 responses are not retried by this rule.
 
 ### Compact Requests
 

@@ -11,6 +11,8 @@ export const grokVsllmManagedModels = Object.freeze([
     upstreamModel: "grok-4.5",
     name: "VSLLM Grok 4.5 (Chat Completions)",
     apiBackend: "chat_completions",
+    contextWindow: 1_000_000,
+    maxCompletionTokens: 65_536,
     reasoningEfforts: ["low", "medium", "high"],
     defaultReasoningEffort: "high"
   },
@@ -19,7 +21,19 @@ export const grokVsllmManagedModels = Object.freeze([
     upstreamModel: "grok-4.6",
     name: "VSLLM Grok 4.6 (Chat Completions)",
     apiBackend: "chat_completions",
+    contextWindow: 1_000_000,
+    maxCompletionTokens: 65_536,
     reasoningEfforts: ["low", "medium", "high", "xhigh"],
+    defaultReasoningEffort: "high"
+  },
+  {
+    pickerId: "vsllm-ox-alpha",
+    upstreamModel: "stealth/ox-alpha",
+    name: "VSLLM Ox Alpha (Chat Completions, Free)",
+    apiBackend: "chat_completions",
+    contextWindow: 1_048_576,
+    maxCompletionTokens: 131_072,
+    reasoningEfforts: ["low", "medium", "high"],
     defaultReasoningEffort: "high"
   }
 ]);
@@ -35,6 +49,7 @@ function grokReasoningEffortLabel(effort) {
 }
 
 function appendGrokReasoningEffortToml(lines, model) {
+  if (!Array.isArray(model.reasoningEfforts) || model.reasoningEfforts.length === 0) return;
   lines.push("supports_reasoning_effort = true");
   lines.push(`reasoning_effort = ${JSON.stringify(model.defaultReasoningEffort)}`);
   for (const effort of model.reasoningEfforts) {
@@ -84,8 +99,8 @@ export function managedGrokConfigSections(baseUrl) {
       `name = ${JSON.stringify(model.name)}`,
       `description = ${JSON.stringify(`${model.upstreamModel} through codex-auth-advanced proxy using Chat Completions`)}`,
       `api_backend = ${JSON.stringify(model.apiBackend)}`,
-      "context_window = 1000000",
-      "max_completion_tokens = 65536",
+      `context_window = ${model.contextWindow}`,
+      `max_completion_tokens = ${model.maxCompletionTokens}`,
       ""
     );
     appendGrokReasoningEffortToml(lines, model);

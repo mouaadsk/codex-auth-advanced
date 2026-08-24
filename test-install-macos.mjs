@@ -334,6 +334,11 @@ for (const expected of [
   "[model.vsllm-grok-46]",
   'model = "grok-4.6"',
   'name = "VSLLM Grok 4.6 (Chat Completions)"',
+  "[model.vsllm-ox-alpha]",
+  'model = "stealth/ox-alpha"',
+  'name = "VSLLM Ox Alpha (Chat Completions, Free)"',
+  "context_window = 1048576",
+  "max_completion_tokens = 131072",
   "supports_reasoning_effort = true",
   'reasoning_effort = "high"',
   "[[model.vsllm-grok-46.reasoning_efforts]]",
@@ -342,7 +347,7 @@ for (const expected of [
   if (!grokConfig.includes(expected)) throw new Error(`Grok config is missing ${expected}:\n${grokConfig}`);
 }
 if (grokConfig.includes('api_backend = "responses"')
-  || grokConfig.match(/api_backend = "chat_completions"/g)?.length !== 2) {
+  || grokConfig.match(/api_backend = "chat_completions"/g)?.length !== 3) {
   throw new Error(`Grok models should explicitly select Chat Completions independently:\n${grokConfig}`);
 }
 

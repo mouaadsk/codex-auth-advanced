@@ -35,7 +35,7 @@ const compactionFailurePriorities = {
 // account accepts it. A small bounded retry is safe because it preserves the
 // request and lets the provider select another channel without silently
 // downgrading quality.
-export const vsllmReasoningLevelMaxRetries = 2;
+export const vsllmReasoningLevelMaxRetries = 5;
 export const vsllmReasoningLevelRetryDelayMs = 150;
 const vsllmReasoningRetryEfforts = new Set(["max", "xhigh", "ultra"]);
 
