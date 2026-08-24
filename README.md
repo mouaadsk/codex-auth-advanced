@@ -7,6 +7,8 @@
 
 This repository is maintained as a local macOS checkout. It is not currently published as a general npm release.
 
+Maintainers and coding agents should read [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md) before changing runtime behavior. It documents architecture, state invariants, routing and retry rules, test coverage, safe proxy operations, and the definition of done.
+
 ## Contents
 
 - [Capabilities](#capabilities)
