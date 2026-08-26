@@ -548,8 +548,9 @@ try {
 
   // Provider gateways can return a transient 5xx or abort a slow request
   // before the same payload succeeds on a healthy channel. Compaction retries
-  // exactly once by default and keeps the request body unchanged.
-  assert.equal(compactionTransientMaxRetries, 1);
+  // up to twice by default (three total attempts) and keeps the request body
+  // unchanged across retries.
+  assert.equal(compactionTransientMaxRetries, 2);
   const transientBodies = [];
   let transientCalls = 0;
   const transientResponse = await fetchCompactionWithRetry(

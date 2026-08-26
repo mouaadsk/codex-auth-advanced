@@ -40,11 +40,15 @@ export const vsllmReasoningLevelRetryDelayMs = 150;
 const vsllmReasoningRetryEfforts = new Set(["max", "xhigh", "ultra"]);
 
 // Provider-compatible compaction is a one-shot, non-streaming summary request,
-// so retrying the exact payload is safe. Keep the transient budget deliberately
-// small: one retry is enough to let a New API/Cloudflare request land on a
-// healthy channel without turning a provider outage into an unbounded loop.
-export const compactionTransientMaxRetries = 1;
-export const compactionTransientRetryDelayMs = 500;
+// so retrying the exact payload is safe. VSLLM (New API / Cloudflare) regularly
+// returns a transient 524/504 on the first attempt of a large-context summary
+// and then succeeds on the next channel. One retry was not enough: the session
+// surfaces the failure to Codex as a 502 and auto-compaction stalls until the
+// user manually runs /compact. Bump to two retries (three total attempts) so
+// one bad Cloudflare edge does not abort the whole compaction cycle. The retry
+// budget stays bounded so a true provider outage still fails fast.
+export const compactionTransientMaxRetries = 2;
+export const compactionTransientRetryDelayMs = 750;
 
 export function isRetryableCompactionStatus(status) {
   const numericStatus = Number(status);
