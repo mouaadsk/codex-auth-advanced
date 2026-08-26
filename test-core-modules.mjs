@@ -51,9 +51,11 @@ import {
   rollingApiSpendFromTotal
 } from "./src/provider-policy.mjs";
 import {
+  compactionChannelProbeMaxRetries,
   compactionTransientMaxRetries,
   fetchCompactionWithRetry,
   fetchCompactionWithVsllmReasoningRetry,
+  isVsllmChannelPreFlight429Body,
   isUnsupportedVsllmReasoningLevelResponse,
   normalizeCompactionResponse,
   repairProviderProxyBodyPlaintext,
@@ -581,6 +583,92 @@ try {
     { model: "gpt-5.6-sol", input: "summary" },
     { model: "gpt-5.6-sol", input: "summary" }
   ]);
+
+  assert.equal(isVsllmChannelPreFlight429Body(`{"error":{"message":"pre-flight probe to upstream returned 429"}}`), true);
+  assert.equal(isVsllmChannelPreFlight429Body(`{"error":{"message":"quota reached"}}`), false);
+  assert.equal(isVsllmChannelPreFlight429Body(""), false);
+  assert.equal(compactionChannelProbeMaxRetries, 3);
+
+  // A pre-flight 429 must succeed on a later attempt and consume the channel-
+  // probe retry budget (no watchdog wait, no delay).
+  let probeCalls = 0;
+  const probeStart = Date.now();
+  const probeResponse = await fetchCompactionWithRetry(
+    retryTarget.url,
+    { method: "POST", body: "{}" },
+    {
+      target: retryTarget,
+      requestBody: {},
+      timeoutMs: 0,
+      transientDelayMs: 0,
+      channelProbeDelayMs: 0,
+      delayMs: 0,
+      fetchImpl: async () => {
+        probeCalls += 1;
+        if (probeCalls <= 2) {
+          return new Response(
+            JSON.stringify({ error: { message: "pre-flight probe to upstream returned 429" } }),
+            { status: 429 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+    }
+  );
+  assert.equal(probeResponse.status, 200);
+  assert.equal(probeCalls, 3, "two pre-flight 429s then a success");
+  assert.ok(Date.now() - probeStart < 500, "pre-flight 429 retries must not wait on the watchdog");
+
+  // When the pre-flight 429 keeps coming back past the channel-probe budget,
+  // the helper returns the final 429 response so the caller can classify it
+  // as channel_exhausted (not generic quota).
+  let alwaysProbeCalls = 0;
+  const exhausted = await fetchCompactionWithRetry(
+    retryTarget.url,
+    { method: "POST", body: "{}" },
+    {
+      target: retryTarget,
+      requestBody: {},
+      timeoutMs: 0,
+      transientDelayMs: 0,
+      channelProbeDelayMs: 0,
+      delayMs: 0,
+      fetchImpl: async () => {
+        alwaysProbeCalls += 1;
+        return new Response(
+          JSON.stringify({ error: { message: "pre-flight probe to upstream returned 429" } }),
+          { status: 429 }
+        );
+      }
+    }
+  );
+  assert.equal(exhausted.status, 429);
+  assert.equal(alwaysProbeCalls, 1 + compactionChannelProbeMaxRetries,
+    "1 initial + maxChannelProbeRetries retries");
+
+  // A real quota message must not trigger the channel-probe branch.
+  let realQuotaCalls = 0;
+  const realQuotaResponse = await fetchCompactionWithRetry(
+    retryTarget.url,
+    { method: "POST", body: "{}" },
+    {
+      target: retryTarget,
+      requestBody: {},
+      timeoutMs: 0,
+      transientDelayMs: 0,
+      channelProbeDelayMs: 0,
+      delayMs: 0,
+      fetchImpl: async () => {
+        realQuotaCalls += 1;
+        return new Response(
+          JSON.stringify({ error: { message: "quota reached" } }),
+          { status: 429 }
+        );
+      }
+    }
+  );
+  assert.equal(realQuotaResponse.status, 429);
+  assert.equal(realQuotaCalls, 1, "real quota responses must not be retried as channel probes");
 
   let timeoutCalls = 0;
   const timeoutRecovery = await fetchCompactionWithRetry(

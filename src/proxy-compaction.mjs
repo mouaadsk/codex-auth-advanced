@@ -20,6 +20,7 @@ const compactionFailurePriorities = {
   configuration: 115,
   access: 100,
   quota: 100,
+  channel_exhausted: 95,
   timeout: 90,
   network: 85,
   upstream_unavailable: 80,
@@ -50,10 +51,35 @@ const vsllmReasoningRetryEfforts = new Set(["max", "xhigh", "ultra"]);
 export const compactionTransientMaxRetries = 2;
 export const compactionTransientRetryDelayMs = 750;
 
+// VSLLM/New API may reject a compaction request with
+// "pre-flight probe to upstream returned 429" when the per-model upstream
+// channel is momentarily exhausted. The channel selector usually rotates on
+// the next attempt, so retry immediately (no delay, no watchdog wait) up to
+// this many times. This budget is in addition to compactionTransientMaxRetries
+// and is consumed only by the "pre-flight probe ... 429" body — real quota
+// exhaustion messages (e.g. "quota reached") still surface immediately.
+export const compactionChannelProbeMaxRetries = 3;
+export const compactionChannelProbeRetryDelayMs = 0;
+
 export function isRetryableCompactionStatus(status) {
   const numericStatus = Number(status);
   return numericStatus === 408 || numericStatus === 425
     || (numericStatus >= 500 && numericStatus <= 599);
+}
+
+// VSLLM/New API may route identical requests to different upstream channels
+// per attempt. When a specific channel returns "pre-flight probe ... 429",
+// the channel is exhausted for the moment but the account still has budget;
+// the next attempt usually lands on a healthy channel. This is distinct from
+// real quota exhaustion messages (e.g. "quota reached", "当前订阅额度不足").
+// The proxy retries this signal as a transient channel-routing issue: no
+// delay (we already waited for the upstream to respond), bounded budget, no
+// fall-through to the next wire shape because Responses and Chat Completions
+// share the same channel for the same model on the same account.
+export function isVsllmChannelPreFlight429Body(body) {
+  const text = String(body || "");
+  if (!text) return false;
+  return /pre-flight\s+probe\s+to\s+upstream\s+returned\s+429/i.test(text);
 }
 
 export function isRetryableCompactionFetchError(error) {
@@ -167,6 +193,8 @@ export async function fetchCompactionWithRetry(url, init, {
   label = "summarization",
   maxTransientRetries = compactionTransientMaxRetries,
   transientDelayMs = compactionTransientRetryDelayMs,
+  maxChannelProbeRetries = compactionChannelProbeMaxRetries,
+  channelProbeDelayMs = compactionChannelProbeRetryDelayMs,
   // Tests can inject a fetcher and zero-delay sleeper. Production callers use
   // the global fetch and short delays so New API can select another channel.
   fetchImpl = globalThis.fetch,
@@ -176,8 +204,10 @@ export async function fetchCompactionWithRetry(url, init, {
   const requestedEffort = retryableVsllmReasoningEffort(target, requestBody);
   const reasoningEligible = Boolean(requestedEffort);
   const transientRetryLimit = Math.max(0, Number(maxTransientRetries) || 0);
+  const channelProbeLimit = Math.max(0, Number(maxChannelProbeRetries) || 0);
   let reasoningRetries = 0;
   let transientRetries = 0;
+  let channelProbeRetries = 0;
 
   while (true) {
     const attemptInit = { ...init };
@@ -234,6 +264,20 @@ export async function fetchCompactionWithRetry(url, init, {
           `[Proxy Local Compaction] VSLLM rejected reasoning level ${JSON.stringify(requestedEffort)} for ${label}; retrying through the provider channel selector (${reasoningRetries}/${vsllmReasoningLevelMaxRetries}).`
         );
         await sleep(Math.max(0, Number(delayMs) || 0));
+        continue;
+      }
+    }
+
+    if (response.status === 429
+      && channelProbeRetries < channelProbeLimit) {
+      const errorText = await response.clone().text().catch(() => "");
+      if (isVsllmChannelPreFlight429Body(errorText)) {
+        channelProbeRetries += 1;
+        await discardRetryResponse(response);
+        console.warn(
+          `[Proxy Local Compaction] VSLLM channel probe rejected ${label}; retrying the same provider endpoint (${channelProbeRetries}/${channelProbeLimit}).`
+        );
+        await sleep(Math.max(0, Number(channelProbeDelayMs) || 0));
         continue;
       }
     }
@@ -304,12 +348,21 @@ function recordCompactionFetchFailure(target, error) {
   );
 }
 
+// Used when the channel-probe retry loop exhausts its budget. Distinct from
+// `quota` so the user sees "channel kept rejecting pre-flight probes" instead
+// of "billing limit reached" when the issue is a VSLLM routing problem, not
+// account exhaustion.
+function recordCompactionChannelExhausted(target, status = null) {
+  recordCompactionFailure(target, "channel_exhausted", status);
+}
+
 export function describeCompactionFailure(target) {
   const failure = target && typeof target === "object" ? compactionFailures.get(target) : null;
   if (!failure) return "the provider returned no usable summary";
   const http = failure.status == null ? "" : ` (HTTP ${failure.status})`;
   if (failure.kind === "access") return `provider authentication or account access was rejected${http}`;
   if (failure.kind === "quota") return `the provider quota or billing limit was reached${http}`;
+  if (failure.kind === "channel_exhausted") return `the provider's upstream channel kept rejecting pre-flight probes${http}`;
   if (failure.kind === "timeout") return `the provider summarization request timed out${http}`;
   if (failure.kind === "unsupported_endpoint") return `the provider has no compatible summarization endpoint${http}`;
   if (failure.kind === "upstream_unavailable") return `the provider summarization service was unavailable${http}`;
@@ -1035,8 +1088,12 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         label: "chat completions"
       });
       if (res.status !== 200) {
-        recordCompactionHttpFailure(target, res.status);
         const errText = await res.text().catch(() => "");
+        if (res.status === 429 && isVsllmChannelPreFlight429Body(errText)) {
+          recordCompactionChannelExhausted(target, res.status);
+        } else {
+          recordCompactionHttpFailure(target, res.status);
+        }
         console.error(`[Proxy Local Compaction] completions endpoint failed with status ${res.status}: ${errText.slice(0, 200)}`);
         return "";
       }
@@ -1136,8 +1193,12 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         }
         recordCompactionFailureIfUnset(target, "invalid_response");
       } else {
-        recordCompactionHttpFailure(target, responsesRes.status);
         const errText = await responsesRes.text().catch(() => "");
+        if (responsesRes.status === 429 && isVsllmChannelPreFlight429Body(errText)) {
+          recordCompactionChannelExhausted(target, responsesRes.status);
+        } else {
+          recordCompactionHttpFailure(target, responsesRes.status);
+        }
         console.warn(`[Proxy Local Compaction] responses endpoint with model ${fallbackModel} returned status ${responsesRes.status}: ${errText.slice(0, 150)}`);
       }
     } catch (err) {
@@ -1175,8 +1236,12 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
         if (text) return text;
         recordCompactionFailureIfUnset(target, "invalid_response");
       } else {
-        recordCompactionHttpFailure(target, res.status);
         const errText = await res.text().catch(() => "");
+        if (res.status === 429 && isVsllmChannelPreFlight429Body(errText)) {
+          recordCompactionChannelExhausted(target, res.status);
+        } else {
+          recordCompactionHttpFailure(target, res.status);
+        }
         console.warn(`[Proxy Local Compaction] completions endpoint with model ${fallbackModel} returned status ${res.status}: ${errText.slice(0, 150)}`);
       }
     } catch (err) {
