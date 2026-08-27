@@ -47,6 +47,7 @@ import {
 import {
   describeCompactionFailure,
   runLocalCompactionFallback,
+  runLocalCompactionFallbackAcrossAccounts,
   summarizeViaShape
 } from "./proxy-compaction.mjs";
 // antigravity translations are handled inside shape-translator.mjs
@@ -140,6 +141,7 @@ export function createProviderProxy(options) {
   const markApiAccountExhaustedFromProxy = options.markApiAccountExhaustedFromProxy;
   const switchFromExhaustedApiAccount = options.switchFromExhaustedApiAccount;
   const targetFromTransientApiFailure = options.targetFromTransientApiFailure;
+  const listCompactionAccountCandidates = options.listCompactionAccountCandidates;
   const vsllmTransientUsageLimitMaxRetries = options.vsllmTransientUsageLimitMaxRetries;
   const vsllmTransientUsageLimitRetryDelayMs = options.vsllmTransientUsageLimitRetryDelayMs;
   const modelCapacityMaxRetries = options.modelCapacityMaxRetries;
@@ -719,7 +721,7 @@ export function createProviderProxy(options) {
           && !target.officialAnthropic
           && claudeResponsesBridge?.kind !== "responses") {
           console.log("[Proxy] Codex remote compaction v2 detected; generating a provider-compatible local summary.");
-          let localCompacted = await runLocalCompactionFallback(
+          let localCompacted = await runLocalCompactionFallbackAcrossAccounts(
             target,
             body,
             req.headers,
@@ -727,7 +729,10 @@ export function createProviderProxy(options) {
             sanitizeProxyRequestHeaders,
             {
               originalModel: originalRequestModel,
-              remoteCompactionV2: true
+              remoteCompactionV2: true,
+              codexHome: route.codexHome,
+              pinnedOnly: !!route.accountSelector,
+              listCompactionAccountCandidates
             }
           );
           if (!localCompacted) {
@@ -805,13 +810,18 @@ export function createProviderProxy(options) {
           || isRetryableCompactionStatus(upstream?.status)
           || [404, 405, 524].includes(upstream?.status))) {
           console.log(`[Proxy] Compaction failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
-          let localCompacted = await runLocalCompactionFallback(
+          let localCompacted = await runLocalCompactionFallbackAcrossAccounts(
             target,
             body,
             req.headers,
             bodyAlreadyDecoded,
             sanitizeProxyRequestHeaders,
-            { originalModel: originalRequestModel }
+            {
+              originalModel: originalRequestModel,
+              codexHome: route.codexHome,
+              pinnedOnly: !!route.accountSelector,
+              listCompactionAccountCandidates
+            }
           );
           if (!localCompacted) {
             const reason = describeCompactionFailure(target);
@@ -826,12 +836,17 @@ export function createProviderProxy(options) {
 
         if (claudeMessagesCompaction && (fetchFailed || [502, 503, 504, 524].includes(upstream.status))) {
           console.log(`[Proxy] Claude compaction request failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
-          let localCompacted = await runLocalCompactionFallback(
+          let localCompacted = await runLocalCompactionFallbackAcrossAccounts(
             target,
             body,
             req.headers,
             bodyAlreadyDecoded,
-            sanitizeProxyRequestHeaders
+            sanitizeProxyRequestHeaders,
+            {
+              codexHome: route.codexHome,
+              pinnedOnly: !!route.accountSelector,
+              listCompactionAccountCandidates
+            }
           );
           if (!localCompacted) {
             const reason = describeCompactionFailure(target);

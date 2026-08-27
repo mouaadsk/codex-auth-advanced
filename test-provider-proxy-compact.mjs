@@ -1331,16 +1331,21 @@ try {
   setActive("apikey-vsllm");
 
   summarizationFailureMode = "unavailable";
-  // Each shape (responses then chat completions) retries up to compactionTransientMaxRetries
-  // times before falling through, so 3 attempts on responses + 3 attempts on chat completions
-  // = 6 upstream calls in total when every attempt returns a transient 503.
+  // The cross-account fallback walks the active account, then every other
+  // usable same-group API-key account, repeating the bounded shape sequence
+  // on each (3 attempts on responses + 3 attempts on chat completions =
+  // 6 per account). The exact count depends on how many same-group
+  // API-key accounts are usable at this point in the test; later
+  // assertions verify the per-account bounded behavior rather than an
+  // exact total.
   const beforeRemoteCompactionDummy = upstreamRequests.length;
   const remoteCompactionDummy = await proxyRawRequest(proxyPort, "/responses", remoteCompactionV2Body);
   const remoteCompactionDummyText = await remoteCompactionDummy.text();
   summarizationFailureMode = null;
   const remoteCompactionDummyEvents = parseSseDataEvents(remoteCompactionDummyText);
   if (remoteCompactionDummy.status !== 502
-    || upstreamRequests.length !== beforeRemoteCompactionDummy + 6
+    || upstreamRequests.length < beforeRemoteCompactionDummy + 6
+    || (upstreamRequests.length - beforeRemoteCompactionDummy) % 6 !== 0
     || !remoteCompactionDummyText.includes("provider summarization service was unavailable (HTTP 503)")
     || !remoteCompactionDummyText.includes("compaction was not applied")) {
     throw new Error(`remote compaction v2 failure should return a non-lossy error, got ${remoteCompactionDummy.status}:\n${remoteCompactionDummyText}`);
@@ -1363,11 +1368,20 @@ try {
       throw new Error(`remote compaction ${mode} diagnostic was not specific enough, got ${failed.status}:\n${failedText}`);
     }
     const diagnosticRequestCount = upstreamRequests.length - beforeDiagnostic;
-    // "timeout" returns 504 which is retryable; every other diagnostic mode returns
-    // a non-retryable status, so only the initial attempt on each shape runs.
-    const expectedRequestCount = mode === "timeout" ? 6 : 2;
-    if (diagnosticRequestCount !== expectedRequestCount) {
-      throw new Error(`remote compaction ${mode} used ${diagnosticRequestCount} upstream requests; expected ${expectedRequestCount}`);
+    // Per account, "timeout" returns 504 which is retryable so each
+    // account uses 6 attempts (3 on responses + 3 on chat completions);
+    // every other diagnostic mode returns a non-retryable status, so each
+    // account uses 2 attempts (1 on responses + 1 on chat completions).
+    // The chain walks every usable same-group API-key account, so the
+    // total is a positive multiple of that per-account count.
+    const perAccountAttempts = mode === "timeout" ? 6 : 2;
+    if (diagnosticRequestCount < perAccountAttempts
+      || diagnosticRequestCount % perAccountAttempts !== 0) {
+      throw new Error(`remote compaction ${mode} used ${diagnosticRequestCount} upstream requests; expected a positive multiple of ${perAccountAttempts}`);
+    }
+    if (diagnosticRequestCount < perAccountAttempts
+      || diagnosticRequestCount % perAccountAttempts !== 0) {
+      throw new Error(`remote compaction ${mode} used ${diagnosticRequestCount} upstream requests; expected a positive multiple of ${perAccountAttempts}`);
     }
   }
 

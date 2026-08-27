@@ -69,6 +69,7 @@ const providerProxy = createProviderProxy({
   markApiAccountExhaustedFromProxy: (...args) => accountService.markApiAccountExhaustedFromProxy(...args),
   switchFromExhaustedApiAccount: (...args) => accountService.switchFromExhaustedApiAccount(...args),
   targetFromTransientApiFailure: (...args) => accountService.targetFromTransientApiFailure(...args),
+  listCompactionAccountCandidates: (...args) => accountService.listCompactionAccountCandidates(...args),
   vsllmTransientUsageLimitMaxRetries,
   vsllmTransientUsageLimitRetryDelayMs,
   modelCapacityMaxRetries,

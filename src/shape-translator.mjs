@@ -101,6 +101,36 @@ function safeJsonParse(text, fallback) {
 
 // ---------- Request translators (source -> target) ----------
 
+// Responses and Chat Completions use different object forms for a named
+// function choice.  Keep the caller's explicit policy when a Responses
+// request is retried against /chat/completions; silently dropping it changes
+// a required tool call into provider-default (auto) behavior.
+function responsesToolChoiceToChat(toolChoice) {
+  if (toolChoice == null) return undefined;
+  if (typeof toolChoice === "string") return toolChoice;
+  if (typeof toolChoice !== "object" || Array.isArray(toolChoice)) return toolChoice;
+
+  if (toolChoice.type === "function") {
+    const name = toolChoice.name || toolChoice.function?.name;
+    return name
+      ? { type: "function", function: { name: String(name) } }
+      : undefined;
+  }
+
+  // Responses' allowed_tools form has no exact Chat Completions equivalent.
+  // Preserve its required/auto intent rather than dropping the policy.  The
+  // tool list itself is still forwarded, so the provider can apply the
+  // closest available restriction.
+  if (toolChoice.type === "allowed_tools") {
+    if (toolChoice.mode === "required" || toolChoice.mode === "none" || toolChoice.mode === "auto") {
+      return toolChoice.mode;
+    }
+    return "auto";
+  }
+
+  return toolChoice;
+}
+
 function responsesToChatRequest(payload) {
   const source = payload && typeof payload === "object" ? payload : {};
   const messages = [];
@@ -151,8 +181,15 @@ function responsesToChatRequest(payload) {
       }
     }));
   }
+  const toolChoice = responsesToolChoiceToChat(source.tool_choice);
+  if (toolChoice !== undefined) out.tool_choice = toolChoice;
+  if (typeof source.parallel_tool_calls === "boolean") {
+    out.parallel_tool_calls = source.parallel_tool_calls;
+  }
   if (source.reasoning?.effort) out.reasoning_effort = source.reasoning.effort;
   if (source.temperature != null) out.temperature = source.temperature;
+  if (source.top_p != null) out.top_p = source.top_p;
+  if (source.max_output_tokens != null) out.max_tokens = source.max_output_tokens;
   return out;
 }
 

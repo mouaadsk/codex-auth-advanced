@@ -11,7 +11,6 @@ export const grokVsllmManagedModels = Object.freeze([
     upstreamModel: "grok-4.5",
     name: "VSLLM Grok 4.5 (Chat Completions)",
     apiBackend: "chat_completions",
-    contextWindow: 1_000_000,
     maxCompletionTokens: 65_536,
     reasoningEfforts: ["low", "medium", "high"],
     defaultReasoningEffort: "high"
@@ -21,7 +20,6 @@ export const grokVsllmManagedModels = Object.freeze([
     upstreamModel: "grok-4.6",
     name: "VSLLM Grok 4.6 (Chat Completions)",
     apiBackend: "chat_completions",
-    contextWindow: 1_000_000,
     maxCompletionTokens: 65_536,
     reasoningEfforts: ["low", "medium", "high", "xhigh"],
     defaultReasoningEffort: "high"
@@ -92,17 +90,22 @@ export function managedGrokConfigSections(baseUrl) {
     ""
   ];
   for (const model of grokVsllmManagedModels) {
-    lines.push(
+    const modelLines = [
       `[model.${model.pickerId}]`,
       'model_provider = "vsllm"',
       `model = ${JSON.stringify(model.upstreamModel)}`,
       `name = ${JSON.stringify(model.name)}`,
       `description = ${JSON.stringify(`${model.upstreamModel} through codex-auth-advanced proxy using Chat Completions`)}`,
-      `api_backend = ${JSON.stringify(model.apiBackend)}`,
-      `context_window = ${model.contextWindow}`,
+      `api_backend = ${JSON.stringify(model.apiBackend)}`
+    ];
+    if (Number.isFinite(model.contextWindow)) {
+      modelLines.push(`context_window = ${model.contextWindow}`);
+    }
+    modelLines.push(
       `max_completion_tokens = ${model.maxCompletionTokens}`,
       ""
     );
+    lines.push(...modelLines);
     appendGrokReasoningEffortToml(lines, model);
   }
   return lines.join("\n").trimEnd();

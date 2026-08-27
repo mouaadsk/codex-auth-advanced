@@ -845,6 +845,14 @@ export function createCliService({
     if (Number.isFinite(windowMinutes)) {
       matches[0].api_spend_window_minutes = windowMinutes;
     }
+    if (matches[0].api_spend && typeof matches[0].api_spend === "object") {
+      matches[0].api_spend.limit_usd = limitUsd;
+      if (Number.isFinite(windowMinutes)) matches[0].api_spend.window_minutes = windowMinutes;
+      if (Number.isFinite(Number(matches[0].api_spend.spend_usd))) {
+        matches[0].api_spend.exhausted = Number(matches[0].api_spend.spend_usd) >= limitUsd;
+        matches[0].api_spend.remaining_usd = Math.max(0, limitUsd - Number(matches[0].api_spend.spend_usd));
+      }
+    }
     writeJsonFile(filePath, registry);
     process.stdout.write(`Set API spend limit for ${matches[0].alias || matches[0].email || matches[0].account_key} to $${limitUsd.toFixed(2)}.\n`);
   }

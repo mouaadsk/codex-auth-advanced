@@ -40,6 +40,17 @@ const chatReq = {
   ]
 };
 
+const responsesToolPolicyReq = {
+  model: "gpt-5.6-sol",
+  input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "use the tool" }] }],
+  tools: [{ type: "function", name: "shell", description: "Run a shell", parameters: { type: "object" } }],
+  tool_choice: { type: "function", name: "shell" },
+  parallel_tool_calls: false,
+  max_output_tokens: 321,
+  top_p: 0.8,
+  stream: true
+};
+
 const messagesReq = {
   model: "claude-sonnet-4-5",
   system: "Be brief.",
@@ -131,6 +142,17 @@ assert.equal(agReq.request.tools[0].functionDeclarations[0].parameters.type, "ob
 const backToResponses = translateRequest("antigravity", "responses", agReq);
 assert.ok(Array.isArray(backToResponses.tools));
 assert.equal(backToResponses.tools[0].name, "shell");
+
+// Responses -> Chat must preserve explicit tool policy during endpoint
+// fallback.  Losing this field silently changes required/named calls to auto.
+const chatToolPolicy = translateRequest("responses", "chat_completions", responsesToolPolicyReq);
+assert.deepEqual(chatToolPolicy.tool_choice, {
+  type: "function",
+  function: { name: "shell" }
+});
+assert.equal(chatToolPolicy.parallel_tool_calls, false);
+assert.equal(chatToolPolicy.max_tokens, 321);
+assert.equal(chatToolPolicy.top_p, 0.8);
 
 // ---------- Messages <-> Antigravity ----------
 

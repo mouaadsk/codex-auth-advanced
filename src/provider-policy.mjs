@@ -211,7 +211,15 @@ export function applyApiSpendWindow(entry, costs) {
   const windowMinutes = apiSpendWindowMinutes(entry.account, { endpoint: entry.endpoint });
   if (!Number.isFinite(windowMinutes)) return costs;
 
-  const totalSpend = firstFinite(costs.totalSpend, costs.monthly, costs.weekly, costs.daily, costs.spend);
+  const totalSpend = firstFinite(
+    costs.totalSpend,
+    costs.monthly,
+    costs.weekly,
+    costs.daily,
+    costs.spend,
+    entry.account?.api_spend?.total_spend_usd,
+    entry.account?.api_spend_window?.total_spend_usd
+  );
   if (!Number.isFinite(totalSpend)) return costs;
 
   const rolling = rollingApiSpendFromTotal(entry.account, totalSpend, windowMinutes);

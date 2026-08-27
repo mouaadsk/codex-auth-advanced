@@ -225,6 +225,41 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     return apiProxyTargetForAccount(codexHome, activeRegistryAccountFromRegistry(registry));
   }
 
+  // Enumerate API-key accounts in the same group that can serve as a last-
+  // resort fallback for an idempotent compaction request. The active account
+  // comes first; the remaining usable same-group apikey accounts follow in
+  // the standard sorted order. Pinned routes never get a fallback chain: a
+  // pinned proxy URL stays on the caller-selected account only. Returns the
+  // already-built proxy target so callers can hand it straight to the
+  // compaction summarizer.
+  function listCompactionAccountCandidates(codexHome, options = {}) {
+    const excludeAccountKeys = new Set(
+      Array.isArray(options.excludeAccountKeys) ? options.excludeAccountKeys : []
+    );
+    const pinnedOnly = options.pinnedOnly === true;
+    if (pinnedOnly) return [];
+    const registry = reconcileRegistryActiveAccount(codexHome, readJsonFile(registryPath(codexHome)));
+    if (!registry || !Array.isArray(registry.accounts)) return [];
+    const activeKey = activeAccountKeyFromRegistry(registry);
+    const orderedKeys = [];
+    if (activeKey) orderedKeys.push(activeKey);
+    for (const account of sortedRegistryAccounts(registry)) {
+      if (!account || account.account_key === activeKey) continue;
+      orderedKeys.push(account.account_key);
+    }
+    const out = [];
+    for (const accountKey of orderedKeys) {
+      if (excludeAccountKeys.has(accountKey)) continue;
+      const account = accountForKey(registry, accountKey);
+      if (!account || account.auth_mode !== "apikey") continue;
+      if (accountIsExhausted(account)) continue;
+      const target = apiProxyTargetForAccount(codexHome, account);
+      if (!target || target.error) continue;
+      out.push(target);
+    }
+    return out;
+  }
+
   function apiProxyAccountForSelector(codexHome, selector) {
     const registry = readJsonFile(registryPath(codexHome));
     if (!registry || !Array.isArray(registry.accounts)) {
@@ -643,6 +678,7 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     switchToStoredAccount,
     activeRegistryAccountFromRegistry,
     firstUsableSwitchCandidate,
-    autoSwitchEnabled
+    autoSwitchEnabled,
+    listCompactionAccountCandidates
   };
 }

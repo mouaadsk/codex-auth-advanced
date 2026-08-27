@@ -350,6 +350,10 @@ if (grokConfig.includes('api_backend = "responses"')
   || grokConfig.match(/api_backend = "chat_completions"/g)?.length !== 3) {
   throw new Error(`Grok models should explicitly select Chat Completions independently:\n${grokConfig}`);
 }
+if (grokConfig.includes("context_window = 1000000")
+  || grokConfig.match(/context_window = /g)?.length !== 1) {
+  throw new Error(`Grok 4.5/4.6 should use Grok Build's default context window:\n${grokConfig}`);
+}
 
 const plistPath = path.join(home, "Library", "LaunchAgents", "com.mouaadsk.codex-auth-advanced.proxy.plist");
 const plist = fs.readFileSync(plistPath, "utf8");

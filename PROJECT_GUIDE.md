@@ -268,7 +268,7 @@ Native Anthropic-compatible VSLLM models use `/v1/messages`. Models exposed thro
 
 ### Grok Build
 
-`configure grok` requires the currently active account to be VSLLM and writes a pinned route for that exact account. Managed picker entries are `vsllm-grok-45`, `vsllm-grok-46`, and `vsllm-ox-alpha` (upstream `stealth/ox-alpha`); each explicitly declares `api_backend = "chat_completions"`, so Grok Build appends `/v1/chat/completions` to the shared `/v1` base URL. Re-run configuration to deliberately pin another VSLLM account.
+`configure grok` requires the currently active account to be VSLLM and writes a pinned route for that exact account. Managed picker entries are `vsllm-grok-45`, `vsllm-grok-46`, and `vsllm-ox-alpha` (upstream `stealth/ox-alpha`); each explicitly declares `api_backend = "chat_completions"`, so Grok Build appends `/v1/chat/completions` to the shared `/v1` base URL. Grok 4.5 and Grok 4.6 intentionally omit `context_window` until VSLLM publishes a verified value, leaving Grok Build to use its conservative custom-model default. Re-run configuration to deliberately pin another VSLLM account.
 
 ## 9. Compaction Contract
 
@@ -293,6 +293,8 @@ The proxy never forwards `compaction_trigger` as conversation text. It expands s
 
 If all compatible summary attempts fail, the proxy returns HTTP 502 with a specific reason and `compaction was not applied`. It must not fabricate an empty or placeholder compaction, because that would silently discard context.
 
+If the failure above happened on the active account but other same-group API-key accounts are configured, the proxy additionally performs a last-resort cross-account fallback: it repeats the full shape sequence for the same model on each remaining usable account in registry order and returns the first successful summary. The active account is never mutated and pinned routes are exempt from this fallback. See *Cross-account compaction fallback* below.
+
 ### Transient compaction retry policy
 
 Provider-compatible summarization is non-streaming and idempotent. Each shape receives one retry with the exact same account, endpoint, model, reasoning effort, transcript, headers, and JSON body when any of these occur:
@@ -302,7 +304,7 @@ Provider-compatible summarization is non-streaming and idempotent. Each shape re
 - HTTP 408 or 425.
 - HTTP 5xx, including Cloudflare 504 and 524.
 
-The Responses endpoint has a 120-second per-attempt watchdog; the Codex Chat Completions fallback has a 30-second per-attempt watchdog. Claude and generic shape summarizers use their call-site budgets. The retry count is bounded; after it is exhausted, the next compatible shape is attempted or the non-lossy 502 is returned.
+The Responses endpoint defaults to a 300-second (5-minute) per-attempt watchdog (configurable via `CODEX_AUTH_ADVANCED_COMPACTION_RESPONSES_TIMEOUT_MS` or `CODEX_AUTH_ADVANCED_COMPACTION_TIMEOUT_MS`); the Codex Chat Completions fallback defaults to a 240-second (4-minute) per-attempt watchdog (configurable via `CODEX_AUTH_ADVANCED_COMPACTION_COMPLETIONS_TIMEOUT_MS` or `CODEX_AUTH_ADVANCED_COMPACTION_TIMEOUT_MS`). Claude and generic shape summarizers use their call-site budgets. The retry count is bounded; after it is exhausted, the next compatible shape is attempted or the non-lossy 502 is returned.
 
 Do not apply this generic policy to normal streaming turns. A replay after partial output could duplicate work or tool calls.
 
@@ -310,6 +312,13 @@ Do not apply this generic policy to normal streaming turns. A replay after parti
 
 VSLLM/New API may route identical model requests to channels with inconsistent validators. If the exact error says that the requested `max`, `xhigh`, or `ultra` level is unsupported and lists valid levels, the proxy retries the unchanged request up to five times. This narrow rule applies to normal Responses/Chat requests and compaction summaries. It does not translate the effort and does not catch unrelated HTTP 400 responses.
 
+### Cross-account compaction fallback
+
+Provider-compatible summarization is a non-streaming, idempotent one-shot call, so when the active account's compaction fails after all same-account retries are exhausted the proxy tries the same model on every other usable same-group API-key account before giving up. The chain order is: the active account first, then the remaining usable accounts in the standard registry sort order. Each candidate runs the full shape sequence (`/v1/responses` then `/v1/chat/completions`) with the same per-account retry/watchdog budgets, and the first to return a usable summary wins. Future accounts added to the registry participate automatically as long as they are API-key accounts with a configured upstream base URL and are not exhausted.
+
+The fallback is compaction-only. Normal chat routing, account switching, exhaustion mutation, and pinned routes are unaffected. Pinned proxy URLs (e.g. `accounts/<key>/v1`) stay on the caller-selected account and never fall through to a different one. The active account key is never mutated by the fallback chain. If every candidate fails, the proxy returns the same non-lossy 502 it would have returned before, with the reason from the last attempted account.
+
+## 10. Provider and Account Failure Policy
 ## 10. Provider and Account Failure Policy
 
 Provider errors are classified in `provider-policy.mjs` before mutation or failover.
@@ -377,6 +386,7 @@ Additional deterministic tests exist and should be run when their domains change
 node test-chat-responses-bridge.mjs
 node test-antigravity-bridge.mjs
 node test-endpoint-chain.mjs
+node test-compaction-account-fallback.mjs
 node test-shape-translator.mjs
 node test-shape-probe.mjs
 node test-shape-probe-store.mjs
@@ -450,6 +460,10 @@ Live provider tests are optional and must be deliberate. Never infer permission 
 ### Automatic compaction returns 502 after a long wait
 
 Look for `Proxy Local Compaction` in `proxy.error.log`. A typical upstream outage shows a Responses timeout or Cloudflare 504 followed by a Chat Completions timeout. The proxy now retries each idempotent summary endpoint once; a final 502 means all bounded attempts failed and the original context was intentionally left intact. Manual `/compact` may work later simply because a later provider channel completed.
+
+### Compaction fails on the active account but other accounts are configured
+
+Since the cross-account fallback was added, the proxy will already have tried the same model on every usable same-group API-key account before surfacing a 502. Look for `Proxy Local Compaction` lines that mention `Fallback account ... failed` followed by `no more accounts to try`. If you see the active account failing but a different provider works, that is the expected fallback chain succeeding and the original context is preserved either way. If every candidate fails, the issue is upstream-side for the configured providers, not the proxy.
 
 ### `level "max" not supported`
 

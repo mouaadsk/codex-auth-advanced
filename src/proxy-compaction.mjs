@@ -1287,6 +1287,155 @@ export async function runLocalCompactionFallback(target, body, headers, alreadyD
   });
 }
 
+// Try provider-compatible summarization on the active account, then on every
+// other usable same-group apikey account when the active one fails. Each
+// candidate is tried in turn with the same model and reasoning effort; the
+// first to return a usable summary wins. The chain is intentionally narrow:
+// it is reserved for the compaction path, where the request is non-streaming
+// and idempotent, and it never modifies the active account. Pinned routes
+// stay on the caller-selected account only and never fall through to a
+// different one.
+export async function runLocalCompactionFallbackAcrossAccounts(target, body, headers, alreadyDecoded, sanitizeRequestHeaders, options = {}) {
+  const codexHome = options.codexHome;
+  const listCandidates = options.listCompactionAccountCandidates;
+  const pinnedOnly = options.pinnedOnly === true;
+  const excludeAccountKeys = new Set(
+    Array.isArray(options.excludeAccountKeys) ? options.excludeAccountKeys : []
+  );
+
+  // Snapshot the original target so we can preserve its incoming request
+  // metadata (URL path, query) and only swap the upstream host + base URL.
+  let originalUrl = null;
+  let pathPart = "";
+  let queryPart = "";
+  try {
+    originalUrl = new URL(target?.url || "");
+    pathPart = originalUrl.pathname || "";
+    queryPart = originalUrl.search || "";
+  } catch {
+    return runLocalCompactionFallback(
+      target,
+      body,
+      headers,
+      alreadyDecoded,
+      sanitizeRequestHeaders,
+      options
+    );
+  }
+
+  function targetForCandidate(candidate) {
+    if (!candidate || !candidate.upstreamBaseUrl) return null;
+    // The incoming proxy URL was already rooted at upstreamBaseUrl + path.
+    // Strip a leading /v1 from the original path if the candidate's
+    // upstreamBaseUrl already ends with /v1, otherwise keep /v1 once.
+    const base = String(candidate.upstreamBaseUrl).replace(/\/+$/, "");
+    let path = pathPart;
+    if (base.endsWith("/v1")) {
+      path = path.replace(/^\/v1(?=\/|$)/, "");
+      if (!path.startsWith("/")) path = `/${path}`;
+    } else if (!path.startsWith("/v1/") && !path.startsWith("/v1")) {
+      // Match proxyRequestTargetUrl's behavior: prepend /v1 when the caller
+      // asked for a v1 endpoint and the upstream does not already include /v1.
+      const needsV1 = path === "/responses"
+        || path.startsWith("/responses/")
+        || path === "/chat/completions"
+        || path.startsWith("/chat/completions/")
+        || path === "/messages"
+        || path.startsWith("/messages/");
+      if (needsV1) path = `/v1${path}`;
+    }
+    return {
+      ...candidate,
+      url: `${base}${path}${queryPart}`
+    };
+  }
+
+  let candidates;
+  if (pinnedOnly) {
+    candidates = [targetForCandidate(target)];
+  } else if (typeof listCandidates === "function" && codexHome) {
+    candidates = listCandidates(codexHome, { excludeAccountKeys: [...excludeAccountKeys] })
+      .map(targetForCandidate)
+      .filter(Boolean);
+    // Reuse the original target for the active account whenever the
+    // enumerator's candidate refers to the same account_key. This keeps
+    // the WeakMap-keyed compaction-failure record attached to the same
+    // object the caller passed in, so describeCompactionFailure(target)
+    // after the wrapper returns can still inspect the recorded failure.
+    const activeKey = target?.account?.account_key;
+    if (activeKey) {
+      const activeIndex = candidates.findIndex((candidate) => candidate?.account?.account_key === activeKey);
+      if (activeIndex >= 0) {
+        candidates[activeIndex] = target;
+      } else {
+        const firstTarget = targetForCandidate(target);
+        if (firstTarget) candidates.unshift(firstTarget);
+      }
+    }
+  } else {
+    candidates = [targetForCandidate(target)];
+  }
+
+  if (!candidates || candidates.length === 0) {
+    return runLocalCompactionFallback(
+      target,
+      body,
+      headers,
+      alreadyDecoded,
+      sanitizeRequestHeaders,
+      options
+    );
+  }
+
+  let lastFailure = null;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const candidateKey = candidate?.account?.account_key || candidate?.upstreamBaseUrl || "unknown";
+    if (excludeAccountKeys.has(candidateKey)) continue;
+    if (index === 0) {
+      console.log(
+        `[Proxy Local Compaction] Summarization on active account (${candidateKey}); same account retry budgets already exhausted before cross-account fallback.`
+      );
+    } else {
+      const alias = candidate?.account?.alias || candidate?.account?.email || candidateKey;
+      console.log(
+        `[Proxy Local Compaction] Active account did not return a usable summary; trying fallback account ${alias} (${candidateKey}).`
+      );
+    }
+    let response;
+    try {
+      response = await runLocalCompactionFallback(
+        candidate,
+        body,
+        headers,
+        alreadyDecoded,
+        sanitizeRequestHeaders,
+        options
+      );
+    } catch (err) {
+      lastFailure = err;
+      console.warn(
+        `[Proxy Local Compaction] Fallback account ${candidateKey} threw: ${err?.message || err}.`
+      );
+      continue;
+    }
+    if (response) return response;
+    const reason = describeCompactionFailure(candidate) || "no usable summary";
+    lastFailure = reason;
+    if (index < candidates.length - 1) {
+      console.warn(
+        `[Proxy Local Compaction] Fallback account ${candidateKey} failed (${reason}); trying next account.`
+      );
+    } else {
+      console.warn(
+        `[Proxy Local Compaction] Fallback account ${candidateKey} failed (${reason}); no more accounts to try.`
+      );
+    }
+  }
+
+  return null;
+}
+
 function claudeMessagesJsonResponse(body, extraHeaders = {}) {
   const responseBody = Buffer.from(JSON.stringify(body), "utf8");
   return new Response(responseBody, {
