@@ -339,7 +339,7 @@ function isInvalidApiKeyBody(body) {
 export function isInvalidEncryptedContentBody(body) {
   return responseBodyMatches(
     body,
-    /invalid[_ -]?encrypted[_ -]?content|encrypted content.*(decrypt|parse|verified)|missing[_ -]?required[_ -]?parameter.*encrypted[_ -]?content|missing required parameter.*encrypted[_ -]?content/i,
+    /invalid[_ -]?encrypted[_ -]?content|thinking[_ -]?signature[_ -]?invalid|encrypted content.*(decrypt|parse|verified)|missing[_ -]?required[_ -]?parameter.*encrypted[_ -]?content|missing required parameter.*encrypted[_ -]?content/i,
     { includeParams: true }
   );
 }

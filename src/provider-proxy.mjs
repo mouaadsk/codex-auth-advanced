@@ -562,7 +562,7 @@ export function createProviderProxy(options) {
         currentTarget.url
       ].join("\u0000");
       let bodyAlreadyDecoded = false;
-      let triedPlaintextCompactRepair = false;
+      let triedEncryptedContentRepair = false;
       let claudeResponsesBridge = null;
       let claudeMessagesCompaction = false;
       let claudeCompactionModel = null;
@@ -863,16 +863,20 @@ export function createProviderProxy(options) {
           throw fetchError;
         }
 
-        if (target.repairInvalidEncryptedContent && isCompactProxyTarget(target) && !triedPlaintextCompactRepair) {
+        if (target.repairInvalidEncryptedContent && !triedEncryptedContentRepair) {
           const { invalid } = await invalidEncryptedContentResponse(upstream);
           if (invalid) {
             const stripped = repairProviderProxyBodyPlaintext(target, body, req.headers, {
               alreadyDecoded: bodyAlreadyDecoded
             });
             if (stripped.repaired) {
+              const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+              const requestKind = isCompactProxyTarget(target) ? "compact request" : "Responses request";
+              console.warn(`[Proxy] ${label} rejected encrypted content; retrying the ${requestKind} once without opaque encrypted reasoning state.`);
+              try { await upstream.body?.cancel(); } catch {}
               body = stripped.body;
               bodyAlreadyDecoded = bodyAlreadyDecoded || stripped.decoded === true;
-              triedPlaintextCompactRepair = true;
+              triedEncryptedContentRepair = true;
               continue;
             }
           }

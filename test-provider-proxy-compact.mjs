@@ -472,6 +472,17 @@ const upstream = http.createServer(async (req, res) => {
       }));
       return;
     }
+    if (responseFailure === "invalid_encrypted_content") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: "The encrypted content for item rs_test could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+          type: "invalid_request_error",
+          code: "thinking_signature_invalid"
+        }
+      }));
+      return;
+    }
     if (responseFailure === "delayed_completed") {
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
@@ -1081,6 +1092,58 @@ try {
     }
   }
 
+  // A provider/account/channel transition can make an earlier encrypted
+  // reasoning item unverifiable. The 400 arrives before any output, so retry
+  // once with the same normal Responses turn after removing only opaque
+  // encrypted/reasoning state. Preserve readable messages and tool history.
+  responseFailures.push("invalid_encrypted_content");
+  const beforeNormalEncryptedRepair = upstreamRequests.length;
+  await proxyRequest(proxyPort, "/responses", body);
+  const normalEncryptedRepairRequests = upstreamRequests.slice(beforeNormalEncryptedRepair);
+  if (normalEncryptedRepairRequests.length !== 2
+    || normalEncryptedRepairRequests.some((request) => request.authorization !== "Bearer vsllm-secret" || !request.url.endsWith("/responses"))) {
+    throw new Error(`normal invalid encrypted content should retry once on the same VSLLM Responses endpoint, got ${JSON.stringify(normalEncryptedRepairRequests)}`);
+  }
+  assertRequestAt(beforeNormalEncryptedRepair, {
+    label: "normal VSLLM encrypted first attempt",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: true,
+    expectedReasoningEffort: "xhigh"
+  });
+  assertRequestAt(beforeNormalEncryptedRepair + 1, {
+    label: "normal VSLLM plaintext repair",
+    bearer: "vsllm-secret",
+    acceptEncoding: "identity",
+    expectEncryptedContent: false,
+    expectReasoning: false,
+    expectedReasoningEffort: "xhigh"
+  });
+  const repairedNormalBody = JSON.parse(normalEncryptedRepairRequests[1].bodyText);
+  if (!repairedNormalBody.input.some((item) => item.type === "function_call" && item.call_id === "call_test")
+    || !repairedNormalBody.input.some((item) => item.type === "function_call_output" && item.call_id === "call_test")) {
+    throw new Error(`normal encrypted-content repair must preserve tool history, got ${normalEncryptedRepairRequests[1].bodyText}`);
+  }
+
+  responseFailures.push("invalid_encrypted_content", "invalid_encrypted_content");
+  const beforePersistentEncryptedFailure = upstreamRequests.length;
+  const persistentEncryptedFailure = await proxyAccountRawRequest(proxyPort, "vsllm", "/responses", body);
+  if (persistentEncryptedFailure.status !== 400
+    || upstreamRequests.length !== beforePersistentEncryptedFailure + 2) {
+    throw new Error(`persistent invalid encrypted content must stop after one pinned-account repair, got ${persistentEncryptedFailure.status} and ${upstreamRequests.length - beforePersistentEncryptedFailure} requests`);
+  }
+  await persistentEncryptedFailure.text();
+
+  setActive("apikey-openai");
+  responseFailures.push("invalid_encrypted_content");
+  const beforeNonOptedEncryptedFailure = upstreamRequests.length;
+  const nonOptedEncryptedFailure = await proxyRawRequest(proxyPort, "/responses", body);
+  if (nonOptedEncryptedFailure.status !== 400
+    || upstreamRequests.length !== beforeNonOptedEncryptedFailure + 1) {
+    throw new Error(`non-opted provider must not receive encrypted-content repair, got ${nonOptedEncryptedFailure.status} and ${upstreamRequests.length - beforeNonOptedEncryptedFailure} requests`);
+  }
+  setActive("apikey-vsllm");
+
   chatReasoningLevelFailures.push("max", "max");
   const beforeChatReasoningRetry = upstreamRequests.length;
   const chatReasoningRetry = await proxyRequest(proxyPort, "/chat/completions", {
@@ -1392,6 +1455,34 @@ try {
   }
   assertLatestRequest({ label: "vsllm native compact", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true, expectedReasoningEffort: "xhigh" });
   assertCompactResponseTextContent("vsllm native compact response", compactRes1);
+
+  compactFailures.push("invalid_encrypted_content");
+  const beforeVsllmEncryptedRepair = upstreamRequests.length;
+  const vsllmEncryptedRepair = await proxyRequest(proxyPort, "/responses/compact", body);
+  if (upstreamRequests.length !== beforeVsllmEncryptedRepair + 2) {
+    throw new Error(`expected vsllm invalid encrypted content to retry once with plaintext, got ${upstreamRequests.length - beforeVsllmEncryptedRepair} upstream requests`);
+  }
+  if (upstreamRequests.slice(beforeVsllmEncryptedRepair).some((request) => !request.url.endsWith("/responses/compact"))) {
+    throw new Error(`vsllm encrypted-content repair must preserve the compact endpoint, got ${JSON.stringify(upstreamRequests.slice(beforeVsllmEncryptedRepair))}`);
+  }
+  assertRequestAt(beforeVsllmEncryptedRepair, { label: "vsllm compact encrypted first attempt", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: true, expectedReasoningEffort: "xhigh" });
+  assertRequestAt(beforeVsllmEncryptedRepair + 1, { label: "vsllm compact plaintext repair", bearer: "vsllm-secret", acceptEncoding: "identity", expectEncryptedContent: false, expectReasoning: false, expectPlaintextCompactOnly: true, expectedReasoningEffort: "xhigh" });
+  assertCompactResponseTextContent("vsllm compact plaintext repair response", vsllmEncryptedRepair);
+
+  setActive("apikey-llmapi");
+  compactFailures.push("invalid_encrypted_content");
+  const beforeLlmapiEncryptedRepair = upstreamRequests.length;
+  const llmapiEncryptedRepair = await proxyRequest(proxyPort, "/responses/compact", body);
+  if (upstreamRequests.length !== beforeLlmapiEncryptedRepair + 2) {
+    throw new Error(`expected llmapi invalid encrypted content to retry once with plaintext, got ${upstreamRequests.length - beforeLlmapiEncryptedRepair} upstream requests`);
+  }
+  if (upstreamRequests.slice(beforeLlmapiEncryptedRepair).some((request) => !request.url.endsWith("/responses/compact"))) {
+    throw new Error(`llmapi encrypted-content repair must preserve the compact endpoint, got ${JSON.stringify(upstreamRequests.slice(beforeLlmapiEncryptedRepair))}`);
+  }
+  assertRequestAt(beforeLlmapiEncryptedRepair, { label: "llmapi compact encrypted first attempt", bearer: "llmapi-secret", acceptEncoding: "identity", expectEncryptedContent: true, expectedReasoningEffort: "xhigh" });
+  assertRequestAt(beforeLlmapiEncryptedRepair + 1, { label: "llmapi compact plaintext repair", bearer: "llmapi-secret", acceptEncoding: "identity", expectEncryptedContent: false, expectReasoning: false, expectPlaintextCompactOnly: true, expectedReasoningEffort: "xhigh" });
+  assertCompactResponseTextContent("llmapi compact plaintext repair response", llmapiEncryptedRepair);
+  setActive("apikey-vsllm");
 
   compactFailures.push("not_found");
   const beforeVsllmFallback = upstreamRequests.length;

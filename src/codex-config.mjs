@@ -225,7 +225,7 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: null,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: false
+      repairInvalidEncryptedContent: true
     };
   }
   if (normalized === "vsllm" || normalized === "vsllm.com" || normalized === "api.vsllm.com") {
@@ -235,7 +235,7 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: 55,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: false
+      repairInvalidEncryptedContent: true
     };
   }
   return null;

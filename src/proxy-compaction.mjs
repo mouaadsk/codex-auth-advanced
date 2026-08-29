@@ -431,12 +431,24 @@ export function isClaudeMessagesCompactionTarget(target, parsed) {
 }
 
 export function repairProviderProxyBodyPlaintext(target, body, headers = {}, options = {}) {
-  if (!target.repairInvalidEncryptedContent || !isCompactProxyTarget(target)) {
+  const compact = isCompactProxyTarget(target);
+  let responseShape = false;
+  try {
+    const pathname = new URL(target?.url || "").pathname.replace(/\/$/, "");
+    responseShape = pathname.endsWith("/responses") || pathname.endsWith("/chat/completions");
+  } catch {
+    responseShape = false;
+  }
+  if (!target.repairInvalidEncryptedContent || (!compact && !responseShape)) {
     return { body, repaired: false };
   }
   const stripped = stripEncryptedContentFromProxyBody(body, headers, {
     ...options,
-    plaintextOnlyCompact: true
+    // Native compact accepts a conversation transcript, so discard tool and
+    // control items there. A normal Responses turn still needs its readable
+    // messages and tool-call/tool-output pairs; only remove opaque encrypted
+    // state and reasoning items for that recovery request.
+    plaintextOnlyCompact: compact
   });
   return {
     body: stripped.body,

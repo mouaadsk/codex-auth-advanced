@@ -41,6 +41,7 @@ import {
   apiProviderTransientRetryReason,
   encodedClaudeGatewayModelId,
   encodedVsllmClaudeGatewayModelId,
+  isInvalidEncryptedContentBody,
   isModelCapacityResponseBody,
   isVsllmApiAccount,
   isVsllmClaudeGatewayModelId,
@@ -168,6 +169,9 @@ try {
   assert.equal(inferApiKeyTemplateName({ alias: "llmapi-main" }), "llmapi");
   assert.equal(inferApiKeyTemplateName({}, "https://llmapi.pro/v1"), "llmapi");
   assert.equal(apiKeyTemplate("llmapi")?.baseUrl, "https://llmapi.pro/v1");
+  assert.equal(apiKeyTemplate("llmapi")?.repairInvalidEncryptedContent, true);
+  assert.equal(apiKeyTemplate("vsllm")?.repairInvalidEncryptedContent, true);
+  assert.equal(isInvalidEncryptedContentBody({ error: { code: "thinking_signature_invalid" } }), true);
   assert.equal(isVsllmApiAccount({ alias: "llmapi" }, "https://llmapi.pro/v1/models"), true);
   assert.equal(isVsllmApiAccount({ alias: "custom-relay" }, "https://llmapi.pro/v1/models"), true);
 
@@ -730,6 +734,40 @@ try {
     role: "user",
     content: [{ type: "input_text", text: "keep this" }]
   }]);
+
+  const normalResponsesTarget = {
+    ...compactTarget,
+    url: "https://vsllm.com/v1/responses"
+  };
+  const normalRepaired = repairProviderProxyBodyPlaintext(
+    normalResponsesTarget,
+    Buffer.from(JSON.stringify(repairRequest))
+  );
+  const normalRepairedJson = JSON.parse(normalRepaired.body.toString("utf8"));
+  assert.equal(normalRepaired.repaired, true);
+  assert.equal(normalRepairedJson.input.some((item) => item.type === "reasoning"), false);
+  assert.equal(normalRepairedJson.input.some((item) => item.type === "message" && item.role === "user"), true);
+  assert.equal(normalRepairedJson.input.some((item) => item.type === "message" && item.role === "assistant" && item.content === undefined), false);
+
+  const normalChatTarget = {
+    ...compactTarget,
+    url: "https://vsllm.com/v1/chat/completions"
+  };
+  const normalChatRepaired = repairProviderProxyBodyPlaintext(
+    normalChatTarget,
+    Buffer.from(JSON.stringify({
+      model: "gpt-5.5",
+      messages: [{ role: "assistant", content: [{ type: "output_text", text: "readable" }], encrypted_content: "old-state" }]
+    }))
+  );
+  assert.equal(normalChatRepaired.repaired, true);
+  assert.equal(JSON.stringify(normalChatRepaired.body).includes("encrypted_content"), false);
+
+  const nonOptedResponsesRepair = repairProviderProxyBodyPlaintext(
+    { ...normalResponsesTarget, repairInvalidEncryptedContent: false },
+    Buffer.from(JSON.stringify(repairRequest))
+  );
+  assert.equal(nonOptedResponsesRepair.repaired, false);
 
   const compactResponse = {
     object: "response.compaction",
