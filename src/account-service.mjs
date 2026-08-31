@@ -216,7 +216,8 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
       upstreamBaseUrl,
       chatgpt: false,
       apiTemplate: template?.name || "openai",
-      repairInvalidEncryptedContent: template?.repairInvalidEncryptedContent === true
+      repairInvalidEncryptedContent: template?.repairInvalidEncryptedContent === true,
+      stripInternalMetadataPassthrough: template?.stripInternalMetadataPassthrough === true || account?.strip_internal_metadata_passthrough === true
     };
   }
 
@@ -401,13 +402,15 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     };
   }
 
+  // Auto-switch is gated on hard exhaustion only. The configured
+  // `threshold_5h_percent` / `threshold_weekly_percent` values are kept for
+  // backwards compatibility with existing registries and the `config auto`
+  // display, but they no longer trigger an automatic account flip. Switching
+  // on near-threshold usage was churning the active account every 30 s when
+  // the most-recently-used candidate happened to be different.
   function accountShouldAutoSwitch(account, registry) {
     if (!account) return false;
-    if (accountIsExhausted(account)) return true;
-    const thresholds = registryAutoThresholds(registry);
-    const primary = accountRemainingPercent(account, "primary");
-    const secondary = accountRemainingPercent(account, "secondary");
-    return (primary != null && primary <= thresholds.primary) || (secondary != null && secondary <= thresholds.secondary);
+    return accountIsExhausted(account);
   }
 
   function accountIsSwitchCandidate(account) {
@@ -416,6 +419,23 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
 
   function accountSortTime(account) {
     return Number(account.last_used_at || account.created_at || 0);
+  }
+
+  // Lower is better. Missing usage counts as 0% (freshest possible) so an
+  // account we have never observed is preferred over one we have already
+  // loaded.
+  function accountUsagePercent(account) {
+    const primary = Number(account?.last_usage?.primary?.used_percent);
+    return Number.isFinite(primary) ? primary : 0;
+  }
+
+  // Order candidates by usage ascending (best first), then by last_used_at
+  // ascending (oldest first) so the daemon rotates fairly instead of
+  // re-picking the same account every cycle.
+  function compareSwitchCandidates(a, b) {
+    const byUsage = accountUsagePercent(a) - accountUsagePercent(b);
+    if (byUsage !== 0) return byUsage;
+    return accountSortTime(a) - accountSortTime(b);
   }
 
   function sortedRegistryAccounts(registry) {
@@ -632,8 +652,9 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
   function firstUsableSwitchCandidate(registry, { preferredAuthMode = null, excludeAccountKeys = null } = {}) {
     const active = activeAccountKeyFromRegistry(registry);
     const excluded = new Set(excludeAccountKeys || []);
-    const candidates = sortedRegistryAccounts(registry)
-      .filter((account) => account.account_key !== active && !excluded.has(account.account_key) && accountIsSwitchCandidate(account));
+    const candidates = [...registry.accounts]
+      .filter((account) => account.account_key !== active && !excluded.has(account.account_key) && accountIsSwitchCandidate(account))
+      .sort(compareSwitchCandidates);
     if (preferredAuthMode) {
       const preferred = candidates.find((account) => account.auth_mode === preferredAuthMode);
       if (preferred) return preferred;
@@ -670,9 +691,11 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     accountUsageLabel,
     accountIsExhausted,
     accountRemainingPercent,
+    accountUsagePercent,
     registryAutoThresholds,
     accountShouldAutoSwitch,
     sortedRegistryAccounts,
+    compareSwitchCandidates,
     findAccountForSwitch,
     reconcileRegistryActiveAccount,
     switchToStoredAccount,

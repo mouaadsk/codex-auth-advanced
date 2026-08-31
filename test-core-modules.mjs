@@ -49,7 +49,8 @@ import {
   parseVsllmSubscriptionSelf,
   remappedProxyRequestModel,
   resolvedClaudeGatewayModelId,
-  rollingApiSpendFromTotal
+  rollingApiSpendFromTotal,
+  shouldStripInternalMetadata
 } from "./src/provider-policy.mjs";
 import {
   compactionChannelProbeMaxRetries,
@@ -65,7 +66,8 @@ import {
 import {
   decodeRemoteCompactionV2Summary,
   encodeRemoteCompactionV2Summary,
-  rewriteProviderProxyRequestBody
+  rewriteProviderProxyRequestBody,
+  stripInternalMetadataFromJson
 } from "./src/proxy-body-transforms.mjs";
 import { createProviderProxy, modelCapacityRetryDelay } from "./src/provider-proxy.mjs";
 import { createAccountService } from "./src/account-service.mjs";
@@ -440,6 +442,78 @@ try {
   assert.equal(rewrittenJson.model, "gpt-5.5");
   assert.equal(rewrittenJson.client_metadata, undefined);
   assert.equal(rewrittenJson.reasoning.effort, "xhigh");
+
+  // Verify internal metadata stripping for VSLLM and compatible providers:
+  const strippedMetadata = stripInternalMetadataFromJson({
+    model: "gpt-5.6-sol",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hello world" }],
+        internal_chat_message_metadata_passthrough: {
+          content_item_kinds: ["user.text"]
+        },
+        internal_message_id: "msg_123"
+      }
+    ]
+  });
+  assert.equal(strippedMetadata.changed, true);
+  assert.equal(strippedMetadata.value.input[0].internal_chat_message_metadata_passthrough, undefined);
+  assert.equal(strippedMetadata.value.input[0].internal_message_id, undefined);
+  assert.equal(strippedMetadata.value.input[0].role, "user");
+  assert.deepEqual(strippedMetadata.value.input[0].content, [{ type: "input_text", text: "hello world" }]);
+
+  // shouldStripInternalMetadata policy check:
+  assert.equal(shouldStripInternalMetadata({ apiTemplate: "vsllm" }), true);
+  assert.equal(shouldStripInternalMetadata({ apiTemplate: "llmapi" }), true);
+  assert.equal(shouldStripInternalMetadata({ apiTemplate: "openai", account: { alias: "openai" } }), false);
+  assert.equal(apiKeyTemplate("vsllm")?.stripInternalMetadataPassthrough, true);
+  assert.equal(apiKeyTemplate("openai")?.stripInternalMetadataPassthrough, false);
+
+  // Environment variable override checks:
+  const origEnvStrip = process.env.CODEX_AUTH_ADVANCED_STRIP_INTERNAL_METADATA;
+  try {
+    process.env.CODEX_AUTH_ADVANCED_STRIP_INTERNAL_METADATA = "0";
+    assert.equal(shouldStripInternalMetadata({ apiTemplate: "vsllm" }), false);
+    const passThroughBody = rewriteProviderProxyRequestBody(
+      { apiTemplate: "vsllm", account: { alias: "vsllm" } },
+      Buffer.from(JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{
+          type: "message",
+          role: "user",
+          content: "test",
+          internal_chat_message_metadata_passthrough: { content_item_kinds: ["user.text"] }
+        }]
+      }))
+    );
+    const passThroughJson = JSON.parse(passThroughBody.body.toString("utf8"));
+    assert.ok(passThroughJson.input[0].internal_chat_message_metadata_passthrough);
+
+    process.env.CODEX_AUTH_ADVANCED_STRIP_INTERNAL_METADATA = "1";
+    assert.equal(shouldStripInternalMetadata({ apiTemplate: "openai", account: { alias: "openai" } }), true);
+    const strippedOpenAiBody = rewriteProviderProxyRequestBody(
+      { apiTemplate: "openai", account: { alias: "openai" } },
+      Buffer.from(JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{
+          type: "message",
+          role: "user",
+          content: "test",
+          internal_chat_message_metadata_passthrough: { content_item_kinds: ["user.text"] }
+        }]
+      }))
+    );
+    const strippedOpenAiJson = JSON.parse(strippedOpenAiBody.body.toString("utf8"));
+    assert.equal(strippedOpenAiJson.input[0].internal_chat_message_metadata_passthrough, undefined);
+  } finally {
+    if (origEnvStrip !== undefined) {
+      process.env.CODEX_AUTH_ADVANCED_STRIP_INTERNAL_METADATA = origEnvStrip;
+    } else {
+      delete process.env.CODEX_AUTH_ADVANCED_STRIP_INTERNAL_METADATA;
+    }
+  }
 
   // VSLLM/New API can select a channel whose reasoning-level list is narrower
   // than another channel serving the same model. Keep the requested high-end
@@ -934,6 +1008,103 @@ try {
   );
   assert.equal(accountService.accountShouldAutoSwitch(exhaustedAccount, { auto_switch: { enabled: true } }), true);
 
+  // Auto-switch gates on exhaustion only — a near-threshold active account
+  // (6% remaining, exactly at the configured threshold) must NOT flip.
+  assert.equal(
+    accountService.accountShouldAutoSwitch(
+      { ...fallbackAccount, last_usage: { primary: { used_percent: 94 }, secondary: { used_percent: 95 } } },
+      { auto_switch: { enabled: true, threshold_5h_percent: 6, threshold_weekly_percent: 5 } }
+    ),
+    false
+  );
+  // But a 100%-used account still flips.
+  assert.equal(
+    accountService.accountShouldAutoSwitch(
+      { ...fallbackAccount, last_usage: { primary: { used_percent: 100 } } },
+      { auto_switch: { enabled: true } }
+    ),
+    true
+  );
+
+  // Candidate ordering: lowest usage wins even when another candidate was
+  // used more recently (regression test for the vsllm-2 → llmapi flip where
+  // the idle vsllm account lost to the busier llmapi account).
+  const orderingRegistry = {
+    active_account_key: "apikey-active",
+    auto_switch: { enabled: true },
+    accounts: [
+      { account_key: "apikey-active", alias: "active", auth_mode: "apikey", created_at: 10 },
+      {
+        account_key: "apikey-recent-busy",
+        alias: "recent-busy",
+        auth_mode: "apikey",
+        created_at: 20,
+        last_used_at: 1000,
+        last_usage: { primary: { used_percent: 69 } }
+      },
+      {
+        account_key: "apikey-stale-idle",
+        alias: "stale-idle",
+        auth_mode: "apikey",
+        created_at: 30,
+        last_used_at: 100,
+        last_usage: { primary: { used_percent: 0 } }
+      }
+    ]
+  };
+  assert.equal(
+    accountService.firstUsableSwitchCandidate(orderingRegistry).account_key,
+    "apikey-stale-idle"
+  );
+
+  // Tie on usage: the oldest last_used_at wins so the daemon rotates fairly
+  // instead of re-picking the same account every cycle.
+  const tieRegistry = {
+    active_account_key: "apikey-active",
+    auto_switch: { enabled: true },
+    accounts: [
+      { account_key: "apikey-active", auth_mode: "apikey", created_at: 10 },
+      { account_key: "apikey-recent", auth_mode: "apikey", created_at: 20, last_used_at: 2000 },
+      { account_key: "apikey-old", auth_mode: "apikey", created_at: 30, last_used_at: 50 }
+    ]
+  };
+  assert.equal(
+    accountService.firstUsableSwitchCandidate(tieRegistry).account_key,
+    "apikey-old"
+  );
+
+  // preferredAuthMode still filters after sorting: a matching-mode candidate
+  // wins even when another mode has lower usage.
+  const modeRegistry = {
+    active_account_key: "apikey-active",
+    auto_switch: { enabled: true },
+    accounts: [
+      { account_key: "apikey-active", auth_mode: "apikey", created_at: 10 },
+      {
+        account_key: "chatgpt-idle",
+        auth_mode: "chatgpt",
+        created_at: 20,
+        last_used_at: 10,
+        last_usage: { primary: { used_percent: 0 } }
+      },
+      {
+        account_key: "apikey-busy",
+        auth_mode: "apikey",
+        created_at: 30,
+        last_used_at: 20,
+        last_usage: { primary: { used_percent: 50 } }
+      }
+    ]
+  };
+  assert.equal(
+    accountService.firstUsableSwitchCandidate(modeRegistry, { preferredAuthMode: "apikey" }).account_key,
+    "apikey-busy"
+  );
+  assert.equal(
+    accountService.firstUsableSwitchCandidate(modeRegistry).account_key,
+    "chatgpt-idle"
+  );
+
   writeJsonFile(path.join(serviceAccountsDir, `${fallbackAccount.account_key}.auth.json`), {
     auth_mode: "apikey",
     OPENAI_API_KEY: "fallback-secret",
@@ -1193,7 +1364,11 @@ try {
   writeJsonFile(path.join(serviceAccountsDir, "registry.json"), {
     active_account_key: exhaustedAccount.account_key,
     auto_switch: { enabled: true },
-    accounts: [activeAccount, exhaustedAccount, fallbackAccount]
+    accounts: [
+      { ...activeAccount, last_usage: { primary: { used_percent: 40 } } },
+      exhaustedAccount,
+      { ...fallbackAccount, last_usage: { primary: { used_percent: 5 } } }
+    ]
   });
   const daemonEvents = [];
   const daemonAccountService = {
