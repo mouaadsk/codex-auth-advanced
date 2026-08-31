@@ -132,6 +132,62 @@ export function modelCapacityRetryDelay(response, retryNumber, baseDelayMs) {
   return Math.min(maxModelCapacityRetryDelayMs, bounded + Math.floor(Math.random() * (jitterMax + 1)));
 }
 
+// Extract session-correlation fields from a Codex CLI request so log lines
+// can be tied back to a specific /Users/mouaad-mac/.codex/sessions/<date>/rollout-<id>.jsonl.
+//
+// Codex CLI does NOT send an x-codex-session-id header. The session id only
+// appears in the local JSONL filename. The body, however, carries the turn
+// id in input[*].internal_chat_message_metadata_passthrough.turn_id, and
+// the workspace cwd is encoded in the URL path (decoded into route.codexHome
+// by providerProxyRouteFromIncoming). Together those let an investigator
+// find the matching rollout file via:
+//   ~/.codex/sessions/<year>/<month>/<day>/rollout-<id>.jsonl
+//
+// Returns { codexHome, sessionId, turnId }. Never throws — invalid bodies
+// just yield nulls so log enrichment stays best-effort and never blocks a
+// real upstream call.
+export function extractCodexRequestCorrelation(body, route) {
+  const codexHome = typeof route?.codexHome === "string" ? route.codexHome : null;
+  const sessionId = null; // Codex CLI does not transmit this.
+  let turnId = null;
+  if (body == null) return { codexHome, sessionId, turnId };
+  try {
+    const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
+    if (!text) return { codexHome, sessionId, turnId };
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed?.input)) {
+      // Walk in reverse so the most recent turn id wins (assistant turns
+      // typically sit at the tail of input[]).
+      for (let i = parsed.input.length - 1; i >= 0; i -= 1) {
+        const meta = parsed.input[i]?.internal_chat_message_metadata_passthrough;
+        const candidate = typeof meta?.turn_id === "string" ? meta.turn_id : null;
+        if (candidate) {
+          turnId = candidate;
+          break;
+        }
+      }
+    }
+  } catch {
+    // Body is not JSON (e.g. non-decoded upstream request body) — leave
+    // turnId null. This is best-effort logging, not a parsing contract.
+  }
+  return { codexHome, sessionId, turnId };
+}
+
+// Build the suffix appended to proxy log lines so operators can grep by
+// session/turn. Format is stable and easy to parse:
+//   " codex_home=/Users/mouaad-mac/.codex turn=<id>"
+// When turnId is missing, only the codex_home is appended (still useful for
+// multi-codex-home setups).
+export function codexCorrelationLogSuffix(correlation) {
+  if (!correlation) return "";
+  const parts = [];
+  if (correlation.codexHome) parts.push(`codex_home=${correlation.codexHome}`);
+  if (correlation.turnId) parts.push(`turn=${correlation.turnId}`);
+  if (correlation.sessionId) parts.push(`session=${correlation.sessionId}`);
+  return parts.length ? ` | ${parts.join(" ")}` : "";
+}
+
 export function createProviderProxy(options) {
   const providerProxyHost = options.host;
   const providerProxyPort = options.port;
@@ -552,6 +608,11 @@ export function createProviderProxy(options) {
       }
       let body = await readProxyRequestBody(req);
       let upstream = null;
+      // Compute Codex session correlation once per request so the [Proxy Request]
+      // log line can be tied back to ~/.codex/sessions/.../rollout-<id>.jsonl.
+      // Best-effort: helpers never throw on malformed bodies.
+      const codexCorrelation = extractCodexRequestCorrelation(body, route);
+      const codexCorrelationSuffix = codexCorrelationLogSuffix(codexCorrelation);
       const originalSourceBody = body;
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
@@ -714,7 +775,7 @@ export function createProviderProxy(options) {
             : target.chatgpt
               ? "ChatGPT account"
               : "API provider";
-        console.log(`[Proxy Request] ${req.method} ${req.url} -> ${targetLabel}: ${target.url}`);
+        console.log(`[Proxy Request] ${req.method} ${req.url} -> ${targetLabel}: ${target.url}${codexCorrelationSuffix}`);
 
         if (remoteCompactionV2
           && !target.chatgpt
@@ -755,10 +816,10 @@ export function createProviderProxy(options) {
         } catch (err) {
           fetchError = err;
           if (err?.code === upstreamHeaderStallErrorCode) {
-            console.warn(`[Proxy Stream] ${req.url} stalled before upstream headers on ${targetLabel}; treating it as a transient 524.`);
+            console.warn(`[Proxy Stream] ${req.url} stalled before upstream headers on ${targetLabel}; treating it as a transient 524.${codexCorrelationSuffix}`);
             upstream = upstreamHeaderStallResponse(target);
           } else if (!target.chatgpt && !target.officialAnthropic) {
-            console.warn(`[Proxy] ${req.url} failed before upstream headers on ${targetLabel}; treating it as a transient 502 (${err?.cause?.code || err?.code || err?.message || err}).`);
+            console.warn(`[Proxy] ${req.url} failed before upstream headers on ${targetLabel}; treating it as a transient 502 (${err?.cause?.code || err?.code || err?.message || err}).${codexCorrelationSuffix}`);
             upstream = upstreamFetchFailureResponse(target, err);
           } else {
             fetchFailed = true;
