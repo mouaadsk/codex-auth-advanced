@@ -333,7 +333,11 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
       excludeAccountKeys: options.excludeAccountKeys
     });
     if (!candidate) return false;
-    await switchToStoredAccount(codexHome, candidate);
+    await switchToStoredAccount(codexHome, candidate, {
+      reason: "auto-exhausted",
+      status,
+      classify: options.exhaustionReason || account?.api_exhausted_reason || undefined
+    });
     return true;
   }
 
@@ -575,7 +579,15 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
     return { account: null, ambiguous: false };
   }
 
-  async function switchToStoredAccount(codexHome, account) {
+  async function switchToStoredAccount(codexHome, account, options = {}) {
+    // `reason` is operator-facing only: it tells log readers whether a switch
+    // was a deliberate user command (`manual`), the auto-switch daemon firing
+    // on hard exhaustion (`auto-exhausted`), or the proxy recovering after a
+    // classified upstream exhaustion. Anything else falls back to `manual`
+    // so we never silently downgrade a real auto-exhausted event. The
+    // existing `Switched to <alias>.` line is preserved for backwards
+    // compatibility with anything that greps for it.
+    const reason = options.reason === "auto-exhausted" ? "auto-exhausted" : "manual";
     const registryFile = registryPath(codexHome);
     const registry = readJsonFile(registryFile);
     const storedAccount = accountForKey(registry, account?.account_key);
@@ -633,6 +645,14 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
       fs.chmodSync(rootAuthPath, 0o600);
     }
 
+    // Capture the previous active key BEFORE synchronizeActiveAccountMetadata
+    // rewrites it so the structured [Account Switch] line below shows the
+    // real source account. After this point the registry already points at
+    // the new account.
+    const previousActiveKey = registry ? activeAccountKeyFromRegistry(registry) : null;
+    const previousActiveAccount = registry ? accountForKey(registry, previousActiveKey) : null;
+    const fromLabel = previousActiveAccount ? accountLabel(previousActiveAccount) : "(none)";
+
     if (registry && Array.isArray(registry.accounts)) {
       synchronizeActiveAccountMetadata(registry, account.account_key);
       registry.active_account_activated_at_ms = Date.now();
@@ -641,6 +661,18 @@ export function createAccountService({ providerProxy, chatgptCodexBaseUrl }) {
       writeJsonFile(registryFile, registry);
       fs.chmodSync(registryFile, 0o600);
     }
+
+    // Structured, machine-parseable switch breadcrumb. Kept alongside the
+    // legacy `Switched to <alias>.` line so existing log readers keep
+    // working. Optional `status=` and `classify=` fields appear only when
+    // the caller supplies them (proxy recovery passes both).
+    const extras = [];
+    if (Number.isFinite(Number(options.status))) extras.push(`status=${Number(options.status)}`);
+    if (typeof options.classify === "string" && options.classify.length > 0) extras.push(`classify=${options.classify}`);
+    const extraSegment = extras.length ? ` ${extras.join(" ")}` : "";
+    process.stdout.write(
+      `[Account Switch] origin=${reason} from=${fromLabel} to=${accountLabel(account)} at_ms=${Date.now()}${extraSegment}\n`
+    );
     process.stdout.write(`Switched to ${accountLabel(account)}.\n`);
   }
 

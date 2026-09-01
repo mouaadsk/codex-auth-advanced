@@ -340,7 +340,11 @@ export function createCliService({
     // Copy any shared per-account config only after the user has made an
     // explicit selection. Opening and cancelling the picker remains read-only.
     syncMissingApiKeyConfigsAllGroups();
-    await switchToStoredAccount(codexHome, account);
+    // `manual` covers the direct `switch <query>` command, the interactive
+    // picker, and `handleLiveStoredSwitch --auto`. All three are
+    // operator-initiated and should log `origin=manual` so they are
+    // distinguishable from the auto-switch daemon's `auto-exhausted` flips.
+    await switchToStoredAccount(codexHome, account, { reason: "manual" });
   }
 
   function renderSwitchRows(accounts, activeAccountKey, { includeExhausted = true } = {}) {
@@ -779,7 +783,10 @@ export function createCliService({
     if (!accountShouldAutoSwitch(active, registry)) return;
     const candidate = firstUsableSwitchCandidate(registry, { preferredAuthMode: active?.auth_mode || null });
     if (!candidate) return;
-    await switchToStoredAccount(group.codexHome, candidate);
+    // The cycle only fires when `accountShouldAutoSwitch` is true, which is
+    // strictly hard exhaustion. Mark this as `auto-exhausted` so log readers
+    // can tell a daemon cycle flip apart from a manual `switch <query>`.
+    await switchToStoredAccount(group.codexHome, candidate, { reason: "auto-exhausted" });
   }
 
   async function runAutoSwitchCycle() {

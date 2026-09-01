@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -205,6 +206,16 @@ export function codexCorrelationLogSuffix(correlation) {
     parts.push(`thread="${safe}"`);
   }
   return parts.length ? ` | ${parts.join(" ")}` : "";
+}
+
+// Format a per-request `req_id=<uuid>` fragment so every [Proxy …] log line
+// for a single inbound request can be grouped by a stable handle. Codex CLI
+// does not send `x-codex-session-id` and `/v1/messages` bodies carry no
+// turn_id, so the request id is the only way to correlate lines that are
+// anonymous under `codexCorrelationLogSuffix` alone (e.g. all Claude
+// `/v1/messages` traffic).
+export function requestIdLogFragment(requestId) {
+  return typeof requestId === "string" && requestId.length > 0 ? ` req_id=${requestId}` : "";
 }
 
 // Look up a human-readable thread name for a session id. Codex CLI keeps a
@@ -874,6 +885,14 @@ export function createProviderProxy(options) {
         : new Map();
       const codexCorrelation = extractCodexRequestCorrelation(body, route, codexSessionIndex);
       const codexCorrelationSuffix = codexCorrelationLogSuffix(codexCorrelation);
+      // Per-request UUID so every [Proxy …] log line emitted on this
+      // request's path can be grouped by a stable handle, even when the
+      // body carries no turn id (e.g. /v1/messages translations have
+      // internal_chat_message_metadata_passthrough stripped, see
+      // proxy-body-transforms.mjs). Scoped to this closure so concurrent
+      // requests never share a handle.
+      const requestId = randomUUID();
+      const requestIdSuffix = requestIdLogFragment(requestId);
       const originalSourceBody = body;
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
@@ -896,7 +915,7 @@ export function createProviderProxy(options) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = rewrittenBody.decoded === true;
         if (isCompactProxyTarget(target)) {
-          console.log("[Proxy] Rewrote compact request body for provider compatibility.");
+          console.log(`[Proxy] Rewrote compact request body for provider compatibility.${codexCorrelationSuffix}${requestIdSuffix}`);
         }
       } else if (rewrittenBody.decoded) {
         body = rewrittenBody.body;
@@ -955,7 +974,7 @@ export function createProviderProxy(options) {
         target = claudeResponsesBridge.target;
         body = claudeResponsesBridge.body;
         bodyAlreadyDecoded = true;
-        console.log(`[Proxy] Bridging Claude Messages model ${claudeResponsesBridge.originalRequest.model} through OpenAI Responses.`);
+        console.log(`[Proxy] Bridging Claude Messages model ${claudeResponsesBridge.originalRequest.model} through OpenAI Responses.${codexCorrelationSuffix}${requestIdSuffix}`);
       }
       // Universal endpoint chain: detect the wire shape the client sent and
       // walk per-account shape plans on transport failures before considering
@@ -1036,13 +1055,13 @@ export function createProviderProxy(options) {
             : target.chatgpt
               ? "ChatGPT account"
               : "API provider";
-        console.log(`[Proxy Request] ${req.method} ${req.url} -> ${targetLabel}: ${target.url}${codexCorrelationSuffix}`);
+        console.log(`[Proxy Request] ${req.method} ${req.url} -> ${targetLabel}: ${target.url}${codexCorrelationSuffix}${requestIdSuffix}`);
 
         if (remoteCompactionV2
           && !target.chatgpt
           && !target.officialAnthropic
           && claudeResponsesBridge?.kind !== "responses") {
-          console.log("[Proxy] Codex remote compaction v2 detected; generating a provider-compatible local summary.");
+          console.log(`[Proxy] Codex remote compaction v2 detected; generating a provider-compatible local summary.${codexCorrelationSuffix}${requestIdSuffix}`);
           let localCompacted = await runLocalCompactionFallbackAcrossAccounts(
             target,
             body,
@@ -1059,7 +1078,7 @@ export function createProviderProxy(options) {
           );
           if (!localCompacted) {
             const reason = describeCompactionFailure(target);
-            console.warn(`[Proxy] Remote compaction v2 fallback failed: ${reason}; leaving the original request intact.`);
+            console.warn(`[Proxy] Remote compaction v2 fallback failed: ${reason}; leaving the original request intact.${codexCorrelationSuffix}${requestIdSuffix}`);
             return writeProxyError(res, 502, `Provider-compatible summarization failed: ${reason}; compaction was not applied.`);
           }
           upstream = localCompacted;
@@ -1077,10 +1096,10 @@ export function createProviderProxy(options) {
         } catch (err) {
           fetchError = err;
           if (err?.code === upstreamHeaderStallErrorCode) {
-            console.warn(`[Proxy Stream] ${req.url} stalled before upstream headers on ${targetLabel}; treating it as a transient 524.${codexCorrelationSuffix}`);
+            console.warn(`[Proxy Stream] ${req.url} stalled before upstream headers on ${targetLabel}; treating it as a transient 524.${codexCorrelationSuffix}${requestIdSuffix}`);
             upstream = upstreamHeaderStallResponse(target);
           } else if (!target.chatgpt && !target.officialAnthropic) {
-            console.warn(`[Proxy] ${req.url} failed before upstream headers on ${targetLabel}; treating it as a transient 502 (${err?.cause?.code || err?.code || err?.message || err}).${codexCorrelationSuffix}`);
+            console.warn(`[Proxy] ${req.url} failed before upstream headers on ${targetLabel}; treating it as a transient 502 (${err?.cause?.code || err?.code || err?.message || err}).${codexCorrelationSuffix}${requestIdSuffix}`);
             upstream = upstreamFetchFailureResponse(target, err);
           } else {
             fetchFailed = true;
@@ -1110,7 +1129,7 @@ export function createProviderProxy(options) {
               const delayMs = modelCapacityRetryDelay(upstream, retries, modelCapacityRetryBaseDelayMs);
               const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
               console.warn(
-                `[Proxy Stream] ${label} reported model capacity before output; retrying the exact same request in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).`
+                `[Proxy Stream] ${label} reported model capacity before output; retrying the exact same request in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).${codexCorrelationSuffix}${requestIdSuffix}`
               );
               try { await upstream.body?.cancel(); } catch {}
               await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -1118,7 +1137,7 @@ export function createProviderProxy(options) {
             }
             const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
             console.warn(
-              `[Proxy Stream] ${label} still reported model capacity after ${modelCapacityMaxRetries} retries; forwarding the terminal stream error without replaying partial output.`
+              `[Proxy Stream] ${label} still reported model capacity after ${modelCapacityMaxRetries} retries; forwarding the terminal stream error without replaying partial output.${codexCorrelationSuffix}${requestIdSuffix}`
             );
             // Keep the normal transient-failure path below active. It may try
             // another usable account for a default route, while pinned routes
@@ -1131,7 +1150,7 @@ export function createProviderProxy(options) {
         if (isCompactProxyTarget(target) && (fetchFailed
           || isRetryableCompactionStatus(upstream?.status)
           || [404, 405, 524].includes(upstream?.status))) {
-          console.log(`[Proxy] Compaction failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
+          console.log(`[Proxy] Compaction failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...${codexCorrelationSuffix}${requestIdSuffix}`);
           let localCompacted = await runLocalCompactionFallbackAcrossAccounts(
             target,
             body,
@@ -1147,7 +1166,7 @@ export function createProviderProxy(options) {
           );
           if (!localCompacted) {
             const reason = describeCompactionFailure(target);
-            console.warn(`[Proxy] Local compaction fallback failed during error handler: ${reason}; leaving the original request intact.`);
+            console.warn(`[Proxy] Local compaction fallback failed during error handler: ${reason}; leaving the original request intact.${codexCorrelationSuffix}${requestIdSuffix}`);
             return writeProxyError(res, 502, `Compaction summarization failed: ${reason}; compaction was not applied.`);
           }
           if (localCompacted) {
@@ -1157,7 +1176,7 @@ export function createProviderProxy(options) {
         }
 
         if (claudeMessagesCompaction && (fetchFailed || [502, 503, 504, 524].includes(upstream.status))) {
-          console.log(`[Proxy] Claude compaction request failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...`);
+          console.log(`[Proxy] Claude compaction request failed or timed out (fetchFailed: ${fetchFailed}, status: ${upstream?.status}, error: ${fetchError?.message}). Triggering local compaction fallback...${codexCorrelationSuffix}${requestIdSuffix}`);
           let localCompacted = await runLocalCompactionFallbackAcrossAccounts(
             target,
             body,
@@ -1172,7 +1191,7 @@ export function createProviderProxy(options) {
           );
           if (!localCompacted) {
             const reason = describeCompactionFailure(target);
-            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler: ${reason}; leaving the original request intact.`);
+            console.warn(`[Proxy] Local Claude compaction fallback failed during error handler: ${reason}; leaving the original request intact.${codexCorrelationSuffix}${requestIdSuffix}`);
             return writeProxyError(res, 502, `Compaction summarization failed: ${reason}; compaction was not applied.`);
           }
           if (localCompacted) {
@@ -1194,7 +1213,7 @@ export function createProviderProxy(options) {
             if (stripped.repaired) {
               const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
               const requestKind = isCompactProxyTarget(target) ? "compact request" : "Responses request";
-              console.warn(`[Proxy] ${label} rejected encrypted content; retrying the ${requestKind} once without opaque encrypted reasoning state.`);
+              console.warn(`[Proxy] ${label} rejected encrypted content; retrying the ${requestKind} once without opaque encrypted reasoning state.${codexCorrelationSuffix}${requestIdSuffix}`);
               try { await upstream.body?.cancel(); } catch {}
               body = stripped.body;
               bodyAlreadyDecoded = bodyAlreadyDecoded || stripped.decoded === true;
@@ -1244,7 +1263,7 @@ export function createProviderProxy(options) {
           if (retries < vsllmTransientUsageLimitMaxRetries) {
             transientUsageLimitRetries.set(accountKey, retries + 1);
             const label = target.account?.alias || target.account?.email || target.account?.account_key || "VSLLM";
-            console.warn(`[Proxy] ${label} returned a transient usage-limit response; retrying the same account.`);
+            console.warn(`[Proxy] ${label} returned a transient usage-limit response; retrying the same account.${codexCorrelationSuffix}${requestIdSuffix}`);
             await new Promise((resolve) => setTimeout(resolve, vsllmTransientUsageLimitRetryDelayMs));
             continue;
           }
@@ -1256,7 +1275,7 @@ export function createProviderProxy(options) {
             modelCapacityRetries.set(retryKey, retries + 1);
             const delayMs = modelCapacityRetryDelay(upstream, retries, modelCapacityRetryBaseDelayMs);
             const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
-            console.warn(`[Proxy] ${label} reported model capacity; retrying the same account in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).`);
+            console.warn(`[Proxy] ${label} reported model capacity; retrying the same account in ${delayMs}ms (${retries + 1}/${modelCapacityMaxRetries}).${codexCorrelationSuffix}${requestIdSuffix}`);
             try { await upstream.body?.cancel(); } catch {}
             await new Promise((resolve) => setTimeout(resolve, delayMs));
             continue;
@@ -1278,7 +1297,7 @@ export function createProviderProxy(options) {
           const nextShape = shapesForAccount[shapeCursor + 1];
           if (nextShape) {
             const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
-            console.warn(`[Proxy] ${label} returned status ${upstream?.status}; trying next wire shape ${shapeName(nextShape)}.`);
+            console.warn(`[Proxy] ${label} returned status ${upstream?.status}; trying next wire shape ${shapeName(nextShape)}.${codexCorrelationSuffix}${requestIdSuffix}`);
             // Compact requests need a special summarization call for non-Responses
             // shapes; the upstream does not understand the encrypted_content /
             // compaction_trigger envelope, so summarizeViaShape builds a fresh
@@ -1353,6 +1372,17 @@ export function createProviderProxy(options) {
             excludeAccountKeys: attemptedAccountKeys
           });
           if (transientTarget) {
+            // Distinct tag from `[Account Switch]` because no persistent
+            // switch happens here — the registry's active account is
+            // untouched. `request_only=true` makes that distinction
+            // grep-able and `req_id` ties the breadcrumb to every other
+            // [Proxy …] line for this same inbound request.
+            const transientFromLabel = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
+            const transientAccount = transientTarget.account || {};
+            const transientToLabel = transientAccount.alias || transientAccount.email || transientAccount.account_key || "provider";
+            console.warn(
+              `[Account Failover] origin=auto-transient from=${transientFromLabel} to=${transientToLabel} reason=${effectiveTransientRetryReason || "api_key_restriction"} request_only=true${requestIdSuffix}${codexCorrelationSuffix}`
+            );
             target = retargetClaudeResponsesBridge(transientTarget, claudeResponsesBridge);
             continue;
           }
@@ -1364,7 +1394,7 @@ export function createProviderProxy(options) {
         target = retargetClaudeResponsesBridge(newTarget, claudeResponsesBridge);
       }
 
-      console.log(`[Proxy Response] ${req.url} -> status: ${upstream.status}`);
+      console.log(`[Proxy Response] ${req.url} -> status: ${upstream.status}${codexCorrelationSuffix}${requestIdSuffix}`);
       // Per-shape response translation: when the chain walker retargeted a
       // Responses-source request to /v1/chat/completions or /v1/messages on
       // the same upstream, the response body is in the new shape's format.
@@ -1393,7 +1423,7 @@ export function createProviderProxy(options) {
             return;
           }
         } catch (e) {
-          console.warn(`[Proxy] shape response translation failed: ${e?.message || e}`);
+          console.warn(`[Proxy] shape response translation failed: ${e?.message || e}${codexCorrelationSuffix}${requestIdSuffix}`);
         }
       }
       if (!upstream.body) {
@@ -1525,7 +1555,7 @@ export function createProviderProxy(options) {
           if (stallFired || res.writableEnded) return;
           stallFired = true;
           stallWatchdogFired = true;
-          console.warn(`[Proxy Stream] ${req.url} stalled: no upstream bytes for ${streamStallWatchdogMs}ms; terminating with SSE error.`);
+          console.warn(`[Proxy Stream] ${req.url} stalled: no upstream bytes for ${streamStallWatchdogMs}ms; terminating with SSE error.${codexCorrelationSuffix}${requestIdSuffix}`);
           finishDiagnostics("upstream_stall");
           const stallEventText = `event: error\ndata: ${stallErrorPayload}\n\n`;
           // Write the SSE error event as a raw HTTP chunk directly to the
@@ -1567,7 +1597,7 @@ export function createProviderProxy(options) {
       }
       responseStream.pipe(res);
     } catch (error) {
-      console.error(`[Proxy Error] ${req.url} failed:`, error);
+      console.error(`[Proxy Error] ${req.url} failed:${codexCorrelationSuffix}${requestIdSuffix}`, error);
       writeProxyError(res, 502, `Provider proxy request failed: ${error?.message || error}`);
     }
   }
