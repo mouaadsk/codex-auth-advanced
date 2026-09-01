@@ -143,17 +143,23 @@ export function modelCapacityRetryDelay(response, retryNumber, baseDelayMs) {
 // find the matching rollout file via:
 //   ~/.codex/sessions/<year>/<month>/<day>/rollout-<id>.jsonl
 //
-// Returns { codexHome, sessionId, turnId }. Never throws — invalid bodies
-// just yield nulls so log enrichment stays best-effort and never blocks a
-// real upstream call.
-export function extractCodexRequestCorrelation(body, route) {
+// sessionIndex (optional) maps turn_id -> { sessionId, sessionFile,
+// threadName }. When supplied and the body exposes a turn_id, the helper
+// resolves the matching session id and (when known) the original thread
+// name from ~/.codex/session_index.jsonl so log lines carry both pieces.
+//
+// Returns { codexHome, sessionId, turnId, threadName }. Never throws —
+// invalid bodies just yield nulls so log enrichment stays best-effort and
+// never blocks a real upstream call.
+export function extractCodexRequestCorrelation(body, route, sessionIndex) {
   const codexHome = typeof route?.codexHome === "string" ? route.codexHome : null;
-  const sessionId = null; // Codex CLI does not transmit this.
+  let sessionId = null;
+  let threadName = null;
   let turnId = null;
-  if (body == null) return { codexHome, sessionId, turnId };
+  if (body == null) return { codexHome, sessionId, turnId, threadName };
   try {
     const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
-    if (!text) return { codexHome, sessionId, turnId };
+    if (!text) return { codexHome, sessionId, turnId, threadName };
     const parsed = JSON.parse(text);
     if (Array.isArray(parsed?.input)) {
       // Walk in reverse so the most recent turn id wins (assistant turns
@@ -171,21 +177,255 @@ export function extractCodexRequestCorrelation(body, route) {
     // Body is not JSON (e.g. non-decoded upstream request body) — leave
     // turnId null. This is best-effort logging, not a parsing contract.
   }
-  return { codexHome, sessionId, turnId };
+  if (turnId && sessionIndex && typeof sessionIndex.get === "function") {
+    const hit = sessionIndex.get(turnId);
+    if (hit) {
+      sessionId = hit.sessionId || null;
+      threadName = hit.threadName || null;
+    }
+  }
+  return { codexHome, sessionId, turnId, threadName };
 }
 
 // Build the suffix appended to proxy log lines so operators can grep by
 // session/turn. Format is stable and easy to parse:
-//   " codex_home=/Users/mouaad-mac/.codex turn=<id>"
-// When turnId is missing, only the codex_home is appended (still useful for
-// multi-codex-home setups).
+//   " codex_home=/Users/mouaad-mac/.codex turn=<id> session=<id>"
+// When the thread name is known it is appended last (quoted) so log readers
+// can spot human-meaningful sessions at a glance.
 export function codexCorrelationLogSuffix(correlation) {
   if (!correlation) return "";
   const parts = [];
   if (correlation.codexHome) parts.push(`codex_home=${correlation.codexHome}`);
   if (correlation.turnId) parts.push(`turn=${correlation.turnId}`);
   if (correlation.sessionId) parts.push(`session=${correlation.sessionId}`);
+  if (correlation.threadName) {
+    // Quote the thread name so embedded whitespace / quotes do not break log
+    // parsing. Escape any embedded double-quotes for grep safety.
+    const safe = String(correlation.threadName).replace(/"/g, "\\\"");
+    parts.push(`thread="${safe}"`);
+  }
   return parts.length ? ` | ${parts.join(" ")}` : "";
+}
+
+// Look up a human-readable thread name for a session id. Codex CLI keeps a
+// JSONL index at <codex_home>/session_index.jsonl where each line is
+// {"id":"<session id>","thread_name":"...","updated_at":"..."}. Best
+// effort: returns null on any I/O or parse failure.
+export function loadCodexThreadNames(codexHome) {
+  const map = new Map();
+  if (!codexHome) return map;
+  const indexPath = path.join(codexHome, "session_index.jsonl");
+  let text;
+  try {
+    text = fs.readFileSync(indexPath, "utf8");
+  } catch {
+    return map;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed);
+      const id = typeof entry?.id === "string" ? entry.id : null;
+      const name = typeof entry?.thread_name === "string" ? entry.thread_name : null;
+      if (id && name) map.set(id, name);
+    } catch {
+      // Skip malformed lines — the index is informational only.
+    }
+  }
+  return map;
+}
+
+// Build a turn_id -> { sessionId, threadName, sessionFile } index for the
+// local Codex session files under <codexHome>/sessions/. The index is
+// cached for cacheTtlMs (default 30s) so a burst of requests from the same
+// Codex session does not re-walk every JSONL.
+//
+// indexByCodexHome is a Map<codexHome, { builtAt, turns }> kept inside the
+// closure so concurrent requests for the same codexHome share one entry.
+// When cacheTtlMs <= 0 we always rebuild — useful for unit tests.
+export function createCodexSessionIndex(options = {}) {
+  const cacheTtlMs = Number.isFinite(options.cacheTtlMs) ? options.cacheTtlMs : 30_000;
+  const maxFiles = Number.isFinite(options.maxFiles) ? Math.max(1, options.maxFiles) : 500;
+  const indexByCodexHome = new Map();
+
+  async function build(codexHome) {
+    if (!codexHome) {
+      return { builtAt: Date.now(), turns: new Map() };
+    }
+    const sessionsRoot = path.join(codexHome, "sessions");
+    let dateDirs = [];
+    try {
+      dateDirs = fs.readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name)
+        .sort()
+        .reverse();
+    } catch {
+      return { builtAt: Date.now(), turns: new Map() };
+    }
+
+    const threadNames = loadCodexThreadNames(codexHome);
+    const turnMap = new Map();
+    let filesScanned = 0;
+
+    // Codex stores rollout files at <codex_home>/sessions/<YYYY>/<MM>/<DD>/rollout-<...>.jsonl.
+    // We walk all three levels because Codex rolls the day directory over
+    // at midnight UTC, so the same month/year can hold many day subdirs.
+    for (const yearDir of dateDirs) {
+      if (filesScanned >= maxFiles) break;
+      const yearPath = path.join(sessionsRoot, yearDir);
+      let monthDirs = [];
+      try {
+        monthDirs = fs.readdirSync(yearPath, { withFileTypes: true })
+          .filter((d) => d.isDirectory())
+          .map((d) => d.name)
+          .sort()
+          .reverse();
+      } catch {
+        continue;
+      }
+      for (const monthDir of monthDirs) {
+        if (filesScanned >= maxFiles) break;
+        const monthPath = path.join(yearPath, monthDir);
+        let dayDirs = [];
+        try {
+          dayDirs = fs.readdirSync(monthPath, { withFileTypes: true })
+            .filter((d) => d.isDirectory())
+            .map((d) => d.name)
+            .sort()
+            .reverse();
+        } catch {
+          continue;
+        }
+        for (const dayDir of dayDirs) {
+          if (filesScanned >= maxFiles) break;
+          const dayPath = path.join(monthPath, dayDir);
+          let files = [];
+          try {
+            files = (await fs.promises.readdir(dayPath, { withFileTypes: true }))
+              .filter((d) => d.isFile() && d.name.endsWith(".jsonl"))
+              .map((d) => d.name);
+          } catch {
+            continue;
+          }
+          // Newest mtime first so the most recent sessions populate the
+          // index first. mtime access lets us avoid keeping the dir
+          // scan sorted by name (which is only a proxy).
+          const fileEntries = await Promise.all(files.map(async (name) => {
+            const full = path.join(dayPath, name);
+            try {
+              const stat = await fs.promises.stat(full);
+              return { full, name, mtime: stat.mtimeMs };
+            } catch {
+              return null;
+            }
+          }));
+          const sortedFiles = fileEntries
+            .filter(Boolean)
+            .sort((a, b) => b.mtime - a.mtime);
+          for (const { full } of sortedFiles) {
+            if (filesScanned >= maxFiles) break;
+            filesScanned += 1;
+            // We could parse the session id from the filename, but the
+            // session_meta line is the source of truth.
+            // harvestSessionTurnIdsSync gives us both at once.
+            const turnIds = new Set();
+            const sessionId = await harvestSessionTurnIdsSync(full, turnIds);
+            if (!sessionId) continue;
+            const threadName = threadNames.get(sessionId) || null;
+            for (const tid of turnIds) {
+              // First-write wins. We walk newest first, so the most recent
+              // session claims a turn_id. Older duplicates are ignored —
+              // Codex never reuses a turn_id across sessions anyway.
+              if (!turnMap.has(tid)) {
+                turnMap.set(tid, { sessionId, sessionFile: full, threadName });
+              }
+            }
+            // Also map the sessionId itself so callers can resolve
+            // log lines that only carry a session id.
+            if (!turnMap.has(`session:${sessionId}`)) {
+              turnMap.set(`session:${sessionId}`, {
+                sessionId,
+                sessionFile: full,
+                threadName
+              });
+            }
+          }
+        }
+      }
+    }
+    return { builtAt: Date.now(), turns: turnMap };
+  }
+
+  return {
+    async get(codexHome) {
+      if (!codexHome) return new Map();
+      const now = Date.now();
+      const cached = indexByCodexHome.get(codexHome);
+      if (cached && now - cached.builtAt < cacheTtlMs) {
+        return cached.turns;
+      }
+      const entry = await build(codexHome);
+      indexByCodexHome.set(codexHome, entry);
+      return entry.turns;
+    },
+    invalidate(codexHome) {
+      if (codexHome) indexByCodexHome.delete(codexHome);
+      else indexByCodexHome.clear();
+    },
+    _entries: indexByCodexHome
+  };
+}
+
+// Synchronous variant of harvestSessionTurnIds so the build loop stays
+// simple. Codex rollout files can be ~80MB but they are line-delimited
+// and we only need session_meta (first line) plus every line that
+// contains a turn_id token. We use a streaming readline via createInterface
+// so we never materialize the full file in memory.
+function harvestSessionTurnIdsSync(filePath, turnIds) {
+  let sessionId = null;
+  let stream;
+  try {
+    stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  } catch {
+    return null;
+  }
+  let leftover = "";
+  return new Promise((resolve) => {
+    stream.on("data", (chunk) => {
+      leftover += chunk;
+      let idx;
+      while ((idx = leftover.indexOf("\n")) >= 0) {
+        const line = leftover.slice(0, idx);
+        leftover = leftover.slice(idx + 1);
+        if (sessionId == null) {
+          const sid = line.match(/"session_id"\s*:\s*"([^"]+)"/);
+          if (sid) sessionId = sid[1];
+        }
+        const tidRegex = /"turn_id"\s*:\s*"([^"]+)"/g;
+        let m;
+        while ((m = tidRegex.exec(line)) !== null) {
+          turnIds.add(m[1]);
+        }
+      }
+    });
+    stream.on("end", () => {
+      if (leftover) {
+        if (sessionId == null) {
+          const sid = leftover.match(/"session_id"\s*:\s*"([^"]+)"/);
+          if (sid) sessionId = sid[1];
+        }
+        const tidRegex = /"turn_id"\s*:\s*"([^"]+)"/g;
+        let m;
+        while ((m = tidRegex.exec(leftover)) !== null) {
+          turnIds.add(m[1]);
+        }
+      }
+      resolve(sessionId);
+    });
+    stream.on("error", () => resolve(sessionId));
+  });
 }
 
 export function createProviderProxy(options) {
@@ -243,10 +483,26 @@ export function createProviderProxy(options) {
   let providerProxyActiveRequests = 0;
   let providerProxyActiveUpgrades = 0;
 
-
-
-
-
+  // Lazy session-id index for the current proxy lifetime. Codex CLI does
+  // not transmit the session id on the wire — only the turn id (inside
+  // the request body) and the workspace cwd (in the URL path). We map
+  // turn_id -> sessionId/threadName by scanning
+  // ~/.codex/sessions/<date>/rollout-*.jsonl and matching against
+  // ~/.codex/session_index.jsonl. The index is cached per codexHome
+  // for 30s so a burst of requests from the same session does not
+  // re-walk every JSONL. Cache is built on first request and refreshed
+  // lazily on TTL expiry.
+  const codexSessionIndexCache = createCodexSessionIndex({ cacheTtlMs: 30_000 });
+  async function codexSessionIndexFor(codexHome) {
+    try {
+      return await codexSessionIndexCache.get(codexHome);
+    } catch {
+      // Any failure (permissions, missing dir, partial I/O) is non-fatal:
+      // we still log the codex_home + turn_id, we just lose the session
+      // id mapping.
+      return new Map();
+    }
+  }
 
   function providerProxyActiveOperationCount() {
     return providerProxyActiveRequests + providerProxyActiveUpgrades;
@@ -610,8 +866,13 @@ export function createProviderProxy(options) {
       let upstream = null;
       // Compute Codex session correlation once per request so the [Proxy Request]
       // log line can be tied back to ~/.codex/sessions/.../rollout-<id>.jsonl.
-      // Best-effort: helpers never throw on malformed bodies.
-      const codexCorrelation = extractCodexRequestCorrelation(body, route);
+      // Best-effort: helpers never throw on malformed bodies. The session
+      // index is fetched lazily so a missing codex_home (non-Codex request)
+      // or unreadable sessions directory is non-fatal.
+      const codexSessionIndex = route?.codexHome
+        ? await codexSessionIndexFor(route.codexHome)
+        : new Map();
+      const codexCorrelation = extractCodexRequestCorrelation(body, route, codexSessionIndex);
       const codexCorrelationSuffix = codexCorrelationLogSuffix(codexCorrelation);
       const originalSourceBody = body;
       const attemptedAccountKeys = new Set();
