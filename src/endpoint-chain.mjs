@@ -15,7 +15,9 @@ import {
   isAccountExhaustionStatus,
   supportedShapesForAccount,
   supportedShapesForModelWithProbe,
-  providerSlugForTarget
+  providerSlugForTarget,
+  isVsllmApiAccount,
+  vsllmModelDesignatedShape
 } from "./provider-policy.mjs";
 
 const SHAPE_PATHS = {
@@ -45,7 +47,7 @@ function shapeName(shape) {
 }
 
 function buildShapeAttempts({ sourceShape, account, isCompact, model = null, target = null }) {
-  const supported = supportedShapesForAccount(account);
+  const supported = supportedShapesForAccount(account, { target });
   // Key the per-model capability lookup by provider slug (e.g. "vsllm",
   // "llmapi") so the same model can have different capability sets on
   // different providers, and so probe results survive proxy restarts via
@@ -55,6 +57,28 @@ function buildShapeAttempts({ sourceShape, account, isCompact, model = null, tar
   const chain = endpointChainForSource(sourceShape);
   const attempts = [];
   const seen = new Set();
+
+  // For VSLLM / LLMAPI upstreams and non-compact requests, prioritize the
+  // officially designated endpoint wire shape per model family:
+  // - Gemini series -> v1beta (antigravity)
+  // - Claude series -> /v1/messages
+  // - OpenAI (GPT) series -> /v1/responses
+  // - Other models -> /v1/chat/completions
+  const isVsllmProvider = providerSlug === "vsllm" || providerSlug === "llmapi"
+    || (providerSlug === "unknown" && isVsllmApiAccount(account));
+  if (!isCompact && model && isVsllmProvider) {
+    const designated = vsllmModelDesignatedShape(model, sourceShape);
+    // The provider/model-family contract owns the first endpoint. A live
+    // probe is useful for pruning fallback shapes, but a transient or stale
+    // probe result must not suppress the designated route itself. Otherwise
+    // one bad capability sample can permanently reroute Codex GPT traffic
+    // from Responses through an incompatible bridge.
+    if (designated && supported.has(designated)) {
+      attempts.push(designated);
+      seen.add(designated);
+    }
+  }
+
   for (const shape of chain) {
     if (seen.has(shape)) continue;
     seen.add(shape);

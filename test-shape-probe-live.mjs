@@ -15,6 +15,8 @@ globalThis.fetch = async (url, init) => {
     return new Response(JSON.stringify({ error: "no-mock" }), { status: 500 });
   }
   if (behavior === "abort") { abortCount++; const e = new Error("aborted"); e.name = "AbortError"; throw e; }
+  if (behavior === "network-error") throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+  if (/^\d{3}$/.test(behavior)) return new Response("mock", { status: Number(behavior) });
   if (behavior === "200") return new Response(JSON.stringify({ ok: true }), { status: 200 });
   if (behavior === "404") return new Response("not found", { status: 404 });
   if (behavior === "405") return new Response("method not allowed", { status: 405 });
@@ -126,6 +128,44 @@ const vsllmAccount = {
   assert.equal(result1, null);
   const result2 = await probeModelShapes({ account: { upstream_base_url: "x" }, model: "x" });
   assert.equal(result2, null);
+}
+
+// OpenAI-style bases must not produce /v1/v1 endpoint paths.
+{
+  responses.clear();
+  responses.set("*", "404");
+  responses.set("POST /v1/responses", "200");
+  const result = await probeModelShapes({
+    account: { ...vsllmAccount, upstream_base_url: "https://example.test/v1/" },
+    model: "base-normalization"
+  });
+  assert.ok(result.has(WIRE_SHAPES.RESPONSES));
+  assert.equal(result.size, 1);
+}
+
+for (const status of [408, 425, 429, 502, 504, 524]) {
+  responses.clear();
+  responses.set("*", String(status));
+  const result = await probeModelShapes({ account: vsllmAccount, model: `transient-${status}` });
+  assert.equal(result.size, 4, `${status} must not prune endpoint capabilities`);
+}
+
+for (const failure of ["abort", "network-error"]) {
+  responses.clear();
+  responses.set("*", "200");
+  responses.set("POST /v1/responses", failure);
+  assert.equal(
+    await probeModelShapes({ account: vsllmAccount, model: "partial-failure" }),
+    null,
+    "partial transport failures must remain inconclusive"
+  );
+}
+
+{
+  responses.clear();
+  responses.set("*", "501");
+  const result = await probeModelShapes({ account: vsllmAccount, model: "unsupported" });
+  assert.equal(result.size, 0);
 }
 
 console.log("shape probe live ok");

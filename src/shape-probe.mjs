@@ -84,7 +84,10 @@ async function probeOneShape({ baseUrl, apiKey, model, shape, signal }) {
     ? antigravityPathFor(model)
     : SHAPE_PROBE_PATH[shape];
   if (!path) return { shape, supported: false, reason: "no-path" };
-  const url = `${baseUrl}${path}`;
+  // Both root origins and OpenAI-style /v1 bases are accepted. Gemini is
+  // rooted alongside /v1, not below it.
+  const normalizedBase = baseUrl.replace(/\/v1\/?$/, "");
+  const url = `${normalizedBase}${path}`;
   const body = SHAPE_PROBE_BODY[shape](model);
   try {
     const response = await fetch(url, {
@@ -122,19 +125,25 @@ async function probeOneShape({ baseUrl, apiKey, model, shape, signal }) {
     // body is wrong). The probe body is intentionally minimal so genuine
     // 400s are usually endpoint-shape rejections.
     if (status >= 200 && status < 300) return { shape, supported: true };
+    // A gateway outage is not evidence that a protocol is unsupported.
+    // Preserve the candidate conservatively so a temporary failure cannot
+    // prune a working fallback for the lifetime of the capability cache.
+    if ([408, 425, 429].includes(status) || (status >= 500 && status !== 501)) {
+      return { shape, supported: true, status, reason: "transient" };
+    }
     if (isShapeFallbackStatus(status, snippet ? safeJsonParse(snippet) : null)) {
       return { shape, supported: false, status, reason: "unsupported-shape" };
     }
-    // 5xx / transport: treat as supported (assume the endpoint exists; the
-    // chain walker will retry on transport failure anyway).
-    if (status >= 500) return { shape, supported: true, status, reason: "transient" };
+    if (status === 501) return { shape, supported: false, status, reason: "unsupported-shape" };
     // 400 with no recognizable unsupported pattern: assume unsupported
     // (the probe body is minimal; if it 400s the endpoint probably can't
     // serve this model).
     return { shape, supported: false, status, reason: "bad-request" };
   } catch (err) {
-    if (err?.name === "AbortError") return { shape, supported: false, reason: "timeout" };
-    return { shape, supported: false, reason: err?.code || err?.message || "fetch-failed" };
+    if (signal?.aborted || err?.name === "AbortError" || err?.name === "TimeoutError") {
+      return { shape, supported: false, reason: "timeout" };
+    }
+    return { shape, supported: false, reason: "fetch-failed" };
   }
 }
 
@@ -144,9 +153,8 @@ function safeJsonParse(text) {
 
 /**
  * Probe every wire shape the account supports for a given model.
- * Returns a Set of supported shapes. Empty set means the probe could not
- * determine support (e.g. all requests timed out); callers should treat
- * that as "no information" rather than "no shapes supported".
+ * Returns a Set of supported shapes, or null when transport failures make
+ * the result inconclusive. An empty Set means no candidate was supported.
  *
  * @param {object} options
  * @param {object} options.account      account object with upstream_base_url + api_key
@@ -177,12 +185,8 @@ export async function probeModelShapes({ account, model, target = null, timeoutM
     ));
     const supported2 = new Set();
     for (const r of results) if (r.supported) supported2.add(r.shape);
-    // If every probe returned unsupported we can't trust the result (it might
-    // mean the upstream is in a bad state rather than that the model has no
-    // shapes). Only return the set if at least one probe succeeded or all
-    // probes completed with a clear "unsupported-shape" verdict.
-    const allUnsupported = results.every((r) => !r.supported);
-    if (allUnsupported && results.some((r) => r.reason === "timeout" || r.reason === "fetch-failed" || r.reason === "transient")) {
+    // Never cache a partial capability set after a transport failure.
+    if (results.some((r) => r.reason === "timeout" || r.reason === "fetch-failed")) {
       return null; // inconclusive
     }
     return supported2;

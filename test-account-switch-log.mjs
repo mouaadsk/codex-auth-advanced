@@ -87,7 +87,13 @@ try {
     ""
   ].join("\n"));
 
-  const proxy = createProviderProxy({ ensureRunning: async () => true });
+  const proxy = createProviderProxy({
+    host: "127.0.0.1",
+    port: 47778,
+    prefix: "/_codex-auth-advanced"
+  });
+  // This unit test exercises account state, not process startup.
+  proxy.ensureRunning = async () => true;
   const accountService = createAccountService({
     providerProxy: proxy,
     chatgptCodexBaseUrl: "https://chatgpt.com/backend-api/codex"

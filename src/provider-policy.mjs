@@ -720,7 +720,14 @@ export function endpointChainForSource(sourceShape) {
 export function supportedShapesForAccount(account, options = {}) {
   const shapes = new Set();
   if (!account || typeof account !== "object") return shapes;
-  if (isVsllmApiAccount(account, options.endpoint)) {
+  const endpoint = options.endpoint
+    || options.target?.upstreamBaseUrl
+    || options.target?.url
+    || account?.upstream_base_url
+    || account?.upstreamBaseUrl
+    || account?.endpoint
+    || "";
+  if (isVsllmApiAccount(account, endpoint)) {
     // VSLLM historically advertises every wire shape on its gateway.
     shapes.add(WIRE_SHAPES.RESPONSES);
     shapes.add(WIRE_SHAPES.MESSAGES);
@@ -753,6 +760,42 @@ export function supportedShapesForAccount(account, options = {}) {
     }
   }
   return shapes;
+}
+
+// Officially designated endpoint shape per model series on VSLLM / LLMAPI:
+// - Gemini series: v1beta endpoint (/v1beta/models/...:generateContent)
+// - Claude series: /v1/messages
+// - OpenAI (GPT) series: /v1/responses
+// - Other models (GLM, Grok, DeepSeek, Qwen, etc.): /v1/chat/completions
+export function vsllmModelDesignatedShape(model, sourceShape = null) {
+  const raw = String(model || "").trim().toLowerCase();
+  if (!raw) return null;
+  const resolved = resolvedClaudeGatewayModelId(raw).toLowerCase();
+  const base = resolved.split(/[\[\(]/)[0];
+
+  if (base.startsWith("gemini") || base.includes("gemini")) {
+    return WIRE_SHAPES.ANTIGRAVITY;
+  }
+  if (base.startsWith("claude") || base.includes("claude") || base.startsWith("anthropic/")) {
+    return WIRE_SHAPES.MESSAGES;
+  }
+  if (
+    base.startsWith("gpt") ||
+    base.startsWith("o1") ||
+    base.startsWith("o3") ||
+    base.startsWith("o4") ||
+    base.startsWith("chatgpt") ||
+    base.startsWith("openai/")
+  ) {
+    if (sourceShape === WIRE_SHAPES.CHAT_COMPLETIONS) {
+      return WIRE_SHAPES.CHAT_COMPLETIONS;
+    }
+    if (sourceShape === WIRE_SHAPES.MESSAGES) {
+      return WIRE_SHAPES.MESSAGES;
+    }
+    return WIRE_SHAPES.RESPONSES;
+  }
+  return WIRE_SHAPES.CHAT_COMPLETIONS;
 }
 
 // Per-model static capability map for VSLLM. Some models only speak a
@@ -901,4 +944,28 @@ export function isShapeFallbackStatus(status, body) {
 
 export function isAccountExhaustionStatus(status, body, account = null) {
   return apiProviderExhaustionReason(status, body, account) != null;
+}
+
+export function shouldStripInternalMetadata(target = null, account = null) {
+  const env = String(process.env.CODEX_AUTH_ADVANCED_STRIP_INTERNAL_METADATA || "").trim().toLowerCase();
+  if (env === "0" || env === "false" || env === "off" || env === "no") return false;
+  if (env === "1" || env === "true" || env === "on" || env === "yes") return true;
+
+  if (target?.stripInternalMetadataPassthrough === true) return true;
+  if (target?.stripInternalMetadataPassthrough === false) return false;
+  if (account?.strip_internal_metadata_passthrough === true) return true;
+  if (account?.strip_internal_metadata_passthrough === false) return false;
+
+  const targetAccount = target?.account || account;
+  const endpoint = target?.upstreamBaseUrl || target?.url || "";
+  if (isVsllmApiAccount(targetAccount, endpoint)) {
+    return true;
+  }
+
+  const tpl = String(target?.apiTemplate || account?.api_template || "").trim().toLowerCase();
+  if (tpl === "vsllm" || tpl === "llmapi" || tpl === "tcdmx" || tpl === "codex-everywhere") {
+    return true;
+  }
+
+  return false;
 }

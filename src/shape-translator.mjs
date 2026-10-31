@@ -990,10 +990,8 @@ export function createShapeSseTransformStream(bridge) {
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary.length);
         const event = parseSseFrame(frame);
-        console.log(`[DEBUG sse transform] frameLen=${frame.length}, eventData=${event?.data?.choices?.[0]?.delta?.content || event?.data?.type || 'null'}`);
         if (event == null) continue;
         const out = inner(event);
-        console.log(`[DEBUG sse transform] outLen=${out?.length || 0}`);
         if (out) this.push(sseBytes(out));
       }
       callback();

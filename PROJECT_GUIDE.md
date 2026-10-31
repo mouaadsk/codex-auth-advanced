@@ -299,14 +299,14 @@ If the failure above happened on the active account but other same-group API-key
 
 ### Transient compaction retry policy
 
-Provider-compatible summarization is non-streaming and idempotent. Each shape receives one retry with the exact same account, endpoint, model, reasoning effort, transcript, headers, and JSON body when any of these occur:
+Provider-compatible summarization is non-streaming and idempotent. Each shape receives up to two transient retries (three total attempts) with the exact same account, endpoint, model, reasoning effort, transcript, headers, and JSON body when any of these occur:
 
 - A classified network/socket failure.
 - A local fetch or body-read timeout/abort.
 - HTTP 408 or 425.
 - HTTP 5xx, including Cloudflare 504 and 524.
 
-The Responses endpoint defaults to a 300-second (5-minute) per-attempt watchdog (configurable via `CODEX_AUTH_ADVANCED_COMPACTION_RESPONSES_TIMEOUT_MS` or `CODEX_AUTH_ADVANCED_COMPACTION_TIMEOUT_MS`); the Codex Chat Completions fallback defaults to a 240-second (4-minute) per-attempt watchdog (configurable via `CODEX_AUTH_ADVANCED_COMPACTION_COMPLETIONS_TIMEOUT_MS` or `CODEX_AUTH_ADVANCED_COMPACTION_TIMEOUT_MS`). Claude and generic shape summarizers use their call-site budgets. The retry count is bounded; after it is exhausted, the next compatible shape is attempted or the non-lossy 502 is returned.
+The Responses summarizer uses a 120-second per-attempt watchdog; the Codex Chat Completions fallback uses 30 seconds. Claude Chat Completions summarization uses 90 seconds and generic shape summarization uses 60 seconds. Retries retain the same per-attempt budget. These call-site budgets are not currently configurable through environment variables. After the bounded retry budget is exhausted, the next compatible shape is attempted or the non-lossy 502 is returned. The narrow VSLLM channel preflight-429 policy has a separate budget of three retries and does not classify ordinary quota exhaustion as transient.
 
 Do not apply this generic policy to normal streaming turns. A replay after partial output could duplicate work or tool calls.
 
@@ -320,7 +320,6 @@ Provider-compatible summarization is a non-streaming, idempotent one-shot call, 
 
 The fallback is compaction-only. Normal chat routing, account switching, exhaustion mutation, and pinned routes are unaffected. Pinned proxy URLs (e.g. `accounts/<key>/v1`) stay on the caller-selected account and never fall through to a different one. The active account key is never mutated by the fallback chain. If every candidate fails, the proxy returns the same non-lossy 502 it would have returned before, with the reason from the last attempted account.
 
-## 10. Provider and Account Failure Policy
 ## 10. Provider and Account Failure Policy
 
 Provider errors are classified in `provider-policy.mjs` before mutation or failover.
@@ -461,7 +460,7 @@ Live provider tests are optional and must be deliberate. Never infer permission 
 
 ### Automatic compaction returns 502 after a long wait
 
-Look for `Proxy Local Compaction` in `proxy.error.log`. A typical upstream outage shows a Responses timeout or Cloudflare 504 followed by a Chat Completions timeout. The proxy now retries each idempotent summary endpoint once; a final 502 means all bounded attempts failed and the original context was intentionally left intact. Manual `/compact` may work later simply because a later provider channel completed.
+Look for `Proxy Local Compaction` in `proxy.error.log`. A typical upstream outage shows a Responses timeout or Cloudflare 504 followed by a Chat Completions timeout. The proxy retries each idempotent summary endpoint up to twice for transient failures; a final 502 means all bounded attempts failed and the original context was intentionally left intact. Manual `/compact` may work later simply because a later provider channel completed.
 
 ### Compaction fails on the active account but other accounts are configured
 

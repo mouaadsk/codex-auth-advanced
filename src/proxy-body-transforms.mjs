@@ -2,7 +2,8 @@ import zlib from "node:zlib";
 import {
   isVsllmApiAccount,
   remappedProxyRequestModel,
-  resolvedClaudeGatewayModelId
+  resolvedClaudeGatewayModelId,
+  shouldStripInternalMetadata
 } from "./provider-policy.mjs";
 import { isResponsesProxyTarget } from "./proxy-sse-transforms.mjs";
 import { isCompactProxyTarget } from "./proxy-compaction.mjs";
@@ -89,6 +90,42 @@ export function isCodexRemoteCompactionV2Request(target, parsed, headers = {}) {
   const hasTrigger = Array.isArray(parsed.input)
     && parsed.input.some((item) => item?.type === "compaction_trigger");
   return hasTrigger || hasRemoteCompactionV2Metadata(parsed, headers);
+}
+
+function isInternalMetadataKey(key) {
+  const normalized = String(key || "").replaceAll(/[_-]/g, "").toLowerCase();
+  return normalized.startsWith("internal") || normalized === "internalchatmessagemetadatapassthrough";
+}
+
+export function stripInternalMetadataFromJson(value) {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const items = [];
+    for (const item of value) {
+      const stripped = stripInternalMetadataFromJson(item);
+      if (stripped.changed) changed = true;
+      items.push(stripped.value);
+    }
+    return { value: items, changed };
+  }
+
+  if (!isPlainObject(value)) {
+    return { value, changed: false };
+  }
+
+  let changed = false;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (isInternalMetadataKey(key)) {
+      changed = true;
+      continue;
+    }
+    const stripped = stripInternalMetadataFromJson(child);
+    if (stripped.changed) changed = true;
+    out[key] = stripped.value;
+  }
+
+  return { value: out, changed };
 }
 
 function isEncryptedContentKey(key) {
@@ -311,6 +348,14 @@ export function rewriteProviderProxyRequestBody(target, body, headers = {}, opti
         tool.model = "gpt-image-2";
         rewritten = true;
       }
+    }
+  }
+
+  if (shouldStripInternalMetadata(target)) {
+    const stripped = stripInternalMetadataFromJson(parsed);
+    if (stripped.changed) {
+      parsed = stripped.value;
+      rewritten = true;
     }
   }
 

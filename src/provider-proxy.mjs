@@ -16,8 +16,7 @@ import {
   createClaudeResponsesSseTransformStream
 } from "./claude-responses-sse.mjs";
 import {
-  prepareClaudeResponsesBridge,
-  retargetClaudeResponsesBridge
+  prepareClaudeResponsesBridge
 } from "./claude-responses-core.mjs";
 import { translateResponsesResponseToClaude, prepareClaudeChatBridge } from "./claude-responses-responses.mjs";
 import { prepareChatResponsesBridge, translateResponsesResponseToChat, chatTargetFromResponsesTarget } from "./chat-responses-core.mjs";
@@ -62,6 +61,7 @@ import {
 } from "./shape-translator.mjs";
 import {
   isProviderProxyLoopbackRequest,
+  redactProxyLogValue,
   writeProviderProxyControlResponse,
   stripHopByHopHeaders,
   stripProxyResponseHeaders,
@@ -821,6 +821,8 @@ export function createProviderProxy(options) {
 
 
   async function handleProviderProxyRequest(req, res) {
+    let codexCorrelationSuffix = "";
+    let requestIdSuffix = "";
     const incoming = new URL(req.url || "/", `http://${providerProxyHost}:${providerProxyPort}`);
     if (incoming.pathname === `${providerProxyPrefix}/health`) {
       writeProviderProxyControlResponse(res, 200, providerProxyHealthPayload());
@@ -884,7 +886,7 @@ export function createProviderProxy(options) {
         ? await codexSessionIndexFor(route.codexHome)
         : new Map();
       const codexCorrelation = extractCodexRequestCorrelation(body, route, codexSessionIndex);
-      const codexCorrelationSuffix = codexCorrelationLogSuffix(codexCorrelation);
+      codexCorrelationSuffix = codexCorrelationLogSuffix(codexCorrelation);
       // Per-request UUID so every [Proxy …] log line emitted on this
       // request's path can be grouped by a stable handle, even when the
       // body carries no turn id (e.g. /v1/messages translations have
@@ -892,8 +894,7 @@ export function createProviderProxy(options) {
       // proxy-body-transforms.mjs). Scoped to this closure so concurrent
       // requests never share a handle.
       const requestId = randomUUID();
-      const requestIdSuffix = requestIdLogFragment(requestId);
-      const originalSourceBody = body;
+      requestIdSuffix = requestIdLogFragment(requestId);
       const attemptedAccountKeys = new Set();
       const transientUsageLimitRetries = new Map();
       const modelCapacityRetries = new Map();
@@ -908,6 +909,7 @@ export function createProviderProxy(options) {
       let claudeMessagesCompaction = false;
       let claudeCompactionModel = null;
       let originalRequestModel = null;
+      const incomingSourceBody = body;
       const rewrittenBody = rewriteProviderProxyRequestBody(target, body, req.headers);
       originalRequestModel = rewrittenBody.originalModel;
       const remoteCompactionV2 = rewrittenBody.remoteCompactionV2 === true;
@@ -921,6 +923,7 @@ export function createProviderProxy(options) {
         body = rewrittenBody.body;
         bodyAlreadyDecoded = true;
       }
+      let originalSourceBody = body;
       // The bridge only applies to VSLLM targets, so prepare it before any
       // switch to the official Anthropic OAuth target below; an official
       // target can never match the bridge's VSLLM guard.
@@ -987,7 +990,7 @@ export function createProviderProxy(options) {
         requestUrl: req.url,
         model: originalRequestModel
       });
-      planner.prime(target.account);
+      planner.prime(target.account, target);
       const isCompact = isCompactProxyTarget(target);
       // Background-probe per-model shape capabilities when we have not seen
       // this model before on this account. Hard-coded MODEL_SHAPE_CAPABILITIES
@@ -1045,7 +1048,54 @@ export function createProviderProxy(options) {
         return translateShapeResponse(fromShape, toShape, rawBody, bridge?.originalRequest || {});
       }
 
-      while (true) {
+      // If the account/model has a designated shape that differs from the incoming
+      // source shape, bridge to that designated shape on the very first attempt.
+      function applyDesignatedShape() {
+        const initialShapes = planner.shapesForAccount(target.account);
+        if (!route.accountSelector && !isCompact && !isClaudeMessagesTarget(target) && initialShapes.length > 0 && initialShapes[0] !== sourceShape && !target.responseFromShape && claudeResponsesBridge?.kind !== "responses") {
+          const leadingShape = initialShapes[0];
+          const bridge = prepareShapeBridge({
+            target,
+            nextShape: leadingShape,
+            sourceShape,
+            sourceBody: originalSourceBody
+          });
+          if (bridge) {
+            target = bridge.target;
+            body = bridge.body;
+            bodyAlreadyDecoded = true;
+            target.responseFromShape = leadingShape;
+            target.responseToShape = sourceShape;
+            target.shapeBridge = bridge;
+          }
+        }
+      }
+
+      function prepareAccountTarget(nextTarget) {
+        // Rebuild from the caller's bytes, never from the previous account's
+        // translated payload or account-specific compatibility rewrites.
+        target = { ...nextTarget };
+        delete target.responseFromShape;
+        delete target.responseToShape;
+        delete target.shapeBridge;
+        const rewritten = rewriteProviderProxyRequestBody(target, incomingSourceBody, req.headers);
+        body = rewritten.body;
+        bodyAlreadyDecoded = rewritten.decoded === true;
+        originalSourceBody = body;
+        triedEncryptedContentRepair = false;
+        claudeResponsesBridge = prepareClaudeResponsesBridge(target, body);
+        if (claudeResponsesBridge?.kind === "responses") {
+          target = claudeResponsesBridge.target;
+          body = claudeResponsesBridge.body;
+          bodyAlreadyDecoded = true;
+        }
+        planner.prime(target.account, target);
+        applyDesignatedShape();
+      }
+
+      applyDesignatedShape();
+
+      requestAttempts: while (true) {
         let streamTransientRetryReason = null;
         if (target.account?.account_key) attemptedAccountKeys.add(target.account.account_key);
         const targetLabel = target.officialAnthropic
@@ -1294,7 +1344,7 @@ export function createProviderProxy(options) {
         if (shapeCursor < 0) shapeCursor = -1;
         const isShapeFallback = planner.shouldFailOverToNextShape({ status: upstream?.status, body: effectiveResponseBody });
         if (!route.accountSelector && isShapeFallback && shapeCursor + 1 < shapesForAccount.length) {
-          const nextShape = shapesForAccount[shapeCursor + 1];
+          for (const nextShape of shapesForAccount.slice(shapeCursor + 1)) {
           if (nextShape) {
             const label = target.account?.alias || target.account?.email || target.account?.account_key || "provider";
             console.warn(`[Proxy] ${label} returned status ${upstream?.status}; trying next wire shape ${shapeName(nextShape)}.${codexCorrelationSuffix}${requestIdSuffix}`);
@@ -1313,15 +1363,28 @@ export function createProviderProxy(options) {
                 options: { originalModel: originalRequestModel }
               });
               if (summarized) {
+                try { await upstream.body?.cancel(); } catch {}
                 upstream = summarized;
-                break;
+                break requestAttempts;
               }
-              // Fall through to advance to next shape on the next iteration.
+              // Advance locally without replaying the failed upstream request.
               continue;
             }
             // Non-compact chain advancement: translate the request body into
             // the next shape's wire format and retarget the URL. The response
             // is translated back to the source shape below.
+            if (nextShape === sourceShape) {
+              try { await upstream.body?.cancel(); } catch {}
+              const base = target?.upstreamBaseUrl || target?.account?.base_url;
+              const restoredUrl = (base && shapeUrlFor(base, nextShape)) || target.url;
+              target = { ...target, url: restoredUrl };
+              body = originalSourceBody;
+              bodyAlreadyDecoded = true;
+              target.responseFromShape = null;
+              target.responseToShape = null;
+              target.shapeBridge = null;
+              continue requestAttempts;
+            }
             const bridge = await prepareShapeBridge({
               target,
               nextShape,
@@ -1329,6 +1392,7 @@ export function createProviderProxy(options) {
               sourceBody: originalSourceBody
             });
             if (bridge) {
+              try { await upstream.body?.cancel(); } catch {}
               target = bridge.target;
               body = bridge.body;
               bodyAlreadyDecoded = true;
@@ -1340,9 +1404,10 @@ export function createProviderProxy(options) {
               target.responseFromShape = nextShape;
               target.responseToShape = sourceShape;
               target.shapeBridge = bridge;
-              continue;
+              continue requestAttempts;
             }
             continue;
+          }
           }
         }
         // Account-level failover: only on hard exhaustion OR a per-account
@@ -1383,15 +1448,16 @@ export function createProviderProxy(options) {
             console.warn(
               `[Account Failover] origin=auto-transient from=${transientFromLabel} to=${transientToLabel} reason=${effectiveTransientRetryReason || "api_key_restriction"} request_only=true${requestIdSuffix}${codexCorrelationSuffix}`
             );
-            target = retargetClaudeResponsesBridge(transientTarget, claudeResponsesBridge);
+            try { await upstream.body?.cancel(); } catch {}
+            prepareAccountTarget(transientTarget);
             continue;
           }
         }
         if (!switched) break;
-        if (!switched) break;
         const newTarget = targetUrlForProxyRequest(req, { ...route, accountSelector: null, pathPrefix: `${providerProxyPrefix}/${providerProxyGroupId(route.codexHome)}` });
         if (!newTarget || newTarget.error || attemptedAccountKeys.has(newTarget.account?.account_key) || newTarget.account?.account_key === target.account?.account_key) break;
-        target = retargetClaudeResponsesBridge(newTarget, claudeResponsesBridge);
+        try { await upstream.body?.cancel(); } catch {}
+        prepareAccountTarget(newTarget);
       }
 
       console.log(`[Proxy Response] ${req.url} -> status: ${upstream.status}${codexCorrelationSuffix}${requestIdSuffix}`);
@@ -1427,8 +1493,7 @@ export function createProviderProxy(options) {
         }
       }
       if (!upstream.body) {
-        console.log(`[DEBUG streaming] upstream.status=${upstream.status}, content-type=${contentType}, hasBody=${!!upstream.body}`);
-      res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
+        res.writeHead(upstream.status, stripProxyResponseHeaders(upstream.headers));
         res.end();
         return;
       }
@@ -1459,7 +1524,6 @@ export function createProviderProxy(options) {
       if (contentType.includes("event-stream")) res.flushHeaders();
       const contentEncoding = String(upstream.headers.get("content-encoding") || "").toLowerCase();
       let responseStream = Readable.fromWeb(upstream.body);
-      responseStream.on("data", (c) => console.log(`[DEBUG upstream->transform] chunk len=${c.length}, sample=${c.toString().slice(0, 60)}`));
       const watchdogStallTarget = responseStream;
       // The stall watchdog destroys the upstream source when the origin goes
       // silent; that 'error' is expected and must not nuke the client
@@ -1492,7 +1556,6 @@ export function createProviderProxy(options) {
       // Cross-shape SSE translation: when the chain walker retargeted the
       // request to a different wire shape, the response is streamed in the
       // new shape's event format. Translate it back to the source shape.
-      console.log(`[DEBUG sse] target.responseFromShape=${target.responseFromShape}, target.responseToShape=${target.responseToShape}, shapeBridge=${!!target.shapeBridge}`);
       const shapeBridge = target.shapeBridge;
       const sseBridge = (shapeBridge && target.responseFromShape && target.responseToShape
         && target.responseFromShape !== target.responseToShape
@@ -1507,7 +1570,6 @@ export function createProviderProxy(options) {
         ));
       } else if (sseTransform) {
         responseStream = responseStream.pipe(sseTransform);
-        responseStream.on("data", (c) => console.log(`[DEBUG sse->res] chunk len=${c.length}, sample=${c.toString().slice(0, 100)}`));
       } else if (shouldTransformOpenAiResponse) {
         responseStream = responseStream.pipe(createSseResponseTransformStream(
           target,
@@ -1589,7 +1651,6 @@ export function createProviderProxy(options) {
         // Re-arm on raw upstream bytes; piped transforms emit no 'data' while
         // paused, but the raw source does whenever the origin actually sends.
         watchdogStallTarget.on("data", armStallWatchdog);
-        responseStream.on("data", armStallWatchdog);
         responseStream.on("end", clearStallWatchdog);
         responseStream.on("close", clearStallWatchdog);
         res.on("close", clearStallWatchdog);
@@ -1614,8 +1675,8 @@ export function createProviderProxy(options) {
       const format = (args) => {
         const stamp = new Date().toISOString();
         const parts = args.map((arg) => {
-          if (typeof arg === "string") return arg;
-          try { return JSON.stringify(arg); } catch { return String(arg); }
+          if (typeof arg === "string") return redactProxyLogValue(arg);
+          try { return redactProxyLogValue(JSON.stringify(arg)); } catch { return redactProxyLogValue(String(arg)); }
         });
         return [`[${stamp}]`, ...parts];
       };

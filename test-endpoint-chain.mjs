@@ -219,9 +219,9 @@ import {
     model: "discovered-model-1"
   });
   planner.prime(vsllmAccount);
-  // Without any probe result, the chain walker still uses the full chain.
+  // Unknown model families use the designated Chat Completions shape first.
   assert.deepEqual(planner.shapesForAccount(vsllmAccount), [
-    WIRE_SHAPES.RESPONSES, WIRE_SHAPES.CHAT_COMPLETIONS,
+    WIRE_SHAPES.CHAT_COMPLETIONS, WIRE_SHAPES.RESPONSES,
     WIRE_SHAPES.MESSAGES, WIRE_SHAPES.ANTIGRAVITY
   ]);
 }

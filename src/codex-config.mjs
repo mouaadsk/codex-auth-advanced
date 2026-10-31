@@ -195,7 +195,8 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: null,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: false
+      repairInvalidEncryptedContent: false,
+      stripInternalMetadataPassthrough: false
     };
   }
   if (normalized === "codex-everywhere" || normalized === "codex_everywhere" || normalized === "everywhere") {
@@ -205,7 +206,8 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: 50,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: true
+      repairInvalidEncryptedContent: true,
+      stripInternalMetadataPassthrough: true
     };
   }
   if (normalized === "tcdmx") {
@@ -215,7 +217,8 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: 300,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: true
+      repairInvalidEncryptedContent: true,
+      stripInternalMetadataPassthrough: true
     };
   }
   if (normalized === "llmapi" || normalized === "llmapi-pro" || normalized === "llmapi.pro") {
@@ -225,7 +228,8 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: null,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: true
+      repairInvalidEncryptedContent: true,
+      stripInternalMetadataPassthrough: true
     };
   }
   if (normalized === "vsllm" || normalized === "vsllm.com" || normalized === "api.vsllm.com") {
@@ -235,7 +239,8 @@ export function apiKeyTemplate(name) {
       defaultSpendLimitUsd: 55,
       defaultModelContextWindow: 320000,
       defaultAutoCompactTokenLimit: 250000,
-      repairInvalidEncryptedContent: true
+      repairInvalidEncryptedContent: true,
+      stripInternalMetadataPassthrough: true
     };
   }
   return null;

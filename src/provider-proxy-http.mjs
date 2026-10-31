@@ -4,6 +4,13 @@
 
 import http from "node:http";
 
+// Apply to serialized diagnostics, never to the actual upstream request.
+export function redactProxyLogValue(value) {
+  return String(value)
+    .replace(/([?&](?:key|api[_-]?key|access[_-]?token|token|authorization|signature)=)[^&#\s]*/gi, "$1[REDACTED]")
+    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@");
+}
+
 export function isProviderProxyLoopbackRequest(req) {
     const address = String(req.socket?.remoteAddress || "");
     return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
